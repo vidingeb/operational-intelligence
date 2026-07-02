@@ -1,0 +1,343 @@
+import os
+import time
+from typing import Any, Dict, Optional
+
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+
+VERIFY_SSL = os.getenv("NI_VERIFY_SSL", "false").lower() == "true"
+
+NI_BASE_URL = os.getenv("NI_BASE_URL", "https://vcfnetworks.vcf.local").rstrip("/")
+NI_USERNAME = os.getenv("NI_USERNAME", "")
+NI_PASSWORD = os.getenv("NI_PASSWORD", "")
+NI_DOMAIN = os.getenv("NI_DOMAIN", os.getenv("NI_DOMAIN_TYPE", "localdomain"))
+
+REQUEST_TIMEOUT = int(os.getenv("NI_TIMEOUT", "30"))
+
+app = FastAPI(
+    title="Local VCF Operations for Networks API Proxy",
+    version="1.2.0",
+    description="Local proxy API for Copilot Studio / agent access to VCF Operations for Networks."
+)
+
+
+class LoginRequest(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    domain: Optional[str] = None
+
+
+class PathRequest(BaseModel):
+    source: str
+    destination: str
+
+
+class NIClient:
+    def __init__(self):
+        self.base_url = NI_BASE_URL
+        self.session = requests.Session()
+        self.csrf_token: Optional[str] = None
+        self.login_time: Optional[float] = None
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+
+        if self.csrf_token:
+            headers["x-vrni-csrf-token"] = self.csrf_token
+
+        return headers
+
+    def login(
+        self,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        domain: Optional[str] = None
+    ) -> Dict[str, Any]:
+        user = username or NI_USERNAME
+        pwd = password or NI_PASSWORD
+        auth_domain = domain or NI_DOMAIN
+
+        if not user or not pwd:
+            raise HTTPException(
+                status_code=500,
+                detail="NI_USERNAME and NI_PASSWORD must be configured, or supplied to /ni/login."
+            )
+
+        if not auth_domain:
+            raise HTTPException(
+                status_code=500,
+                detail="NI_DOMAIN must be configured, for example localdomain."
+            )
+
+        # Confirmed from browser DevTools:
+        # POST /api/auth/login
+        # { "username": "admin@local", "password": "<password>", "domain": "localdomain" }
+        url = f"{self.base_url}/api/auth/login"
+
+        payload = {
+            "username": user,
+            "password": pwd,
+            "domain": auth_domain
+        }
+
+        try:
+            response = self.session.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                verify=VERIFY_SSL,
+                timeout=REQUEST_TIMEOUT
+            )
+        except requests.RequestException as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to connect to VCF Operations for Networks: {exc}"
+            )
+
+        if response.status_code >= 400:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+
+        # VCF Operations for Networks UI login returns session cookies and x-vrni-csrf-token.
+        self.csrf_token = (
+            response.headers.get("x-vrni-csrf-token")
+            or response.cookies.get("x-vrni-csrf-token")
+        )
+
+        self.login_time = time.time()
+
+        return {
+            "status": "ok",
+            "message": "Authenticated against VCF Operations for Networks.",
+            "base_url": self.base_url,
+            "domain": auth_domain,
+            "csrf_token_present": bool(self.csrf_token),
+            "cookies_present": bool(self.session.cookies)
+        }
+
+    def request(self, method: str, path: str, **kwargs) -> Any:
+        if not self.login_time:
+            self.login()
+
+        url = f"{self.base_url}{path}"
+
+        try:
+            response = self.session.request(
+                method,
+                url,
+                headers=self._headers(),
+                verify=VERIFY_SSL,
+                timeout=REQUEST_TIMEOUT,
+                **kwargs
+            )
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"API request failed: {exc}")
+
+        # Retry once if session expired
+        if response.status_code in [401, 403]:
+            self.login()
+            response = self.session.request(
+                method,
+                url,
+                headers=self._headers(),
+                verify=VERIFY_SSL,
+                timeout=REQUEST_TIMEOUT,
+                **kwargs
+            )
+
+        if response.status_code >= 400:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+
+        if not response.text:
+            return {}
+
+        try:
+            return response.json()
+        except ValueError:
+            return {"raw": response.text}
+
+
+client = NIClient()
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "Local VCF Operations for Networks API Proxy",
+        "version": "1.2.0",
+        "base_url": NI_BASE_URL,
+        "verify_ssl": VERIFY_SSL
+    }
+
+
+@app.get("/ni/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "vcf-networks-api-proxy",
+        "version": "1.2.0",
+        "target": NI_BASE_URL,
+        "domain": NI_DOMAIN
+    }
+
+
+@app.post("/ni/login")
+def login(body: LoginRequest):
+    return client.login(body.username, body.password, body.domain)
+
+
+@app.get("/ni/search")
+def search(
+    query: str = Query(..., description="Search text, for example VM name, IP, segment, router, application."),
+    entity_type: Optional[str] = Query(None, description="Optional entity type filter.")
+):
+    payload: Dict[str, Any] = {"query": query}
+
+    if entity_type:
+        payload["entity_type"] = entity_type
+
+    return client.request("POST", "/api/ni/search", json=payload)
+
+
+@app.get("/ni/entities/vms")
+def list_vms(
+    query: Optional[str] = Query(None, description="Optional VM name/IP filter."),
+    size: int = Query(50, description="Max number of results.")
+):
+    search_query = query or "entity_type = 'VirtualMachine'"
+
+    payload = {
+        "query": search_query,
+        "size": size
+    }
+
+    return client.request("POST", "/api/ni/search", json=payload)
+
+
+@app.get("/ni/entities/nsx-segments")
+def list_nsx_segments(
+    query: Optional[str] = Query(None, description="Optional segment name filter."),
+    size: int = Query(50, description="Max number of results.")
+):
+    search_query = query or "entity_type = 'NSXTLogicalSwitch'"
+
+    payload = {
+        "query": search_query,
+        "size": size
+    }
+
+    return client.request("POST", "/api/ni/search", json=payload)
+
+
+@app.get("/ni/entities/nsx-t1")
+def list_nsx_t1(
+    query: Optional[str] = Query(None, description="Optional Tier-1 name filter."),
+    size: int = Query(50, description="Max number of results.")
+):
+    search_query = query or "entity_type = 'NSXTLogicalRouter'"
+
+    payload = {
+        "query": search_query,
+        "size": size
+    }
+
+    return client.request("POST", "/api/ni/search", json=payload)
+
+
+@app.post("/ni/path")
+def path_lookup(body: PathRequest):
+    payload = {
+        "source": body.source,
+        "destination": body.destination
+    }
+
+    return client.request("POST", "/api/ni/path", json=payload)
+
+
+@app.get("/ni/flows")
+def flows(
+    source: Optional[str] = Query(None, description="Source VM/IP/entity."),
+    destination: Optional[str] = Query(None, description="Destination VM/IP/entity."),
+    port: Optional[str] = Query(None, description="Optional destination port."),
+    protocol: Optional[str] = Query(None, description="Optional protocol TCP/UDP."),
+    size: int = Query(50, description="Max number of results.")
+):
+    payload: Dict[str, Any] = {"size": size}
+
+    if source:
+        payload["source"] = source
+    if destination:
+        payload["destination"] = destination
+    if port:
+        payload["port"] = port
+    if protocol:
+        payload["protocol"] = protocol
+
+    return client.request("POST", "/api/ni/flows", json=payload)
+
+
+@app.get("/ni/alerts")
+def alerts(
+    severity: Optional[str] = Query(None, description="Optional severity filter: CRITICAL, WARNING, INFO."),
+    size: int = Query(50, description="Max number of results.")
+):
+    payload: Dict[str, Any] = {"size": size}
+
+    if severity:
+        payload["severity"] = severity
+
+    return client.request("POST", "/api/ni/alerts", json=payload)
+
+
+@app.get("/ni/applications")
+def applications(
+    query: Optional[str] = Query(None, description="Optional application name filter."),
+    size: int = Query(50, description="Max number of results.")
+):
+    payload: Dict[str, Any] = {"size": size}
+
+    if query:
+        payload["query"] = query
+
+    return client.request("POST", "/api/ni/applications", json=payload)
+
+
+@app.get("/ni/microsegmentation/recommendations")
+def microsegmentation_recommendations(
+    entity: str = Query(..., description="Application, VM, group or entity to analyze.")
+):
+    payload = {"entity": entity}
+
+    return client.request("POST", "/api/ni/microsegmentation/recommendations", json=payload)
+
+
+@app.get("/ni/incomplete-tcp-sessions")
+def incomplete_tcp_sessions(
+    source: Optional[str] = Query(None, description="Optional source filter."),
+    destination: Optional[str] = Query(None, description="Optional destination filter."),
+    size: int = Query(50, description="Max number of results.")
+):
+    payload: Dict[str, Any] = {"size": size}
+
+    if source:
+        payload["source"] = source
+    if destination:
+        payload["destination"] = destination
+
+    return client.request("POST", "/api/ni/incomplete-tcp-sessions", json=payload)
+
+
+@app.get("/ni/metrics/top-talkers")
+def top_talkers(
+    duration: str = Query("24h", description="Time range, for example 1h, 24h, 7d."),
+    size: int = Query(20, description="Max number of results.")
+):
+    payload = {
+        "duration": duration,
+        "size": size
+    }
+
+    return client.request("POST", "/api/ni/metrics/top-talkers", json=payload)
