@@ -1,0 +1,273 @@
+swagger: '2.0'
+info:
+  title: VCF Operations for Networks Local API
+  version: '1.5'
+  description: >-
+    Local VCF Operations for Networks connector via MAP gateway. Matches
+    vcf_networks_api.py v1.5.0.
+host: localhost:8082
+basePath: /
+schemes:
+  - http
+consumes:
+  - application/json
+produces:
+  - application/json
+paths:
+  /ni/health:
+    get:
+      summary: Health check
+      operationId: niHealth
+      responses:
+        '200':
+          description: OK
+  /ni/login:
+    post:
+      summary: Test API token login
+      operationId: niLogin
+      parameters:
+        - name: body
+          in: body
+          required: false
+          schema:
+            $ref: '#/definitions/LoginRequest'
+      responses:
+        '200':
+          description: Login result
+  /ni/search:
+    get:
+      summary: Search VCF Operations for Networks
+      operationId: niSearch
+      parameters:
+        - name: query
+          in: query
+          required: false
+          type: string
+          default: vm
+          description: >-
+            Simple name or IP text, or a full VCF Networks filter expression.
+            Example: vm or name like web
+        - name: entity_type
+          in: query
+          required: false
+          type: string
+          default: VirtualMachine
+          description: >-
+            Entity type. Examples: VirtualMachine, NSXTLogicalSwitch,
+            NSXTLogicalRouter
+        - name: size
+          in: query
+          required: false
+          type: integer
+          default: 50
+          description: Max number of results
+      responses:
+        '200':
+          description: Search results
+    post:
+      summary: Search VCF Operations for Networks with explicit body
+      operationId: niSearchPost
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: '#/definitions/SearchRequest'
+      responses:
+        '200':
+          description: Search results
+  /ni/entities/vms:
+    get:
+      summary: Search virtual machines
+      operationId: niListVMs
+      parameters:
+        - name: query
+          in: query
+          required: false
+          type: string
+          default: vm
+          description: VM name or IP text, or full VCF Networks filter expression
+        - name: size
+          in: query
+          required: false
+          type: integer
+          default: 50
+      responses:
+        '200':
+          description: VM search results
+  /ni/entities/nsx-segments:
+    get:
+      summary: Search NSX segments
+      operationId: niListNSXSegments
+      parameters:
+        - name: query
+          in: query
+          required: false
+          type: string
+          default: segment
+          description: Segment name text or full VCF Networks filter expression
+        - name: size
+          in: query
+          required: false
+          type: integer
+          default: 50
+      responses:
+        '200':
+          description: NSX segment search results
+  /ni/entities/nsx-t1:
+    get:
+      summary: Search NSX Tier-1 routers
+      operationId: niListNSXTier1
+      parameters:
+        - name: query
+          in: query
+          required: false
+          type: string
+          default: t1
+          description: Tier-1 name text or full VCF Networks filter expression
+        - name: size
+          in: query
+          required: false
+          type: integer
+          default: 50
+      responses:
+        '200':
+          description: NSX Tier-1 search results
+  /ni/version:
+    get:
+      summary: Get VCF Operations for Networks API version
+      operationId: niVersion
+      responses:
+        '200':
+          description: Version information
+  /ni/infra/nodes:
+    get:
+      summary: List VCF Operations for Networks infrastructure nodes
+      operationId: niInfraNodes
+      responses:
+        '200':
+          description: Infrastructure node results
+  /ni/data-sources/vcenters:
+    get:
+      summary: List vCenter data sources
+      operationId: niVcenterDataSources
+      responses:
+        '200':
+          description: vCenter data source results
+  /ni/alerts:
+    get:
+      summary: List active alerts
+      operationId: niAlerts
+      responses:
+        '200':
+          description: Alert list
+  /ni/alerts/{problem_id}:
+    get:
+      summary: Show alert details
+      operationId: niAlertDetails
+      parameters:
+        - name: problem_id
+          in: path
+          required: true
+          type: string
+          description: Problem ID from niAlerts
+      responses:
+        '200':
+          description: Alert details
+  /ni/vms:
+    get:
+      summary: List virtual machines
+      operationId: niVMs
+      responses:
+        '200':
+          description: VM list
+  /ni/vms/{vm_id}:
+    get:
+      summary: Show VM details
+      operationId: niVMDetails
+      parameters:
+        - name: vm_id
+          in: path
+          required: true
+          type: string
+          description: VM entity ID from niVMs
+      responses:
+        '200':
+          description: VM details
+  /ni/hosts:
+    get:
+      summary: List hosts
+      operationId: niHosts
+      responses:
+        '200':
+          description: Host list
+  /ni/hosts/{host_id}:
+    get:
+      summary: Show host details
+      operationId: niHostDetails
+      parameters:
+        - name: host_id
+          in: path
+          required: true
+          type: string
+          description: Host entity ID from niHosts
+      responses:
+        '200':
+          description: Host details
+  /ni/clusters:
+    get:
+      summary: List clusters
+      operationId: niClusters
+      responses:
+        '200':
+          description: Cluster list
+  /ni/clusters/{cluster_id}:
+    get:
+      summary: Show cluster details
+      operationId: niClusterDetails
+      parameters:
+        - name: cluster_id
+          in: path
+          required: true
+          type: string
+          description: Cluster entity ID from niClusters
+      responses:
+        '200':
+          description: Cluster details
+definitions:
+  LoginRequest:
+    type: object
+    properties:
+      username:
+        type: string
+        description: >-
+          Optional username override. Usually configured as environment variable
+          on the MAP server.
+      password:
+        type: string
+        description: >-
+          Optional password override. Usually configured as environment variable
+          on the MAP server.
+      domain_type:
+        type: string
+        default: LOCAL
+        description: Domain type for API token auth. Use LOCAL for the local admin account.
+  SearchRequest:
+    type: object
+    required:
+      - entity_type
+      - filter
+    properties:
+      entity_type:
+        type: string
+        default: VirtualMachine
+        description: Entity type, for example VirtualMachine
+      filter:
+        type: string
+        default: name like vm
+        description: VCF Networks filter expression
+      size:
+        type: integer
+        default: 50
+security: []
+securityDefinitions: {}
