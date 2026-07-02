@@ -1,0 +1,452 @@
+swagger: '2.0'
+info:
+  title: VCF Operations Local API
+  version: '2.0'
+  description: >-
+    Local VCF Operations connector via MAP gateway. Read-only wrapper for VCF
+    Operations / Aria Operations 9.0 public API.
+host: localhost:8081
+basePath: /
+schemes:
+  - http
+consumes:
+  - application/json
+produces:
+  - application/json
+paths:
+  /ops/health:
+    get:
+      summary: Health check
+      operationId: opsHealth
+      responses:
+        '200':
+          description: OK
+  /ops/auth/test:
+    get:
+      summary: Test VCF Operations authentication
+      operationId: opsAuthTest
+      responses:
+        '200':
+          description: OK
+  /ops/commands:
+    get:
+      summary: List available local API commands
+      operationId: opsCommands
+      responses:
+        '200':
+          description: OK
+  /ops/summary:
+    get:
+      summary: VCF Operations summary
+      operationId: opsSummary
+      responses:
+        '200':
+          description: OK
+  /ops/resources:
+    get:
+      summary: List VCF Operations resources
+      operationId: opsResources
+      parameters:
+        - name: page
+          in: query
+          required: false
+          type: integer
+          default: 0
+        - name: pageSize
+          in: query
+          required: false
+          type: integer
+          default: 1000
+      responses:
+        '200':
+          description: OK
+  /ops/resources/search:
+    get:
+      summary: Search VCF Operations resources by name
+      operationId: opsResourcesSearch
+      parameters:
+        - name: name
+          in: query
+          required: true
+          type: string
+          description: Resource name or partial name
+        - name: pageSize
+          in: query
+          required: false
+          type: integer
+          default: 1000
+      responses:
+        '200':
+          description: OK
+  /ops/resource/{resource_id}:
+    get:
+      summary: Get VCF Operations resource by ID
+      operationId: opsResourceById
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: OK
+  /ops/resource/{resource_id}/properties:
+    get:
+      summary: Get resource properties
+      operationId: opsResourceProperties
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: OK
+  /ops/resource/{resource_id}/statkeys:
+    get:
+      summary: Get resource stat keys
+      operationId: opsResourceStatkeys
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: OK
+  /ops/resource/{resource_id}/stats/latest:
+    get:
+      summary: Get latest stats for a resource
+      operationId: opsResourceStatsLatest
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          type: string
+        - name: statKey
+          in: query
+          required: false
+          type: string
+          description: Optional stat key filter
+      responses:
+        '200':
+          description: OK
+  /ops/resources/stats/latest:
+    post:
+      summary: Get latest stats for multiple resources
+      operationId: opsResourcesStatsLatest
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            additionalProperties: true
+      responses:
+        '200':
+          description: OK
+  /ops/alerts:
+    get:
+      summary: List VCF Operations alerts
+      operationId: opsAlerts
+      parameters:
+        - name: activeOnly
+          in: query
+          required: false
+          type: boolean
+          default: true
+        - name: page
+          in: query
+          required: false
+          type: integer
+          default: 0
+        - name: pageSize
+          in: query
+          required: false
+          type: integer
+          default: 1000
+      responses:
+        '200':
+          description: OK
+  /ops/critical-alerts:
+    get:
+      summary: List critical VCF Operations alerts
+      operationId: opsCriticalAlerts
+      responses:
+        '200':
+          description: OK
+  /ops/top-alerts:
+    get:
+      summary: List top active alerts sorted by severity
+      operationId: opsTopAlerts
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          type: integer
+          default: 10
+      responses:
+        '200':
+          description: OK
+  /ops/cost-drivers:
+    get:
+      summary: Explain supported cost-related API capability
+      operationId: opsCostDrivers
+      responses:
+        '200':
+          description: OK
+  /ops/cost-drivers/summary:
+    get:
+      summary: Cost-driver guidance summary
+      operationId: opsCostDriversSummary
+      responses:
+        '200':
+          description: OK
+  /ops/cost/currency:
+    get:
+      summary: Get VCF Operations cost currency configuration
+      operationId: opsCostCurrency
+      responses:
+        '200':
+          description: OK
+  /ops/chargeback/bills/summary:
+    post:
+      summary: Query chargeback bills summary
+      operationId: opsChargebackBillsSummary
+      parameters:
+        - name: page
+          in: query
+          required: false
+          type: integer
+          default: 0
+        - name: pageSize
+          in: query
+          required: false
+          type: integer
+          default: 1000
+        - name: sortBy
+          in: query
+          required: false
+          type: string
+        - name: sortOrder
+          in: query
+          required: false
+          type: string
+          default: DESC
+          enum:
+            - ASC
+            - DESC
+        - name: body
+          in: body
+          required: false
+          schema:
+            type: object
+            additionalProperties: true
+      responses:
+        '200':
+          description: OK
+  /ops/chargeback/reports:
+    get:
+      summary: List chargeback reports
+      operationId: opsChargebackReports
+      parameters:
+        - name: name
+          in: query
+          required: false
+          type: string
+        - name: subject
+          in: query
+          required: false
+          type: string
+        - name: status
+          in: query
+          required: false
+          type: string
+        - name: resourceId
+          in: query
+          required: false
+          type: string
+        - name: page
+          in: query
+          required: false
+          type: integer
+          default: 0
+        - name: pageSize
+          in: query
+          required: false
+          type: integer
+          default: 1000
+      responses:
+        '200':
+          description: OK
+  /ops/chargeback/reports/{report_id}:
+    get:
+      summary: Get chargeback report by ID
+      operationId: opsChargebackReportById
+      parameters:
+        - name: report_id
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: OK
+  /ops/reports:
+    get:
+      summary: List reports
+      operationId: opsReports
+      parameters:
+        - name: page
+          in: query
+          required: false
+          type: integer
+          default: 0
+        - name: pageSize
+          in: query
+          required: false
+          type: integer
+          default: 1000
+      responses:
+        '200':
+          description: OK
+  /ops/report-definitions:
+    get:
+      summary: List report definitions
+      operationId: opsReportDefinitions
+      parameters:
+        - name: page
+          in: query
+          required: false
+          type: integer
+          default: 0
+        - name: pageSize
+          in: query
+          required: false
+          type: integer
+          default: 1000
+      responses:
+        '200':
+          description: OK
+  /ops/policies:
+    get:
+      summary: List policies
+      operationId: opsPolicies
+      parameters:
+        - name: page
+          in: query
+          required: false
+          type: integer
+          default: 0
+        - name: pageSize
+          in: query
+          required: false
+          type: integer
+          default: 1000
+      responses:
+        '200':
+          description: OK
+  /ops/supermetrics:
+    get:
+      summary: List super metrics
+      operationId: opsSupermetrics
+      parameters:
+        - name: page
+          in: query
+          required: false
+          type: integer
+          default: 0
+        - name: pageSize
+          in: query
+          required: false
+          type: integer
+          default: 1000
+      responses:
+        '200':
+          description: OK
+  /ops/symptoms:
+    get:
+      summary: List symptoms
+      operationId: opsSymptoms
+      parameters:
+        - name: page
+          in: query
+          required: false
+          type: integer
+          default: 0
+        - name: pageSize
+          in: query
+          required: false
+          type: integer
+          default: 1000
+      responses:
+        '200':
+          description: OK
+  /ops/recommendations:
+    get:
+      summary: List recommendations
+      operationId: opsRecommendations
+      parameters:
+        - name: page
+          in: query
+          required: false
+          type: integer
+          default: 0
+        - name: pageSize
+          in: query
+          required: false
+          type: integer
+          default: 1000
+      responses:
+        '200':
+          description: OK
+  /ops/optimization/{datacenter_id}/automation/status:
+    get:
+      summary: Get workload placement automation status
+      operationId: opsOptimizationAutomationStatus
+      parameters:
+        - name: datacenter_id
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: OK
+  /ops/optimization/{datacenter_id}/cross-dc-move/status:
+    get:
+      summary: Get workload placement cross data center move status
+      operationId: opsOptimizationCrossDcMoveStatus
+      parameters:
+        - name: datacenter_id
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: OK
+  /ops/optimization/{datacenter_id}/placement/settings:
+    get:
+      summary: Get workload placement settings
+      operationId: opsOptimizationPlacementSettings
+      parameters:
+        - name: datacenter_id
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: OK
+definitions: {}
+parameters: {}
+responses: {}
+security: []
+tags:
+  - name: health
+  - name: resources
+  - name: alerts
+  - name: cost
+  - name: chargeback
+  - name: reports
+  - name: policies
+  - name: metrics
+  - name: optimization
+securityDefinitions: {}
