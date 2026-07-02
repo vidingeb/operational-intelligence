@@ -1,0 +1,456 @@
+swagger: '2.0'
+info:
+  title: vCenter Local API
+  version: 1.4.0
+  description: MAP vCenter Connector for Copilot Studio via on-premises data gateway
+host: localhost:8080
+basePath: /
+schemes:
+  - http
+consumes: []
+produces:
+  - application/json
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: healthCheck
+      responses:
+        '200':
+          description: OK
+  /hosts:
+    get:
+      summary: List ESXi hosts
+      operationId: listHosts
+      responses:
+        '200':
+          description: OK
+  /hosts/usage:
+    get:
+      summary: Show ESXi host resource usage
+      operationId: listHostUsage
+      responses:
+        '200':
+          description: OK
+  /vms:
+    get:
+      summary: List virtual machines
+      operationId: listVMs
+      responses:
+        '200':
+          description: OK
+  /vms/search:
+    get:
+      summary: Search virtual machines
+      operationId: searchVMs
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Search string for VM name
+      responses:
+        '200':
+          description: OK
+  /vms/poweredoff:
+    get:
+      summary: List powered off virtual machines
+      operationId: listPoweredOffVMs
+      responses:
+        '200':
+          description: OK
+  /vm/details:
+    get:
+      summary: Get detailed information for a virtual machine
+      operationId: getVMDetails
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+      responses:
+        '200':
+          description: OK
+  /vm/storage:
+    get:
+      summary: Show datastores used by a virtual machine
+      operationId: getVMStorage
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+      responses:
+        '200':
+          description: OK
+  /vm/snapshots:
+    get:
+      summary: Show snapshots for a virtual machine
+      operationId: getVMSnapshots
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+      responses:
+        '200':
+          description: OK
+  /snapshots/old:
+    get:
+      summary: List old snapshots
+      operationId: listOldSnapshots
+      parameters:
+        - in: query
+          name: days
+          type: integer
+          default: 14
+          required: false
+          description: Snapshot age in days
+      responses:
+        '200':
+          description: OK
+  /datastores:
+    get:
+      summary: List datastores
+      operationId: listDatastores
+      responses:
+        '200':
+          description: OK
+  /datastores/lowfree:
+    get:
+      summary: List datastores with low free space
+      operationId: listDatastoresLowFree
+      parameters:
+        - in: query
+          name: threshold_percent
+          type: integer
+          default: 20
+          required: false
+          description: Free space threshold percentage
+      responses:
+        '200':
+          description: OK
+  /clusters:
+    get:
+      summary: List clusters
+      operationId: listClusters
+      responses:
+        '200':
+          description: OK
+  /clusters/summary:
+    get:
+      summary: Show vSphere cluster summary
+      operationId: listClusterSummary
+      responses:
+        '200':
+          description: OK
+  /alarms:
+    get:
+      summary: List active alarms
+      operationId: listActiveAlarms
+      responses:
+        '200':
+          description: OK
+  /tasks/recent:
+    get:
+      summary: Show recent vCenter tasks
+      operationId: listRecentTasks
+      parameters:
+        - in: query
+          name: limit
+          type: integer
+          default: 20
+          required: false
+          description: Number of recent tasks to return
+      responses:
+        '200':
+          description: OK
+  /events/recent:
+    get:
+      summary: Show recent vCenter events
+      operationId: listRecentEvents
+      parameters:
+        - in: query
+          name: limit
+          type: integer
+          default: 20
+          required: false
+          description: Number of recent events to return
+      responses:
+        '200':
+          description: OK
+  /vmtools/outdated:
+    get:
+      summary: List VMs with outdated VMware Tools
+      operationId: listOutdatedVMwareTools
+      responses:
+        '200':
+          description: OK
+  /vmtools/notrunning:
+    get:
+      summary: List VMs where VMware Tools is not running
+      operationId: listVMwareToolsNotRunning
+      responses:
+        '200':
+          description: OK
+  /vm/poweron:
+    post:
+      summary: Power on a virtual machine
+      operationId: powerOnVM
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+      responses:
+        '200':
+          description: OK
+  /vm/poweroff:
+    post:
+      summary: Hard power off a virtual machine
+      operationId: powerOffVM
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+      responses:
+        '200':
+          description: OK
+  /vm/shutdown_guest:
+    post:
+      summary: Gracefully shut down guest OS
+      operationId: shutdownGuestVM
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+      responses:
+        '200':
+          description: OK
+  /vm/reboot_guest:
+    post:
+      summary: Reboot guest OS
+      operationId: rebootGuestVM
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+      responses:
+        '200':
+          description: OK
+  /vm/reset:
+    post:
+      summary: Reset a virtual machine
+      operationId: resetVM
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+      responses:
+        '200':
+          description: OK
+  /vm/suspend:
+    post:
+      summary: Suspend a virtual machine
+      operationId: suspendVM
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+      responses:
+        '200':
+          description: OK
+  /vm/snapshot/create:
+    post:
+      summary: Create VM snapshot
+      operationId: createVMSnapshot
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+        - in: query
+          name: snapshot_name
+          type: string
+          required: true
+          description: Snapshot name
+        - in: query
+          name: description
+          type: string
+          required: false
+          description: Snapshot description
+        - in: query
+          name: memory
+          type: boolean
+          required: false
+          default: false
+          description: Include VM memory
+        - in: query
+          name: quiesce
+          type: boolean
+          required: false
+          default: false
+          description: Quiesce guest filesystem
+      responses:
+        '200':
+          description: OK
+  /vm/snapshot/remove_all:
+    post:
+      summary: Remove all snapshots from VM
+      operationId: removeAllVMSnapshots
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+      responses:
+        '200':
+          description: OK
+  /vm/vmotion:
+    post:
+      summary: vMotion VM to another host
+      operationId: vMotionVM
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+        - in: query
+          name: target_host
+          type: string
+          required: true
+          description: Target ESXi host name
+      responses:
+        '200':
+          description: OK
+  /vm/storage_vmotion:
+    post:
+      summary: Storage vMotion VM to another datastore
+      operationId: storageVMotionVM
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact VM name
+        - in: query
+          name: target_datastore
+          type: string
+          required: true
+          description: Target datastore name
+      responses:
+        '200':
+          description: OK
+  /host/maintenance/enter:
+    post:
+      summary: Put ESXi host into maintenance mode
+      operationId: enterHostMaintenance
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact ESXi host name
+      responses:
+        '200':
+          description: OK
+  /host/maintenance/exit:
+    post:
+      summary: Exit ESXi host from maintenance mode
+      operationId: exitHostMaintenance
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact ESXi host name
+      responses:
+        '200':
+          description: OK
+  /host/reboot:
+    post:
+      summary: Reboot ESXi host
+      operationId: rebootHost
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact ESXi host name
+        - in: query
+          name: force
+          type: boolean
+          required: false
+          default: false
+          description: Force reboot
+      responses:
+        '200':
+          description: OK
+  /host/shutdown:
+    post:
+      summary: Shutdown ESXi host
+      operationId: shutdownHost
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact ESXi host name
+        - in: query
+          name: force
+          type: boolean
+          required: false
+          default: false
+          description: Force shutdown
+      responses:
+        '200':
+          description: OK
+  /host/disconnect:
+    post:
+      summary: Disconnect ESXi host from vCenter
+      operationId: disconnectHost
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact ESXi host name
+      responses:
+        '200':
+          description: OK
+  /host/reconnect:
+    post:
+      summary: Reconnect ESXi host to vCenter
+      operationId: reconnectHost
+      parameters:
+        - in: query
+          name: name
+          type: string
+          required: true
+          description: Exact ESXi host name
+      responses:
+        '200':
+          description: OK
+definitions: {}
+parameters: {}
+responses: {}
+security: []
+tags: []
+securityDefinitions: {}
