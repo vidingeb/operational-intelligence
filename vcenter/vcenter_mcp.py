@@ -8,9 +8,9 @@ from datetime import datetime, timezone, timedelta
 
 mcp = FastMCP("vcenter-local")
 
-VCENTER = "vc01.vcf.local"
+VCENTER = os.getenv("VCENTER_HOST", "vc01.vcf.local")
 VC_USER = os.getenv("VCENTER_USER", "administrator@vsphere.local")
-VC_PASS = os.getenv("VCENTER_PASSWORD", "")
+VC_PASS = os.getenv("VCENTER_PASSWORD")
 
 def get_si():
     context = ssl._create_unverified_context()
