@@ -183,6 +183,7 @@ Try asking me:
             <option value="llama3.1:8b">⚡ 8B (Fast)</option>
             <option value="hermes3">🎯 Hermes 3 (Tool Expert)</option>
             <option value="nemotron-3-nano:4b">🟢 Nemotron Nano (NVIDIA)</option>
+            <option value="qwen2.5:7b">🐉 Qwen 2.5 7B (Alibaba)</option>
             <option value="llama3.1:70b">🧠 70B (Smart)</option>
             <option value="llama3.2">🚀 3B (Fastest)</option>
         </select>
