@@ -16,7 +16,13 @@ app = FastAPI(title="On-Prem AI Orchestrator", version="1.0")
 # Configuration
 OLLAMA_URL = "http://localhost:11434"
 MCP_SERVER = "http://10.0.0.140"
-MODEL = "llama3.1:70b"
+DEFAULT_MODEL = "llama3.1:8b"
+
+AVAILABLE_MODELS = {
+    "llama3.1:8b": {"name": "Llama 3.1 8B", "description": "Fast (~30-60s) — good for daily use"},
+    "llama3.1:70b": {"name": "Llama 3.1 70B", "description": "Slow (~3-5min) — best accuracy"},
+    "llama3.2": {"name": "Llama 3.2 3B", "description": "Fastest (~15-30s) — basic queries"},
+}
 
 VCENTER_BASE = f"{MCP_SERVER}:8080"
 OPS_BASE = f"{MCP_SERVER}:8081"
@@ -341,17 +347,21 @@ async def call_api(tool_name: str, arguments: dict) -> dict:
             return {"error": str(e)}
 
 
-async def chat_with_tools(user_message: str, conversation: list = None) -> str:
+async def chat_with_tools(user_message: str, model: str = None, conversation: list = None) -> str:
     """Send a message to Ollama with tool-calling, execute tools, return final answer."""
+    use_model = model or DEFAULT_MODEL
     if conversation is None:
         conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     conversation.append({"role": "user", "content": user_message})
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    # Use longer timeout for 70B model
+    timeout = 600.0 if "70b" in use_model else 120.0
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
         # First call — LLM decides which tools to use
         response = await client.post(f"{OLLAMA_URL}/api/chat", json={
-            "model": MODEL,
+            "model": use_model,
             "messages": conversation,
             "tools": TOOLS,
             "stream": False,
@@ -384,7 +394,7 @@ async def chat_with_tools(user_message: str, conversation: list = None) -> str:
 
         # Second call — LLM synthesizes the answer
         response = await client.post(f"{OLLAMA_URL}/api/chat", json={
-            "model": MODEL,
+            "model": use_model,
             "messages": conversation,
             "stream": False,
         })
@@ -398,27 +408,37 @@ async def chat_with_tools(user_message: str, conversation: list = None) -> str:
 
 class ChatRequest(BaseModel):
     message: str
+    model: str = None  # Optional model override
 
 class ChatResponse(BaseModel):
     answer: str
-    model: str = MODEL
+    model: str
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MODEL, "mcp_server": MCP_SERVER}
+    return {"status": "ok", "default_model": DEFAULT_MODEL, "available_models": list(AVAILABLE_MODELS.keys()), "mcp_server": MCP_SERVER}
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Ask a question about your VMware infrastructure."""
+    use_model = request.model or DEFAULT_MODEL
+    if use_model not in AVAILABLE_MODELS:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {use_model}. Available: {list(AVAILABLE_MODELS.keys())}")
     try:
-        answer = await chat_with_tools(request.message)
-        return ChatResponse(answer=answer)
+        answer = await chat_with_tools(request.message, model=use_model)
+        return ChatResponse(answer=answer, model=use_model)
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="Cannot connect to Ollama — is it running?")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/models")
+async def list_models():
+    """List available models."""
+    return AVAILABLE_MODELS
 
 
 @app.get("/tools")

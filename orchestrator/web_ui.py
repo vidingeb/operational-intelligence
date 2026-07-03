@@ -72,6 +72,15 @@ HTML_PAGE = """<!DOCTYPE html>
             color: #f0f0f0;
             border: 1px solid #2a4a7f;
         }
+        .message .model-tag {
+            display: inline-block;
+            background: #0f3460;
+            color: #81d4fa;
+            padding: 0.1rem 0.4rem;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            margin-bottom: 0.5rem;
+        }
         .message.error {
             align-self: flex-start;
             background: #3e1a1a;
@@ -91,7 +100,19 @@ HTML_PAGE = """<!DOCTYPE html>
             border-top: 1px solid #0f3460;
             display: flex;
             gap: 0.8rem;
+            align-items: center;
         }
+        #model-select {
+            padding: 0.6rem 0.8rem;
+            border: 1px solid #0f3460;
+            border-radius: 8px;
+            background: #1a1a2e;
+            color: #4fc3f7;
+            font-size: 0.85rem;
+            outline: none;
+            cursor: pointer;
+        }
+        #model-select:focus { border-color: #4fc3f7; }
         #user-input {
             flex: 1;
             padding: 0.8rem 1rem;
@@ -129,18 +150,22 @@ HTML_PAGE = """<!DOCTYPE html>
             display: flex;
             gap: 2rem;
         }
+        #timer {
+            color: #ffcc02;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
     <header>
         <h1>🖥️ On-Prem AI Assistant</h1>
-        <span class="badge">Llama 3.1 70B · Local</span>
         <span class="badge">vCenter · VCF Ops · Networks</span>
+        <span class="badge">100% On-Premises</span>
     </header>
     <div class="info-bar">
         <span>LLM: 10.0.0.141 (Ollama)</span>
         <span>APIs: 10.0.0.140 (MCP Server)</span>
-        <span>Model: llama3.1 70B Q4_K_M</span>
+        <span id="timer"></span>
     </div>
     <div id="chat-container">
         <div class="message assistant">Hello! I'm your on-premises VMware infrastructure assistant. I can query vCenter, VCF Operations, and VCF Networks — all running locally with no cloud dependency.
@@ -149,9 +174,16 @@ Try asking me:
 • "What VMs are running?"
 • "Are there any critical alerts?"
 • "Show me host resource usage"
-• "Which datastores are low on space?"</div>
+• "Which datastores are low on space?"
+
+💡 Tip: Use the model selector below — 8B is fast (~30-60s), 70B is smarter but slower (~3-5min).</div>
     </div>
     <div id="input-area">
+        <select id="model-select">
+            <option value="llama3.1:8b">⚡ 8B (Fast)</option>
+            <option value="llama3.1:70b">🧠 70B (Smart)</option>
+            <option value="llama3.2">🚀 3B (Fastest)</option>
+        </select>
         <input type="text" id="user-input" placeholder="Ask about your VMware infrastructure..." autofocus>
         <button id="send-btn" onclick="sendMessage()">Send</button>
     </div>
@@ -160,6 +192,9 @@ Try asking me:
         const chatContainer = document.getElementById('chat-container');
         const userInput = document.getElementById('user-input');
         const sendBtn = document.getElementById('send-btn');
+        const modelSelect = document.getElementById('model-select');
+        const timerEl = document.getElementById('timer');
+        let timerInterval = null;
 
         userInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
@@ -168,35 +203,55 @@ Try asking me:
             }
         });
 
+        function startTimer() {
+            let seconds = 0;
+            timerEl.textContent = '⏱ 0s';
+            timerInterval = setInterval(() => {
+                seconds++;
+                timerEl.textContent = '⏱ ' + seconds + 's';
+            }, 1000);
+        }
+
+        function stopTimer() {
+            if (timerInterval) {
+                clearInterval(timerInterval);
+                timerInterval = null;
+            }
+        }
+
         async function sendMessage() {
             const message = userInput.value.trim();
             if (!message) return;
 
-            // Add user message
+            const model = modelSelect.value;
+
             addMessage(message, 'user');
             userInput.value = '';
             sendBtn.disabled = true;
 
-            // Add thinking indicator
-            const thinkingEl = addMessage('Thinking... (querying APIs, this may take 30-60s)', 'thinking');
+            const modelLabel = modelSelect.options[modelSelect.selectedIndex].text;
+            const thinkingEl = addMessage('Thinking with ' + modelLabel + '...', 'thinking');
+            startTimer();
 
             try {
                 const response = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message }),
+                    body: JSON.stringify({ message, model }),
                 });
 
+                stopTimer();
                 chatContainer.removeChild(thinkingEl);
 
                 if (response.ok) {
                     const data = await response.json();
-                    addMessage(data.answer, 'assistant');
+                    addMessage(data.answer, 'assistant', data.model);
                 } else {
                     const err = await response.json();
                     addMessage('Error: ' + (err.detail || 'Unknown error'), 'error');
                 }
             } catch (e) {
+                stopTimer();
                 chatContainer.removeChild(thinkingEl);
                 addMessage('Connection error: ' + e.message, 'error');
             }
@@ -205,10 +260,18 @@ Try asking me:
             userInput.focus();
         }
 
-        function addMessage(text, type) {
+        function addMessage(text, type, model) {
             const div = document.createElement('div');
             div.className = 'message ' + type;
-            div.textContent = text;
+            if (model && type === 'assistant') {
+                const tag = document.createElement('div');
+                tag.className = 'model-tag';
+                tag.textContent = model;
+                div.appendChild(tag);
+                div.appendChild(document.createTextNode('\\n' + text));
+            } else {
+                div.textContent = text;
+            }
             chatContainer.appendChild(div);
             chatContainer.scrollTop = chatContainer.scrollHeight;
             return div;
@@ -226,10 +289,11 @@ async def index():
 @app.post("/api/chat")
 async def chat(request: dict):
     """Proxy to the orchestrator."""
-    async with httpx.AsyncClient(timeout=300.0) as client:
+    timeout = 600.0 if "70b" in request.get("model", "") else 300.0
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             f"{ORCHESTRATOR_URL}/chat",
-            json={"message": request["message"]},
+            json={"message": request["message"], "model": request.get("model")},
         )
         response.raise_for_status()
         return response.json()
