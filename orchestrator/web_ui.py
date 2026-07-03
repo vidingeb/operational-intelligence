@@ -181,6 +181,7 @@ Try asking me:
     <div id="input-area">
         <select id="model-select">
             <option value="llama3.1:8b">⚡ 8B (Fast)</option>
+            <option value="hermes3">🎯 Hermes 3 (Tool Expert)</option>
             <option value="llama3.1:70b">🧠 70B (Smart)</option>
             <option value="llama3.2">🚀 3B (Fastest)</option>
         </select>

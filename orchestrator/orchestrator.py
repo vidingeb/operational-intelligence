@@ -20,6 +20,7 @@ DEFAULT_MODEL = "llama3.1:8b"
 
 AVAILABLE_MODELS = {
     "llama3.1:8b": {"name": "Llama 3.1 8B", "description": "Fast (~30-60s) — good for daily use"},
+    "hermes3": {"name": "Hermes 3", "description": "Fast (~30-60s) — optimized for tool calling"},
     "llama3.1:70b": {"name": "Llama 3.1 70B", "description": "Slow (~3-5min) — best accuracy"},
     "llama3.2": {"name": "Llama 3.2 3B", "description": "Fastest (~15-30s) — basic queries"},
 }
