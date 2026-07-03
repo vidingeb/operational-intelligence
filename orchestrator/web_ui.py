@@ -134,13 +134,13 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
     <header>
         <h1>🖥️ On-Prem AI Assistant</h1>
-        <span class="badge">Llama 3.2 · Local</span>
+        <span class="badge">Llama 3.1 70B · Local</span>
         <span class="badge">vCenter · VCF Ops · Networks</span>
     </header>
     <div class="info-bar">
         <span>LLM: 10.0.0.141 (Ollama)</span>
         <span>APIs: 10.0.0.140 (MCP Server)</span>
-        <span>Model: llama3.2 3B Q4</span>
+        <span>Model: llama3.1 70B Q4_K_M</span>
     </div>
     <div id="chat-container">
         <div class="message assistant">Hello! I'm your on-premises VMware infrastructure assistant. I can query vCenter, VCF Operations, and VCF Networks — all running locally with no cloud dependency.

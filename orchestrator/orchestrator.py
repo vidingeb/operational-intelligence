@@ -16,7 +16,7 @@ app = FastAPI(title="On-Prem AI Orchestrator", version="1.0")
 # Configuration
 OLLAMA_URL = "http://localhost:11434"
 MCP_SERVER = "http://10.0.0.140"
-MODEL = "llama3.2"
+MODEL = "llama3.1:70b"
 
 VCENTER_BASE = f"{MCP_SERVER}:8080"
 OPS_BASE = f"{MCP_SERVER}:8081"
