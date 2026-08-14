@@ -12,10 +12,11 @@ Run:  python3 playground.py   (then open http://localhost:8095)
 
 import os
 import time
+import json
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -41,8 +42,13 @@ async def list_models():
 
 
 @app.post("/api/chat")
-async def chat(request: dict):
-    """Send one message to a model and return the reply plus timing metrics."""
+async def chat(request: dict, http_request: Request):
+    """Send one message to a model and return the reply plus timing metrics.
+
+    Streams from Ollama so that if the browser aborts the request (Stop
+    button), the disconnect propagates here, we close the Ollama connection,
+    and generation actually halts instead of running to completion.
+    """
     model = request.get("model")
     message = request.get("message", "").strip()
     system = request.get("system", "").strip()
@@ -55,32 +61,47 @@ async def chat(request: dict):
     messages.append({"role": "user", "content": message})
 
     started = time.time()
+    answer_parts = []
+    final = {}
     try:
         async with httpx.AsyncClient(timeout=600.0) as client:
-            resp = await client.post(
+            async with client.stream(
+                "POST",
                 f"{OLLAMA_URL}/api/chat",
-                json={"model": model, "messages": messages, "stream": False},
-            )
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
+                json={"model": model, "messages": messages, "stream": True},
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    # If the browser stopped waiting, abort generation.
+                    if await http_request.is_disconnected():
+                        raise httpx.ReadError("client disconnected")
+                    chunk = json.loads(line)
+                    answer_parts.append(chunk.get("message", {}).get("content", ""))
+                    if chunk.get("done"):
+                        final = chunk
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        # A client-initiated stop is expected; surface others as 502.
+        if await http_request.is_disconnected():
+            raise HTTPException(status_code=499, detail="stopped by client")
         raise HTTPException(status_code=502, detail=f"Ollama error: {exc}")
 
-    data = resp.json()
     wall = time.time() - started
 
     # Ollama returns durations in nanoseconds.
     def ns_to_s(v):
         return (v or 0) / 1_000_000_000
 
-    eval_count = data.get("eval_count", 0)
-    eval_s = ns_to_s(data.get("eval_duration"))
-    load_s = ns_to_s(data.get("load_duration"))
-    prompt_tokens = data.get("prompt_eval_count", 0)
+    eval_count = final.get("eval_count", 0)
+    eval_s = ns_to_s(final.get("eval_duration"))
+    load_s = ns_to_s(final.get("load_duration"))
+    prompt_tokens = final.get("prompt_eval_count", 0)
     tokens_per_sec = round(eval_count / eval_s, 1) if eval_s > 0 else None
 
     return {
         "model": model,
-        "answer": data.get("message", {}).get("content", ""),
+        "answer": "".join(answer_parts),
         "metrics": {
             "wall_seconds": round(wall, 2),
             "load_seconds": round(load_s, 2),
@@ -154,6 +175,7 @@ then click ⟳ Refresh.</div>
     <button id="refresh" onclick="loadModels()" title="Reload installed models">⟳</button>
     <input type="text" id="input" placeholder="Type a message and press Enter…" autofocus>
     <button id="send" onclick="send()">Send</button>
+    <button id="stop" onclick="stop()" style="display:none;background:#e06a6a">Stop</button>
   </div>
 <script>
   const chat = document.getElementById('chat');
@@ -161,10 +183,16 @@ then click ⟳ Refresh.</div>
   const sysEl = document.getElementById('system');
   const modelEl = document.getElementById('model');
   const sendBtn = document.getElementById('send');
+  const stopBtn = document.getElementById('stop');
+  let controller = null;
 
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   });
+
+  function stop() {
+    if (controller) controller.abort();
+  }
 
   async function loadModels() {
     try {
@@ -213,13 +241,16 @@ then click ⟳ Refresh.</div>
     addMsg(message, 'user');
     input.value = '';
     sendBtn.disabled = true;
+    stopBtn.style.display = '';
     const thinking = addMsg('Thinking with ' + model + '…', 'thinking');
+    controller = new AbortController();
 
     try {
       const r = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, message, system: sysEl.value }),
+        signal: controller.signal,
       });
       const d = await r.json();
       chat.removeChild(thinking);
@@ -227,9 +258,12 @@ then click ⟳ Refresh.</div>
       else addMsg('Error: ' + (d.detail || 'unknown'), 'error');
     } catch (e) {
       chat.removeChild(thinking);
-      addMsg('Connection error: ' + e.message, 'error');
+      if (e.name === 'AbortError') addMsg('⏹ Stopped.', 'error');
+      else addMsg('Connection error: ' + e.message, 'error');
     }
+    controller = null;
     sendBtn.disabled = false;
+    stopBtn.style.display = 'none';
     input.focus();
   }
 
