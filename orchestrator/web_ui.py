@@ -176,7 +176,7 @@ Try asking me:
 • "Show me host resource usage"
 • "Which datastores are low on space?"
 
-💡 Tip: Use the model selector below — 8B is fast (~30-60s), 70B is smarter but slower (~3-5min).</div>
+💡 Tip: Use the model selector below — 8B is fast (~30-60s), Gemma 4 26B is smarter but slower (~2-4min).</div>
     </div>
     <div id="input-area">
         <select id="model-select">
@@ -184,7 +184,7 @@ Try asking me:
             <option value="hermes3">🎯 Hermes 3 (Tool Expert)</option>
             <option value="nemotron-3-nano:4b">🟢 Nemotron Nano (NVIDIA)</option>
             <option value="qwen2.5:7b">🐉 Qwen 2.5 7B (Alibaba)</option>
-            <option value="llama3.1:70b">🧠 70B (Smart)</option>
+            <option value="gemma4:26b">🧠 Gemma 4 26B (Smart)</option>
             <option value="llama3.2">🚀 3B (Fastest)</option>
         </select>
         <input type="text" id="user-input" placeholder="Ask about your VMware infrastructure..." autofocus>
@@ -292,7 +292,7 @@ async def index():
 @app.post("/api/chat")
 async def chat(request: dict):
     """Proxy to the orchestrator."""
-    timeout = 600.0 if "70b" in request.get("model", "") else 300.0
+    timeout = 600.0 if "gemma4:26b" in request.get("model", "") else 300.0
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             f"{ORCHESTRATOR_URL}/chat",

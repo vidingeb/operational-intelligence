@@ -23,7 +23,7 @@ AVAILABLE_MODELS = {
     "hermes3": {"name": "Hermes 3", "description": "Fast (~30-60s) — optimized for tool calling"},
     "nemotron-3-nano:4b": {"name": "Nemotron 3 Nano 4B", "description": "Fast (~20-40s) — NVIDIA agent-optimized"},
     "qwen2.5:7b": {"name": "Qwen 2.5 7B", "description": "Fast (~20-40s) — excellent tool calling for its size"},
-    "llama3.1:70b": {"name": "Llama 3.1 70B", "description": "Slow (~3-5min) — best accuracy"},
+    "gemma4:26b": {"name": "Gemma 4 26B", "description": "Slow (~2-4min) — best accuracy"},
     "llama3.2": {"name": "Llama 3.2 3B", "description": "Fastest (~15-30s) — basic queries"},
 }
 
@@ -358,8 +358,8 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
 
     conversation.append({"role": "user", "content": user_message})
 
-    # Use longer timeout for 70B model
-    timeout = 600.0 if "70b" in use_model else 120.0
+    # Use longer timeout for the large Gemma model
+    timeout = 600.0 if "gemma4:26b" in use_model else 120.0
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         # First call — LLM decides which tools to use
