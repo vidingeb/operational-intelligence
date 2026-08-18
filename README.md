@@ -2,16 +2,55 @@
 
 A working implementation of **Microsoft Copilot Studio** as a conversational AI interface for VMware infrastructure. Ask natural language questions about your vCenter, VCF Operations, and VCF Network Insight environments and get real answers from live data.
 
+Now also includes a **unified gateway** with an **on-prem AI assistant** powered by **Gemma 4 26B** (via Ollama) — so you can chat with your infrastructure from a single endpoint without sending data to the cloud.
+
 📝 **Blog post:** [AI-Driven VMware Operations with Microsoft Copilot Studio](https://bervid.net/p/ai-driven-vmware-operations-with-microsoft-copilot-studio/)
 
 ## What's in this repo
 
-| Folder | Description | Port |
-|--------|-------------|------|
+| Folder / File | Description | Port |
+|---------------|-------------|------|
+| `gateway.py` | **Unified gateway** — mounts all 3 APIs + AI chat endpoint | 8000 |
 | `vcenter/` | FastAPI service wrapping pyVmomi for vCenter operations | 8080 |
 | `vcfops/` | FastAPI service for VCF Operations (Aria Operations) | 8081 |
 | `vcfNetworks/` | FastAPI service for VCF Network Insight | 8082 |
 | `swagger/` | Swagger 2.0 specs for Copilot Studio custom connectors | — |
+
+## Unified Gateway
+
+The gateway (`gateway.py`) combines all three backend APIs under one service and adds:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Combined health check across all backends |
+| `GET /dashboard` | Aggregated operational summary (VMs, hosts, alerts, snapshots, etc.) |
+| `POST /chat` | Natural-language questions answered by Gemma 4 26B with live infra context |
+| `GET /chat/models` | List available models on your Ollama instance |
+
+### Chat example
+
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Are there any VMs with old snapshots I should clean up?"}'
+```
+
+### Start the gateway
+
+```bash
+# Make sure Ollama is running with Gemma 4 26B pulled
+ollama pull gemma4:27b
+
+# Start the unified gateway
+uvicorn gateway:app --host 0.0.0.0 --port 8000
+```
+
+Environment variables for the AI assistant:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama API endpoint |
+| `OLLAMA_MODEL` | `gemma4:27b` | Default model for `/chat` |
 
 ## Architecture
 
