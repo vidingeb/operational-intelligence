@@ -3,3 +3,6 @@ __pycache__/
 *.pyo
 .env
 *.log
+
+# Unredacted screenshot originals - never publish
+assets/originals/
