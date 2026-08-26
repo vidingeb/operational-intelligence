@@ -15,6 +15,7 @@ Environment:
     MCP_SERVER      API host base URL     (default http://10.0.0.140)
     DEFAULT_MODEL   Model to use          (default llama3.1:8b)
     OLLAMA_TIMEOUT  Seconds, overrides the per-model default
+    MAX_TOOL_ROUNDS Agentic tool-calling rounds  (default 5)
 """
 
 import os
@@ -44,6 +45,14 @@ AVAILABLE_MODELS = {
 
 # Models big enough to need a long ceiling rather than the default
 LARGE_MODEL_HINTS = ("70b", "120b")
+
+# How many times the model may look at tool results and decide to call more.
+# 1 would reduce this to the old single-shot behaviour, which breaks any
+# question whose second lookup depends on the first one's answer.
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "5"))
+
+# Per-tool-result budget fed back to the model, in characters.
+TOOL_RESULT_LIMIT = int(os.getenv("TOOL_RESULT_LIMIT", "12000"))
 
 
 def timeout_for(model: str) -> float:
@@ -348,9 +357,15 @@ SYSTEM_PROMPT = """You are an on-premises VMware infrastructure assistant. You h
 When a user asks a question:
 - Use the appropriate tool(s) to gather data before answering
 - Call multiple tools in parallel when the question spans multiple domains
+- You may call tools again after seeing results. If a question requires
+  correlating systems (e.g. find alerts, then look up the VMs or hosts they
+  name), make the first calls, read the output, then make the follow-up calls
+- Tool results are labelled with the tool name that produced them
+- If a result is marked "_truncated", say so rather than implying it is complete
 - Provide concise, actionable summaries
 - If something looks unhealthy, suggest next steps
-- Never guess — always check the APIs first"""
+- Never guess — always check the APIs first
+- Always finish with a written answer, even if the data was incomplete"""
 
 
 async def call_api(tool_name: str, arguments: dict) -> dict:
@@ -376,8 +391,62 @@ async def call_api(tool_name: str, arguments: dict) -> dict:
             return {"error": str(e)}
 
 
+def summarize_tool_result(data, limit: int = TOOL_RESULT_LIMIT) -> str:
+    """Serialize a tool result, trimming whole records rather than cutting JSON mid-token.
+
+    A raw ``json.dumps(...)[:limit]`` leaves the model holding syntactically
+    broken JSON with no clue it was truncated, so it either hallucinates the
+    missing part or gives up. Instead drop entire list items and say so.
+    """
+    full = json.dumps(data, default=str)
+    if len(full) <= limit:
+        return full
+
+    # Find the longest list in the payload and trim that, keeping JSON valid.
+    container, key = None, None
+    if isinstance(data, list):
+        container = data
+    elif isinstance(data, dict):
+        lists = [(k, v) for k, v in data.items() if isinstance(v, list)]
+        if lists:
+            key, container = max(lists, key=lambda kv: len(kv[1]))
+
+    if container:
+        kept = list(container)
+        while kept:
+            kept.pop()
+            trimmed = kept if key is None else {**data, key: kept}
+            note = {
+                "_truncated": True,
+                "_note": (
+                    f"showing {len(kept)} of {len(container)} records; "
+                    "totals and counts below reflect the FULL set"
+                ),
+                "_total_records": len(container),
+            }
+            payload = (
+                {"records": kept, **note} if key is None else {**trimmed, **note}
+            )
+            candidate = json.dumps(payload, default=str)
+            if len(candidate) <= limit:
+                return candidate
+
+    # Not list-shaped (or still too big) — fall back to a truthful stub.
+    return json.dumps({
+        "_truncated": True,
+        "_note": f"result too large to include ({len(full)} bytes)",
+        "_preview": full[: max(0, limit - 200)],
+    }, default=str)
+
+
 async def chat_with_tools(user_message: str, model: str = None, conversation: list = None) -> str:
-    """Send a message to Ollama with tool-calling, execute tools, return final answer."""
+    """Send a message to Ollama with tool-calling, execute tools, return final answer.
+
+    Runs an agentic loop: the model may call tools, see the results, and then
+    call *more* tools based on what it found. This is what makes cross-system
+    questions work ("find the critical alerts, then look up those VMs"), since
+    the second lookup depends on the first one's output.
+    """
     use_model = model or DEFAULT_MODEL
     if conversation is None:
         conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -388,49 +457,58 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
     timeout = timeout_for(use_model)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
-        # First call — LLM decides which tools to use
-        response = await client.post(f"{OLLAMA_URL}/api/chat", json={
-            "model": use_model,
-            "messages": conversation,
-            "tools": TOOLS,
-            "stream": False,
+
+        async def ask(include_tools: bool) -> dict:
+            body = {
+                "model": use_model,
+                "messages": conversation,
+                "stream": False,
+            }
+            if include_tools:
+                body["tools"] = TOOLS
+            response = await client.post(f"{OLLAMA_URL}/api/chat", json=body)
+            response.raise_for_status()
+            return response.json()["message"]
+
+        for _ in range(MAX_TOOL_ROUNDS):
+            assistant_message = await ask(include_tools=True)
+            conversation.append(assistant_message)
+
+            tool_calls = assistant_message.get("tool_calls")
+            if not tool_calls:
+                content = (assistant_message.get("content") or "").strip()
+                if content:
+                    return content
+                break  # empty answer with no tool calls — force a synthesis pass
+
+            results = await asyncio.gather(*[
+                call_api(tc["function"]["name"], tc["function"].get("arguments", {}))
+                for tc in tool_calls
+            ])
+
+            # Label each result with its tool name. Without this, parallel calls
+            # come back as anonymous blobs the model cannot tell apart.
+            for tc, result_data in zip(tool_calls, results):
+                conversation.append({
+                    "role": "tool",
+                    "name": tc["function"]["name"],
+                    "content": summarize_tool_result(result_data),
+                })
+
+        # Out of rounds, or the model stalled: ask once more with tools withheld
+        # so it has to produce prose from what it has already gathered.
+        conversation.append({
+            "role": "user",
+            "content": (
+                "Answer now using the data already gathered. Do not call any more "
+                "tools. If something could not be determined, say so explicitly."
+            ),
         })
-        response.raise_for_status()
-        result = response.json()
-
-        assistant_message = result["message"]
-        conversation.append(assistant_message)
-
-        # If no tool calls, return the direct response
-        if not assistant_message.get("tool_calls"):
-            return assistant_message.get("content", "")
-
-        # Execute tool calls in parallel
-        tool_calls = assistant_message["tool_calls"]
-        tasks = []
-        for tc in tool_calls:
-            fn = tc["function"]
-            tasks.append(call_api(fn["name"], fn.get("arguments", {})))
-
-        results = await asyncio.gather(*tasks)
-
-        # Feed results back to LLM
-        for tc, result_data in zip(tool_calls, results):
-            conversation.append({
-                "role": "tool",
-                "content": json.dumps(result_data, default=str)[:4000],  # Truncate large responses
-            })
-
-        # Second call — LLM synthesizes the answer
-        response = await client.post(f"{OLLAMA_URL}/api/chat", json={
-            "model": use_model,
-            "messages": conversation,
-            "stream": False,
-        })
-        response.raise_for_status()
-        final = response.json()
-
-        return final["message"].get("content", "")
+        final = await ask(include_tools=False)
+        return (final.get("content") or "").strip() or (
+            "The model returned an empty response. Try rephrasing, or use a "
+            "model with stronger tool-calling support."
+        )
 
 
 # --- API Endpoints ---
@@ -455,6 +533,8 @@ async def config():
         "ollama_url": OLLAMA_URL,
         "mcp_server": MCP_SERVER,
         "default_model": DEFAULT_MODEL,
+        "max_tool_rounds": MAX_TOOL_ROUNDS,
+        "tool_count": len(TOOLS),
     }
 
 

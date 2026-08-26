@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Ask the operational-intelligence orchestrator a question.
+#
+#   ops "which VMs have snapshots older than 14 days?"
+#   ops -m llama3.1:8b "quick health check"
+#
+# Env:
+#   ORCHESTRATOR_URL  default http://orchestrator:8090
+#   OPS_MODEL         default gpt-oss:120b
+set -euo pipefail
+
+URL="${ORCHESTRATOR_URL:-http://orchestrator:8090}"
+MODEL="${OPS_MODEL:-gpt-oss:120b}"
+
+usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--model) MODEL="$2"; shift 2 ;;
+    -u|--url)   URL="$2"; shift 2 ;;
+    --health)   curl -fsS -m 30 "$URL/health" | python3 -m json.tool; exit 0 ;;
+    --config)   curl -fsS -m 10 "$URL/config" | python3 -m json.tool; exit 0 ;;
+    -h|--help)  usage 0 ;;
+    --)         shift; break ;;
+    -*)         echo "unknown option: $1" >&2; usage 1 ;;
+    *)          break ;;
+  esac
+done
+
+[[ $# -gt 0 ]] || usage 1
+
+python3 - "$URL" "$MODEL" "$*" <<'PY'
+import json, sys, urllib.request, urllib.error
+
+url, model, message = sys.argv[1], sys.argv[2], sys.argv[3]
+req = urllib.request.Request(
+    f"{url}/chat",
+    data=json.dumps({"model": model, "message": message}).encode(),
+    headers={"Content-Type": "application/json"},
+)
+try:
+    with urllib.request.urlopen(req, timeout=300) as r:
+        print(json.load(r).get("answer", "").strip())
+except urllib.error.HTTPError as e:
+    sys.exit(f"orchestrator returned {e.code}: {e.read().decode(errors='replace')[:500]}")
+except Exception as e:
+    sys.exit(f"could not reach {url}: {e}")
+PY
