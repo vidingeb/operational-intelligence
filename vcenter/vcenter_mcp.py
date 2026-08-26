@@ -88,8 +88,7 @@ def list_old_snapshots(days: int = 14) -> list:
 
     view.Destroy()
     return result
-print("Testing vCenter connectivity...")
-print(list_hosts())
+
 
 if __name__ == "__main__":
     mcp.run()

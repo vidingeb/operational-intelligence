@@ -1,22 +1,36 @@
 """
 On-prem AI Orchestrator — routes natural-language questions to vCenter,
-VCF Operations, and VCF Networks APIs via a local Ollama LLM.
+VCF Operations, and VCF Networks APIs via an Ollama LLM.
 
-Runs on the LLM VM (10.0.0.141) and calls APIs on the MCP server (10.0.0.140).
+Inference and data can live in different places. By default everything is
+local, matching the original single-site deployment: the orchestrator runs on
+the LLM VM (10.0.0.141) and calls APIs on the MCP server (10.0.0.140).
+
+Set OLLAMA_URL to point inference somewhere else — for example a DGX Spark
+GB10 reachable over a tailnet — and only prompts and tool results leave the
+site. vCenter credentials and the API surface stay put.
+
+Environment:
+    OLLAMA_URL      Ollama endpoint       (default http://localhost:11434)
+    MCP_SERVER      API host base URL     (default http://10.0.0.140)
+    DEFAULT_MODEL   Model to use          (default llama3.1:8b)
+    OLLAMA_TIMEOUT  Seconds, overrides the per-model default
 """
 
+import os
 import json
+import time
 import httpx
 import asyncio
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="On-Prem AI Orchestrator", version="1.0")
+app = FastAPI(title="On-Prem AI Orchestrator", version="1.1")
 
-# Configuration
-OLLAMA_URL = "http://localhost:11434"
-MCP_SERVER = "http://10.0.0.140"
-DEFAULT_MODEL = "llama3.1:8b"
+# Configuration — env-overridable so the same code runs single- or split-site
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+MCP_SERVER = os.getenv("MCP_SERVER", "http://10.0.0.140").rstrip("/")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3.1:8b")
 
 AVAILABLE_MODELS = {
     "llama3.1:8b": {"name": "Llama 3.1 8B", "description": "Fast (~30-60s) — good for daily use"},
@@ -25,7 +39,19 @@ AVAILABLE_MODELS = {
     "qwen2.5:7b": {"name": "Qwen 2.5 7B", "description": "Fast (~20-40s) — excellent tool calling for its size"},
     "llama3.1:70b": {"name": "Llama 3.1 70B", "description": "Slow (~3-5min) — best accuracy"},
     "llama3.2": {"name": "Llama 3.2 3B", "description": "Fastest (~15-30s) — basic queries"},
+    "gpt-oss:120b": {"name": "GPT-OSS 120B", "description": "Strongest multi-step tool calling — needs a GB10-class host"},
 }
+
+# Models big enough to need a long ceiling rather than the default
+LARGE_MODEL_HINTS = ("70b", "120b")
+
+
+def timeout_for(model: str) -> float:
+    """Request timeout in seconds, overridable via OLLAMA_TIMEOUT."""
+    override = os.getenv("OLLAMA_TIMEOUT")
+    if override:
+        return float(override)
+    return 600.0 if any(h in model.lower() for h in LARGE_MODEL_HINTS) else 120.0
 
 VCENTER_BASE = f"{MCP_SERVER}:8080"
 OPS_BASE = f"{MCP_SERVER}:8081"
@@ -358,8 +384,8 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
 
     conversation.append({"role": "user", "content": user_message})
 
-    # Use longer timeout for 70B model
-    timeout = 600.0 if "70b" in use_model else 120.0
+    # Large models need a longer ceiling; OLLAMA_TIMEOUT overrides
+    timeout = timeout_for(use_model)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         # First call — LLM decides which tools to use
@@ -418,9 +444,88 @@ class ChatResponse(BaseModel):
     model: str
 
 
+@app.get("/config")
+async def config():
+    """Backend configuration, with no liveness probing.
+
+    Separate from /health so callers that only need to display which backends
+    are configured return instantly, instead of waiting on probe timeouts.
+    """
+    return {
+        "ollama_url": OLLAMA_URL,
+        "mcp_server": MCP_SERVER,
+        "default_model": DEFAULT_MODEL,
+    }
+
+
+async def _probe_ollama() -> dict:
+    """Check the inference backend: reachable, model present, model resident."""
+    info = {"url": OLLAMA_URL, "reachable": False}
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            tags = await client.get(f"{OLLAMA_URL}/api/tags")
+            tags.raise_for_status()
+            info["reachable"] = True
+            info["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+
+            installed = [m.get("model") for m in tags.json().get("models", [])]
+            info["default_model_installed"] = DEFAULT_MODEL in installed
+
+            # A resident model answers immediately; a cold one pays a load cost
+            ps = await client.get(f"{OLLAMA_URL}/api/ps")
+            if ps.status_code == 200:
+                info["models_resident"] = [m.get("model") for m in ps.json().get("models", [])]
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
+async def _probe_api(name: str, base: str) -> dict:
+    """Check one backing API is answering."""
+    info = {"name": name, "url": base, "reachable": False}
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{base}/docs")
+            info["reachable"] = resp.status_code < 500
+            info["status_code"] = resp.status_code
+            info["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "default_model": DEFAULT_MODEL, "available_models": list(AVAILABLE_MODELS.keys()), "mcp_server": MCP_SERVER}
+    """Report whether inference and the backing APIs are actually reachable.
+
+    Always returns 200 so a probe can read the detail; use the `status`
+    field rather than the HTTP code to decide if the system is usable.
+    """
+    ollama, vcenter, ops, networks = await asyncio.gather(
+        _probe_ollama(),
+        _probe_api("vcenter", VCENTER_BASE),
+        _probe_api("vcf_ops", OPS_BASE),
+        _probe_api("vcf_networks", NETWORKS_BASE),
+    )
+
+    apis = [vcenter, ops, networks]
+    if not ollama["reachable"]:
+        status = "unavailable"  # no inference, nothing works
+    elif not all(a["reachable"] for a in apis):
+        status = "degraded"     # can answer, but not from live data
+    else:
+        status = "ok"
+
+    return {
+        "status": status,
+        "default_model": DEFAULT_MODEL,
+        "available_models": list(AVAILABLE_MODELS.keys()),
+        "mcp_server": MCP_SERVER,
+        "inference": ollama,
+        "apis": apis,
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -433,7 +538,7 @@ async def chat(request: ChatRequest):
         answer = await chat_with_tools(request.message, model=use_model)
         return ChatResponse(answer=answer, model=use_model)
     except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Cannot connect to Ollama — is it running?")
+        raise HTTPException(status_code=503, detail=f"Cannot reach Ollama at {OLLAMA_URL} — is it running and reachable?")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

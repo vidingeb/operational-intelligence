@@ -5,11 +5,12 @@ Serves a single-page chat interface on port 8091.
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+import os
 import httpx
 
 app = FastAPI(title="On-Prem AI Chat")
 
-ORCHESTRATOR_URL = "http://localhost:8090"
+ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8090").rstrip("/")
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -163,8 +164,8 @@ HTML_PAGE = """<!DOCTYPE html>
         <span class="badge">100% On-Premises</span>
     </header>
     <div class="info-bar">
-        <span>LLM: 10.0.0.141 (Ollama)</span>
-        <span>APIs: 10.0.0.140 (MCP Server)</span>
+        <span>LLM: {{LLM_BACKEND}}</span>
+        <span>APIs: {{API_BACKEND}}</span>
         <span id="timer"></span>
     </div>
     <div id="chat-container">
@@ -185,6 +186,7 @@ Try asking me:
             <option value="nemotron-3-nano:4b">🟢 Nemotron Nano (NVIDIA)</option>
             <option value="qwen2.5:7b">🐉 Qwen 2.5 7B (Alibaba)</option>
             <option value="llama3.1:70b">🧠 70B (Smart)</option>
+            <option value="gpt-oss:120b">🚀 120B (GB10)</option>
             <option value="llama3.2">🚀 3B (Fastest)</option>
         </select>
         <input type="text" id="user-input" placeholder="Ask about your VMware infrastructure..." autofocus>
@@ -286,7 +288,22 @@ Try asking me:
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return HTML_PAGE
+    """Render the chat page, labelling the backends actually in use.
+
+    Asks the orchestrator rather than duplicating its config, so a split-site
+    deployment shows the real inference host instead of a stale hardcoded IP.
+    Uses /config, not /health, so page load never waits on probe timeouts.
+    """
+    llm, apis = "unknown", "unknown"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            cfg = (await client.get(f"{ORCHESTRATOR_URL}/config")).json()
+        llm = cfg.get("ollama_url", "unknown")
+        apis = cfg.get("mcp_server", "unknown")
+    except Exception:
+        pass  # the page is still usable; the banner just says unknown
+
+    return HTML_PAGE.replace("{{LLM_BACKEND}}", llm).replace("{{API_BACKEND}}", apis)
 
 
 @app.post("/api/chat")
