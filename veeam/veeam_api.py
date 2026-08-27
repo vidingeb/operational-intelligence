@@ -9,10 +9,15 @@ Two things about this API are worth knowing before reading the code:
 
   * Every request needs an x-api-version header, and it must match the build.
     Each release differs, and a mismatch returns an opaque 400 rather than
-    saying so. The installed build here is 13.0.1.1071, whose header value was
-    not known when this was written, so the version is negotiated at login,
-    reported in every response, and the rejection bodies are surfaced on
+    saying so. The installed build here is 13.0.1.1071 on Windows, whose header
+    value was not known when this was written, so the version is negotiated at
+    login, reported in every response, and the rejection bodies are surfaced on
     failure — the server usually names the version it wants.
+
+    On Windows the REST API is served by its own service, "Veeam Backup &
+    Replication REST API Service", listening on 9419. It is not always running
+    after an install or upgrade, and a stopped service presents as a connection
+    refused rather than anything about Veeam.
   * A job reporting Success is not evidence a given VM is protected. Jobs
     succeed while silently skipping VMs. Protection is therefore derived from
     restore points, which are per-object facts.
@@ -108,7 +113,12 @@ def authenticate(force: bool = False) -> Dict[str, Any]:
         try:
             response = _login(version)
         except requests.RequestException as exc:
-            raise HTTPException(status_code=502, detail=f"Cannot reach {VEEAM_URL}: {exc}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Cannot reach {VEEAM_URL}: {exc}. On Windows, check the "
+                       f"'Veeam Backup & Replication REST API Service' is running — "
+                       f"it is a separate service from the backup service itself.",
+            )
 
         if response.status_code == 200:
             body = response.json()
