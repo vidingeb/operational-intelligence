@@ -582,9 +582,15 @@ the way an experienced engineer does.
 - Be concise and specific. An operator wants "esx03: 94% memory, 3 VMs
   ballooning" not a paragraph of narration.
 - Say what you checked, so the boundaries of the answer are visible.
-- Output is displayed as plain text, not rendered Markdown. Do not use
-  Markdown tables — the pipes and dashes appear literally and are unreadable.
-  Never emit HTML such as <br>. Use short labelled lines and simple "- " bullets.
+- Output is displayed in a pane that renders Markdown tables as real tables
+  with a CSV download button. Use a Markdown table whenever you are reporting
+  more than about three items that share the same fields — one row per object,
+  a header row, and a separator row. Do not emit HTML such as <br>; it is
+  stripped. Prose, headings and "- " bullets are fine for everything else.
+- Put every row you are reporting in the table. Never write "the remaining N
+  follow the same pattern" or similar: you have not checked that they do, and
+  it hides the exceptions that make the table worth reading. If there are too
+  many rows, say how many you are showing and how many exist.
 - A sample is not a complete set. If a result carries "showing" or
   "more_available", say so rather than presenting it as everything there is.
 - Never offer to run a query you have no tool for. Saying "let me know and I
@@ -1184,33 +1190,26 @@ async def estate_versions() -> dict:
 
 # --- Output shaping ----------------------------------------------------------
 #
-# The chat pane renders plain text, not Markdown: it builds messages with
-# createTextNode, so a Markdown table arrives as literal "|---|---|" pipes and
-# an HTML <br> arrives as the characters "<br>". The system prompt tells the
-# model this, but a prompt is a request rather than a guarantee, so the common
-# cases are also repaired here — server-side, where they can be tested.
+# The chat pane now renders Markdown tables as real tables with a CSV download,
+# so tables are wanted rather than repaired away. Earlier this function
+# flattened them to "cell - cell" lines because the pane could only display
+# text nodes; that was a workaround for a missing renderer, and rows of
+# pipe-separated names are unreadable past a handful of items.
+#
+# HTML is still stripped: the renderer deliberately builds every cell with
+# textContent, so markup from the model is neither rendered nor wanted.
 
-_TABLE_RULE = re.compile(r"^\s*\|[\s|:\-]+\|\s*$", re.M)
-_TABLE_ROW = re.compile(r"^\s*\|(.+?)\|\s*$", re.M)
 _HTML_BREAK = re.compile(r"<br\s*/?>", re.I)
 
 
 def plain_text(answer: str) -> str:
-    """Flatten Markdown tables and HTML breaks for a plain-text surface.
+    """Remove HTML that the pane will not render, leaving Markdown tables intact.
 
-    Table rows become "cell  -  cell" lines, which stay readable without a
-    renderer. Nothing else is touched: bullets and headings are legible as
-    written, and rewriting them further risks mangling content.
+    The table rows are passed through untouched for the client-side renderer.
     """
     if not answer:
         return answer
     text = _HTML_BREAK.sub(" ", answer)
-    text = _TABLE_RULE.sub("", text)
-    text = _TABLE_ROW.sub(
-        lambda m: "  -  ".join(c.strip() for c in m.group(1).split("|") if c.strip()),
-        text,
-    )
-    # Collapse the blank lines left behind by removed separator rows.
     return re.sub(r"\n{3,}", "\n\n", text)
 
 

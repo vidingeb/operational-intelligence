@@ -21,19 +21,26 @@ def test_html_break_is_removed():
     assert "<br/>" not in o.plain_text("one<br/>two")
 
 
-def test_table_separator_row_is_dropped():
+def test_tables_are_passed_through_for_the_renderer():
+    """These used to be flattened to "cell - cell" because the pane could only
+    show text nodes. It now renders real tables, so flattening would destroy
+    the thing the renderer looks for."""
     table = "| Source | Findings |\n|--------|----------|\n| vCenter | 3 alarms |"
-    out = o.plain_text(table)
-    assert "|--------|" not in out
-    assert "---" not in out
+    assert o.plain_text(table) == table
 
 
-def test_table_rows_become_readable_lines():
-    table = "| Source | Findings |\n|--------|----------|\n| vCenter | 3 alarms |"
+def test_table_with_many_rows_survives_intact():
+    rows = "\n".join(f"| vm{i} | vmx-2{i % 3} |" for i in range(30))
+    table = "| Name | Hardware |\n|---|---|\n" + rows
     out = o.plain_text(table)
-    assert "Source  -  Findings" in out
-    assert "vCenter  -  3 alarms" in out
-    assert "|" not in out
+    assert out.count("|") == table.count("|")
+
+
+def test_html_is_still_stripped_from_a_table():
+    table = "| Name | Note |\n|---|---|\n| vm1 | a<br>b |"
+    out = o.plain_text(table)
+    assert "<br>" not in out
+    assert "| vm1 | a b |" in out
 
 
 def test_ordinary_prose_is_left_alone():

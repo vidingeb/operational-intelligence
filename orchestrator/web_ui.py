@@ -108,6 +108,48 @@ HTML_PAGE = """<!DOCTYPE html>
             font-size: 0.7rem;
             margin-bottom: 0.5rem;
         }
+        /* Tabular results. The pane renders text nodes, so a Markdown table
+           used to arrive as literal pipes - unreadable past a few rows. */
+        .table-block {
+            margin: 0.6rem 0;
+            overflow-x: auto;
+        }
+        .table-block table {
+            border-collapse: collapse;
+            font-size: 0.82rem;
+            width: 100%;
+        }
+        .table-block th, .table-block td {
+            border: 1px solid #2a4a7f;
+            padding: 0.25rem 0.5rem;
+            text-align: left;
+            white-space: nowrap;
+        }
+        .table-block th {
+            background: #0f3460;
+            color: #81d4fa;
+            position: sticky;
+            top: 0;
+        }
+        .table-block tbody tr:nth-child(even) { background: rgba(255,255,255,0.03); }
+        .table-tools {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            margin-bottom: 0.3rem;
+        }
+        .table-count { font-size: 0.72rem; color: #9fb3c8; }
+        .csv-button {
+            background: #0f3460;
+            color: #81d4fa;
+            border: 1px solid #2a4a7f;
+            border-radius: 4px;
+            padding: 0.15rem 0.5rem;
+            font-size: 0.72rem;
+            cursor: pointer;
+            font-family: inherit;
+        }
+        .csv-button:hover { background: #17518f; }
         .message.error {
             align-self: flex-start;
             background: #3e1a1a;
@@ -342,6 +384,137 @@ HTML_PAGE = """<!DOCTYPE html>
             userInput.focus();
         }
 
+        // --- Markdown table rendering ----------------------------------------
+        //
+        // The pane builds messages from text nodes, so a Markdown table used to
+        // arrive as literal "|---|" pipes. The server was flattening tables to
+        // compensate; now they are rendered properly and each one gets a CSV
+        // download, because the answer to "which VMs" is usually the start of a
+        // piece of work rather than the end of one.
+        //
+        // Every cell goes in via textContent. Nothing here uses innerHTML: this
+        // text comes from a model and must never be able to inject markup.
+
+        const TABLE_ROW = /^\\s*\\|(.+)\\|\\s*$/;
+        const TABLE_SEP = /^\\s*\\|[\\s:|-]+\\|\\s*$/;
+
+        function splitCells(line) {
+            return line.replace(/^\\s*\\|/, '').replace(/\\|\\s*$/, '')
+                       .split('|').map(c => c.trim());
+        }
+
+        function csvEscape(value) {
+            const text = (value === null || value === undefined) ? '' : String(value);
+            return /[",\\n\\r]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+        }
+
+        function toCsv(header, rows) {
+            return [header].concat(rows)
+                .map(r => r.map(csvEscape).join(','))
+                .join('\\r\\n');
+        }
+
+        function downloadCsv(header, rows, index) {
+            const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+            // BOM so Excel opens UTF-8 names correctly.
+            const blob = new Blob(['\\uFEFF' + toCsv(header, rows)],
+                                  {type: 'text/csv;charset=utf-8;'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'ops-table-' + index + '-' + stamp + '.csv';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        let tableSeq = 0;
+
+        function buildTable(header, rows) {
+            const block = document.createElement('div');
+            block.className = 'table-block';
+
+            const tools = document.createElement('div');
+            tools.className = 'table-tools';
+            const count = document.createElement('span');
+            count.className = 'table-count';
+            count.textContent = rows.length + (rows.length === 1 ? ' row' : ' rows');
+            const button = document.createElement('button');
+            button.className = 'csv-button';
+            button.textContent = 'Download CSV';
+            const index = ++tableSeq;
+            button.addEventListener('click', () => downloadCsv(header, rows, index));
+            tools.appendChild(button);
+            tools.appendChild(count);
+            block.appendChild(tools);
+
+            const table = document.createElement('table');
+            const thead = document.createElement('thead');
+            const headRow = document.createElement('tr');
+            header.forEach(cell => {
+                const th = document.createElement('th');
+                th.textContent = cell;
+                headRow.appendChild(th);
+            });
+            thead.appendChild(headRow);
+            table.appendChild(thead);
+
+            const tbody = document.createElement('tbody');
+            rows.forEach(row => {
+                const tr = document.createElement('tr');
+                for (let i = 0; i < header.length; i++) {
+                    const td = document.createElement('td');
+                    td.textContent = row[i] === undefined ? '' : row[i];
+                    tr.appendChild(td);
+                }
+                tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+            block.appendChild(table);
+            return block;
+        }
+
+        function renderBody(container, text) {
+            const lines = String(text).split('\\n');
+            let buffer = [];
+            let i = 0;
+
+            function flushText() {
+                if (buffer.length) {
+                    container.appendChild(document.createTextNode(buffer.join('\\n')));
+                    buffer = [];
+                }
+            }
+
+            while (i < lines.length) {
+                const isTableStart = TABLE_ROW.test(lines[i]) &&
+                                     i + 1 < lines.length &&
+                                     TABLE_SEP.test(lines[i + 1]);
+                if (isTableStart) {
+                    const header = splitCells(lines[i]);
+                    const rows = [];
+                    let j = i + 2;
+                    while (j < lines.length && TABLE_ROW.test(lines[j]) &&
+                           !TABLE_SEP.test(lines[j])) {
+                        rows.push(splitCells(lines[j]));
+                        j++;
+                    }
+                    // A header and separator with no rows is not a table worth
+                    // framing; fall through and leave it as text.
+                    if (rows.length) {
+                        flushText();
+                        container.appendChild(buildTable(header, rows));
+                        i = j;
+                        continue;
+                    }
+                }
+                buffer.push(lines[i]);
+                i++;
+            }
+            flushText();
+        }
+
         function addMessage(text, type, model, data) {
             const div = document.createElement('div');
             div.className = 'message ' + type;
@@ -350,7 +523,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 tag.className = 'model-tag';
                 tag.textContent = model;
                 div.appendChild(tag);
-                div.appendChild(document.createTextNode('\\n' + text));
+                renderBody(div, '\\n' + text);
                 const usage = buildUsageBar(data);
                 if (usage) div.appendChild(usage);
                 (data && data.pending_actions || []).forEach(a => {
