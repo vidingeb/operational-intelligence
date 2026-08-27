@@ -414,6 +414,7 @@ def flows(
     port: Optional[str] = Query(None, description="Optional destination port."),
     protocol: Optional[str] = Query(None, description="Optional protocol TCP/UDP."),
     filter: Optional[str] = Query(None, description="Raw Network Insight filter expression, overrides the others."),
+    hours: int = Query(24, description="Look back this many hours. Flow search defaults to a zero-width window, which always returns nothing."),
     size: int = Query(50, description="Max number of results.")
 ):
     """Traffic flows, via the Network Insight search DSL.
@@ -443,7 +444,14 @@ def flows(
             )
         expression = " and ".join(clauses)
 
-    payload = {"entity_type": "Flow", "filter": expression, "size": size}
+    now = int(time.time())
+    start = now - max(hours, 1) * 3600
+    payload = {
+        "entity_type": "Flow",
+        "filter": expression,
+        "size": size,
+        "time_range": {"start_time": start, "end_time": now},
+    }
 
     try:
         results = client.request("POST", "/api/ni/search", json=payload)
@@ -461,4 +469,4 @@ def flows(
             },
         )
 
-    return {"filter_used": expression, "results": results}
+    return {"filter_used": expression, "time_range": payload["time_range"], "results": results}
