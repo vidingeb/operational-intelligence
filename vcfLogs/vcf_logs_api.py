@@ -39,7 +39,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-LOGS_URL = os.getenv("LOGS_URL", "https://log01.vcf.local").rstrip("/")
+LOGS_URL = os.getenv("LOGS_URL", "https://log01.vcf.local:9543").rstrip("/")
 LOGS_USER = os.getenv("LOGS_USER", "admin")
 LOGS_PASS = os.getenv("LOGS_PASSWORD")
 LOGS_PROVIDER = os.getenv("LOGS_PROVIDER", "Local")
