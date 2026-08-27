@@ -341,12 +341,12 @@ def resolve_ip(name: str) -> str:
     entity_id = results[0].get("entity_id")
     detail = client.request("GET", f"/api/ni/entities/vms/{quote(str(entity_id), safe='')}")
 
-    for key in ("ip_addresses", "ip_address"):
-        value = detail.get(key)
-        if isinstance(value, list) and value:
-            return value[0] if isinstance(value[0], str) else str(value[0])
-        if isinstance(value, str) and value:
-            return value
+    # ip_addresses is a list of objects: [{"ip_address": "10.0.0.100", ...}]
+    for entry in detail.get("ip_addresses") or []:
+        if isinstance(entry, dict) and entry.get("ip_address"):
+            return entry["ip_address"]
+        if isinstance(entry, str) and IP_RE.fullmatch(entry):
+            return entry
 
     raise HTTPException(
         status_code=422,
