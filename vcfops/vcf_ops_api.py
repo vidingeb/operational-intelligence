@@ -138,15 +138,31 @@ def _alert_list(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 # -----------------------------------------------------------------------------
 @app.get("/ops/health")
 def health():
-    return {
-        "status": "ok",
+    """Report whether VCF Operations can actually be authenticated against.
+
+    This previously returned a hardcoded "ok" without contacting anything,
+    which is how OPS_PASSWORD went missing entirely without a single health
+    check noticing. Returns 200 either way so a probe can read the detail;
+    check `status`, not the HTTP code.
+    """
+    info = {
         "ops_url": OPS_URL,
         "ops_user": OPS_USER,
         "auth_source": OPS_AUTH_SOURCE,
         "verify_ssl": VERIFY_SSL,
         "api_version": "2.0.0",
-        "note": "Password is read from OPS_PASSWORD environment variable and is not returned here.",
+        "password_configured": bool(OPS_PASS),
     }
+    try:
+        get_token()
+        info["status"] = "ok"
+    except HTTPException as exc:
+        info["status"] = "unavailable"
+        info["error"] = exc.detail
+    except Exception as exc:
+        info["status"] = "unavailable"
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
 
 
 @app.get("/ops/auth/test")

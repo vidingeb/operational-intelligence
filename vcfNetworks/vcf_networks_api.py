@@ -214,14 +214,32 @@ def root():
 
 @app.get("/ni/health")
 def health():
-    return {
-        "status": "ok",
+    """Report whether Network Insight can actually be reached and authenticated.
+
+    This returned a hardcoded "ok" while the credentials behind it had been
+    overwritten with placeholders, so nothing detected the outage. Returns 200
+    either way; check `status`, not the HTTP code.
+    """
+    info = {
         "service": "vcf-networks-api-proxy",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "target": NI_BASE_URL,
         "domain_type": NI_DOMAIN_TYPE,
-        "auth_mode": "api-token"
+        "auth_mode": "api-token",
+        "credentials_configured": bool(NI_USERNAME and NI_PASSWORD),
     }
+    try:
+        upstream = client.request("GET", "/api/ni/info/version")
+        info["status"] = "ok"
+        if isinstance(upstream, dict):
+            info["upstream_version"] = upstream.get("version")
+    except HTTPException as exc:
+        info["status"] = "unavailable"
+        info["error"] = exc.detail
+    except Exception as exc:
+        info["status"] = "unavailable"
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
 
 
 @app.post("/ni/login")
