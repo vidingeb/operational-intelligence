@@ -264,9 +264,20 @@ REGISTRY = [
         "protocol": (Str, False, "TCP or UDP"),
         "hours": (Int, False, "Look-back window in hours (default 24)"),
         "size": (Int, False, "Max results (default 50)")}),
+    _t("networks_flow_inventory", "GET", f"{NETWORKS_BASE}/ni/flows/inventory",
+       "PREFERRED for any question about observed traffic: which flows are north-south or "
+       "east-west, which VMs are talking, to what, on which ports, and whether the firewall "
+       "allowed it. Resolves every flow server-side in one call and returns a traffic_type "
+       "breakdown. Use this instead of networks_flows_recent whenever the question is about "
+       "the content of the traffic rather than merely whether collection is working",
+       {"hours": (Int, False, "Look-back window in hours (default 1)"),
+        "limit": (Int, False, "Max flows to resolve (default 100)"),
+        "traffic_type": (Str, False, "Filter, e.g. north_south or east_west"),
+        "vm": (Str, False, "Only flows where this VM is source or destination")}),
     _t("networks_flows_recent", "GET", f"{NETWORKS_BASE}/ni/flows/recent",
-       "Recently observed traffic flows across the estate, unfiltered. Use to check whether flow "
-       "data is being collected, or for a general picture of current traffic",
+       "Raw flow identifiers only — returns entity IDs with no IPs, VM names or ports. "
+       "Use ONLY to confirm that flow collection is running. It cannot answer any question "
+       "about who is talking to whom; for that use networks_flow_inventory",
        {"hours": (Int, False, "Look-back window in hours (default 1)"),
         "size": (Int, False, "Max results (default 50)")}),
     _t("networks_datasources", "GET", f"{NETWORKS_BASE}/ni/data-sources/vcenters",

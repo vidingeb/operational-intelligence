@@ -604,6 +604,45 @@ def cluster_details(cluster_id: str):
 MAX_HYDRATE = 20
 
 
+def flow_record(flow: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a flow entity into the fields operators actually ask about.
+
+    Field names here were read off a live flow rather than inferred. Notably
+    the entity carries `source_vm` and `destination_vm`, which earlier code
+    omitted, so flows came back without the VM names that make them readable.
+    `destination_vm` is absent for anything that is not a VM, such as a
+    broadcast address or an external host, and that absence is meaningful.
+    """
+    port = flow.get("port") or {}
+
+    record = {
+        "entity_id": flow.get("entity_id"),
+        "name": flow.get("name"),
+        "source_ip": (flow.get("source_ip") or {}).get("ip_address"),
+        "destination_ip": (flow.get("destination_ip") or {}).get("ip_address"),
+        "port": port.get("iana_port_display") or port.get("display") or port.get("start"),
+        "protocol": flow.get("protocol"),
+        "traffic_type": flow.get("traffic_type"),
+        "firewall_action": flow.get("firewall_action"),
+        "within_host": flow.get("within_host"),
+    }
+
+    for key, source in (
+        ("source_vm", "source_vm"),
+        ("destination_vm", "destination_vm"),
+        ("source_host", "source_host"),
+        ("destination_host", "destination_host"),
+        ("source_l2_network", "source_l2_network"),
+        ("destination_l2_network", "destination_l2_network"),
+        ("source_cluster", "source_cluster"),
+    ):
+        value = flow.get(source)
+        if isinstance(value, dict) and value.get("entity_name"):
+            record[key] = value["entity_name"]
+
+    return {k: v for k, v in record.items() if v is not None}
+
+
 def hydrate_flows(results: Dict[str, Any], size: int) -> list:
     """Turn flow entity references into readable flow records.
 
@@ -629,20 +668,7 @@ def hydrate_flows(results: Dict[str, Any], size: int) -> list:
             out.append({"entity_id": entity_id, "error": "could not fetch flow detail"})
             continue
 
-        port = flow.get("port") or {}
-        out.append({
-            "entity_id": entity_id,
-            "name": flow.get("name"),
-            "source_ip": (flow.get("source_ip") or {}).get("ip_address"),
-            "destination_ip": (flow.get("destination_ip") or {}).get("ip_address"),
-            "port": port.get("display") or port.get("start"),
-            "protocol": flow.get("protocol"),
-            "traffic_type": flow.get("traffic_type"),
-            "firewall_action": flow.get("firewall_action"),
-            "source_host": (flow.get("source_host") or {}).get("entity_name"),
-            "destination_host": (flow.get("destination_host") or {}).get("entity_name"),
-            "source_l2_network": (flow.get("source_l2_network") or {}).get("entity_name"),
-        })
+        out.append(flow_record(flow))
 
     if len(refs) > len(out):
         out.append({
@@ -739,6 +765,98 @@ def flows_recent(
         f"/api/ni/entities/flows?size={size}"
         f"&start_time={now - max(hours, 1) * 3600}&end_time={now}",
     )
+
+
+@app.get("/ni/flows/inventory")
+def flows_inventory(
+    hours: int = Query(1, ge=1, le=168, description="Look back this many hours."),
+    limit: int = Query(100, ge=1, le=500, description="Maximum flows to resolve."),
+    traffic_type: Optional[str] = Query(
+        None,
+        description="Filter by traffic type, e.g. north_south or east_west. "
+                    "Matched loosely against the upstream enum.",
+    ),
+    vm: Optional[str] = Query(None, description="Only flows where this VM is source or destination."),
+):
+    """Recent flows, fully resolved, in a single call.
+
+    Listing flows returns entity references only: {entity_id, entity_type,
+    time}. That is enough to prove collection is working and nothing else, so
+    a question like "which flows are north-south" was unanswerable without one
+    detail call per flow. With 51 flows and five tool rounds, the model
+    correctly reported that it could not answer.
+
+    Each reference is resolved here concurrently, and the traffic_type
+    breakdown is counted across everything fetched, so the split can be
+    reported even when the flow list itself is trimmed.
+    """
+    now = int(time.time())
+    window = f"?start_time={now - hours * 3600}&end_time={now}"
+    refs, total_known = list_entity_refs("/api/ni/entities/flows" + window, limit)
+
+    def fetch(ref):
+        entity_id = ref.get("entity_id")
+        if not entity_id:
+            return None
+        try:
+            return client.request(
+                "GET", f"/api/ni/entities/flows/{quote(str(entity_id), safe='')}"
+            )
+        except HTTPException:
+            return {"entity_id": entity_id, "error": "could not fetch flow detail"}
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        details = list(pool.map(fetch, refs))
+
+    flows_out = []
+    for detail in details:
+        if not detail:
+            continue
+        if detail.get("error"):
+            flows_out.append(detail)
+            continue
+        flows_out.append(flow_record(detail))
+
+    fetched = len(flows_out)
+
+    # Counted before filtering: the breakdown describes the observed window,
+    # not the subset that survived the filter.
+    breakdown: Dict[str, int] = {}
+    for record in flows_out:
+        label = record.get("traffic_type") or "UNKNOWN"
+        breakdown[label] = breakdown.get(label, 0) + 1
+
+    if traffic_type:
+        wanted = traffic_type.strip().upper().replace("-", "_").replace(" ", "_")
+        wanted = wanted.replace("_TRAFFIC", "")
+        flows_out = [
+            f for f in flows_out
+            if wanted in (f.get("traffic_type") or "").upper()
+        ]
+
+    if vm:
+        needle = vm.strip().lower()
+        flows_out = [
+            f for f in flows_out
+            if needle in (f.get("source_vm") or "").lower()
+            or needle in (f.get("destination_vm") or "").lower()
+        ]
+
+    incomplete = isinstance(total_known, int) and fetched < total_known
+
+    return {
+        "flow_count": len(flows_out),
+        "flows_examined": fetched,
+        "total_flows_known": total_known,
+        "truncated": incomplete,
+        "traffic_type_breakdown": breakdown,
+        "hint": (
+            f"Examined {fetched} of {total_known} flows in the window; the rest "
+            "were not fetched. Say so rather than presenting this as all traffic."
+        ) if incomplete else None,
+        "filter": {"traffic_type": traffic_type, "vm": vm, "hours": hours},
+        "flows": flows_out,
+    }
 
 
 @app.get("/ni/flows/detail/{flow_id}")
