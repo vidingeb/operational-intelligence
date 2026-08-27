@@ -29,6 +29,7 @@ import time
 import secrets
 import httpx
 import asyncio
+from typing import Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -152,6 +153,13 @@ REGISTRY = [
        "VMs whose VMware Tools are outdated"),
     _t("vcenter_vmtools_notrunning", "GET", f"{VCENTER_BASE}/vmtools/notrunning",
        "Powered-on VMs where VMware Tools is not running — blocks guest shutdown and backup quiescing"),
+    _t("vcenter_vm_versions", "GET", f"{VCENTER_BASE}/vms/versions",
+       "Virtual hardware version (vmx-NN) and VMware Tools version/status for "
+       "every VM, grouped by version with counts and sample names. Use for "
+       "'what hardware version are the VMs on', 'are tools up to date', and "
+       "upgrade or lifecycle planning. Compares against the newest hardware "
+       "version actually present, not a fixed maximum",
+       {"limit": (Int, False, "Max per-VM rows returned (default 500)")}),
 
     # --- vCenter: events ----------------------------------------------------
     _t("vcenter_alarms", "GET", f"{VCENTER_BASE}/alarms",
@@ -1034,6 +1042,58 @@ async def triage_estate(full: bool = False) -> dict:
     }
 
 
+def _version_tuple(text: Any) -> Optional[tuple]:
+    """Parse "9.0.2" into (9, 0, 2). None if it is not a plain dotted number."""
+    if not isinstance(text, str):
+        return None
+    parts = text.strip().split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def _vcenter_host_alignment(vcenter: Any, hosts: Any) -> Optional[dict]:
+    """Compare vCenter's version with the ESXi hosts it manages.
+
+    vCenter ahead of its hosts is the supported direction; hosts ahead of
+    vCenter is not. Live estate: vCenter 9.0.2, hosts 9.0.1 — a real gap that
+    is easy to miss when the two numbers sit in separate sections of an answer.
+    Returns None rather than guessing when either side is unparseable.
+    """
+    if not isinstance(vcenter, dict) or not isinstance(hosts, dict):
+        return None
+    vc = _version_tuple(vcenter.get("version"))
+    host_versions = {b.get("version") for b in hosts.get("builds", [])}
+    parsed = {v: _version_tuple(v) for v in host_versions if _version_tuple(v)}
+    if not vc or not parsed:
+        return None
+
+    behind = sorted(v for v, t in parsed.items() if t < vc)
+    ahead = sorted(v for v, t in parsed.items() if t > vc)
+
+    out = {"vcenter_version": vcenter.get("version"),
+           "host_versions": sorted(parsed)}
+    if ahead:
+        out["status"] = "hosts_ahead_of_vcenter"
+        out["note"] = (
+            f"ESXi {', '.join(ahead)} is newer than vCenter "
+            f"{vcenter.get('version')}. vCenter is expected to be at or above "
+            "the version of the hosts it manages; this is the wrong way round "
+            "and is worth checking."
+        )
+    elif behind:
+        out["status"] = "hosts_behind_vcenter"
+        out["note"] = (
+            f"Hosts are on {', '.join(behind)} while vCenter is on "
+            f"{vcenter.get('version')}. This is the normal direction — vCenter "
+            "is upgraded first — but the hosts have not caught up."
+        )
+    else:
+        out["status"] = "aligned"
+        out["note"] = "vCenter and all hosts report the same version."
+    return out
+
+
 async def estate_versions() -> dict:
     """What software the estate is running, gathered from every system at once.
 
@@ -1048,11 +1108,17 @@ async def estate_versions() -> dict:
         "logs": ("logs_version", {}),
         "veeam": ("veeam_version", {}),
         "networks": ("networks_version", {}),
+        "vm_versions": ("vcenter_vm_versions", {"limit": 1}),
     })
 
     hosts = data.pop("hosts")
-    if isinstance(hosts, dict) and not hosts.get("error"):
+    # /hosts returns a bare list, not {"hosts": [...]}. The first version of
+    # this assumed a dict, which meant the grouping silently produced nothing
+    # and the alignment comparison was skipped without saying why.
+    rows = hosts if isinstance(hosts, list) else None
+    if rows is None and isinstance(hosts, dict) and not hosts.get("error"):
         rows = hosts.get("hosts") if isinstance(hosts.get("hosts"), list) else []
+    if rows is not None:
         builds = {}
         for row in rows:
             key = (row.get("version"), row.get("build"))
@@ -1069,9 +1135,19 @@ async def estate_versions() -> dict:
     else:
         data["esxi_hosts"] = hosts
 
+    # The grouped summary is what an estate-wide answer needs; the per-VM rows
+    # are requested at limit=1 and dropped entirely. vcenter_vm_versions is
+    # there for anyone who wants the full list.
+    vms = data.get("vm_versions")
+    if isinstance(vms, dict) and not vms.get("error"):
+        vms.pop("vms", None)
+        vms.pop("vms_truncated", None)
+
     failed = [k for k, v in data.items() if isinstance(v, dict) and v.get("error")]
+    alignment = _vcenter_host_alignment(data.get("vcenter"), data.get("esxi_hosts"))
     return {
-        "covered": ["vCenter", "ESXi hosts", "VCF Operations for Logs",
+        "covered": ["vCenter", "ESXi hosts", "VM hardware and VMware Tools",
+                    "VCF Operations for Logs",
                     "VCF Operations for Networks", "Veeam Backup & Replication"],
         "not_covered": {
             "NSX": "No NSX wrapper is deployed — NSX version cannot be read.",
@@ -1079,13 +1155,18 @@ async def estate_versions() -> dict:
             "SDDC Manager": "Not integrated.",
         },
         "sections_failed": failed,
+        **({"version_alignment": alignment} if alignment else {}),
         "guidance": (
             "Report the versions found, then state plainly which systems could "
             "not be checked, using not_covered and sections_failed. Do not "
             "present this as the complete estate software inventory, and do not "
             "offer to run a query for an uncovered system — there is no tool "
             "for it. If distinct_builds is greater than 1 the hosts are not on "
-            "a uniform build, which is worth calling out."
+            "a uniform build, which is worth calling out. For VM hardware, give "
+            "the distribution rather than listing VMs, and treat being behind "
+            "the newest version as a planning observation, not a fault. Tools "
+            "not running on a powered-off VM is normal and should not be "
+            "reported as a problem."
         ),
         **data,
     }

@@ -23,12 +23,26 @@ def fake_apis(monkeypatch):
     """Stand in for the five wrappers, recording which tools were called."""
     calls = []
     responses = {
-        "vcenter_about": {"product": "VMware vCenter Server", "version": "9.0.1",
-                          "build": "24755229"},
-        "vcenter_list_hosts": {"hosts": [
+        # Verbatim from the live vCenter.
+        "vcenter_about": {"product": "VMware vCenter Server 9.0.2 build-25148086",
+                          "name": "VMware vCenter Server", "version": "9.0.2",
+                          "build": "25148086", "api_version": "9.0.0.0"},
+        # /hosts returns a BARE LIST, verified against the live wrapper.
+        # The first implementation assumed {"hosts": [...]} and silently
+        # produced no grouping at all.
+        "vcenter_list_hosts": [
             {"name": "esx01.vcf.local", "version": "9.0.1", "build": "24957456"},
             {"name": "esx02.vcf.local", "version": "9.0.1", "build": "24957456"},
-        ]},
+        ],
+        "vcenter_vm_versions": {
+            "vm_count": 30,
+            "hardware_versions": {"newest_in_use": "vmx-21", "distinct_versions": 2,
+                                  "not_on_newest": 4, "by_version": []},
+            "tools_version_status": {"guestToolsCurrent": 26, "guestToolsNeedUpgrade": 4},
+            "tools_running_status": {"guestToolsRunning": 20, "guestToolsNotRunning": 10},
+            "vms": [{"name": "vm1"}],
+            "vms_truncated": True,
+        },
         "logs_version": {"product": "Logs", "version": "8.18.0"},
         "veeam_version": {"product": "Veeam Backup & Replication",
                           "build_version": "13.0.1.1071"},
@@ -50,8 +64,8 @@ def test_gathers_every_system_in_one_call(fake_apis):
     result = run(o.estate_versions())
 
     assert set(calls) == {"vcenter_about", "vcenter_list_hosts", "logs_version",
-                          "veeam_version", "networks_version"}
-    assert result["vcenter"]["version"] == "9.0.1"
+                          "veeam_version", "networks_version", "vcenter_vm_versions"}
+    assert result["vcenter"]["version"] == "9.0.2"
     assert result["veeam"]["build_version"] == "13.0.1.1071"
 
 
@@ -66,7 +80,8 @@ def test_hosts_are_grouped_by_build_not_listed_individually(fake_apis):
 
 def test_mixed_builds_are_visible(fake_apis):
     _, responses = fake_apis
-    responses["vcenter_list_hosts"]["hosts"][1]["build"] = "24000000"
+    responses["vcenter_list_hosts"][1]["build"] = "24000000"
+    responses["vcenter_list_hosts"][1]["version"] = "9.0.0"
 
     hosts = run(o.estate_versions())["esxi_hosts"]
 
@@ -132,3 +147,69 @@ def test_every_registry_entry_has_a_description():
 
 def test_prompt_forbids_offering_nonexistent_queries():
     assert "no tool for" in o.ENGINEER_RULES
+
+
+# --- vCenter / host version alignment ----------------------------------------
+#
+# Live estate: vCenter 9.0.2 build 25148086, hosts 9.0.1 build 24957456. The
+# hosts trail vCenter, which is the supported direction — the point of these
+# tests is that the gap is reported and the direction is described correctly.
+
+def test_hosts_behind_vcenter_is_reported_with_the_right_direction(fake_apis):
+    result = run(o.estate_versions())
+    alignment = result["version_alignment"]
+
+    assert alignment["status"] == "hosts_behind_vcenter"
+    assert alignment["vcenter_version"] == "9.0.2"
+    assert "9.0.1" in alignment["host_versions"]
+    assert "normal direction" in alignment["note"]
+
+
+def test_hosts_ahead_of_vcenter_is_called_out(fake_apis):
+    _, responses = fake_apis
+    for host in responses["vcenter_list_hosts"]:
+        host["version"] = "9.0.3"
+
+    alignment = run(o.estate_versions())["version_alignment"]
+
+    assert alignment["status"] == "hosts_ahead_of_vcenter"
+    assert "wrong way round" in alignment["note"]
+
+
+def test_matching_versions_report_aligned(fake_apis):
+    _, responses = fake_apis
+    for host in responses["vcenter_list_hosts"]:
+        host["version"] = "9.0.2"
+
+    assert run(o.estate_versions())["version_alignment"]["status"] == "aligned"
+
+
+def test_unparseable_version_makes_no_claim(fake_apis):
+    _, responses = fake_apis
+    responses["vcenter_about"]["version"] = "9.0.2-internal"
+
+    assert "version_alignment" not in run(o.estate_versions()), \
+        "an unparseable version must produce no comparison rather than a guess"
+
+
+def test_host_list_is_grouped_from_a_bare_list(fake_apis):
+    """/hosts returns a list; assuming a dict silently produced no grouping."""
+    hosts = run(o.estate_versions())["esxi_hosts"]
+
+    assert hosts["host_count"] == 2
+    assert hosts["distinct_builds"] == 1
+
+
+def test_vm_rows_are_dropped_but_the_summary_is_kept(fake_apis):
+    vms = run(o.estate_versions())["vm_versions"]
+
+    assert "vms" not in vms, "per-VM rows would swamp an estate-wide answer"
+    assert vms["hardware_versions"]["newest_in_use"] == "vmx-21"
+    assert vms["tools_version_status"]["guestToolsNeedUpgrade"] == 4
+
+
+def test_version_tuple_parsing():
+    assert o._version_tuple("9.0.2") == (9, 0, 2)
+    assert o._version_tuple("9.0.2-internal") is None
+    assert o._version_tuple(None) is None
+    assert o._version_tuple("") is None

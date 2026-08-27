@@ -394,6 +394,108 @@ def vmtools_outdated():
 
     view.Destroy()
     return result
+@app.get("/vms/versions")
+def vm_versions(limit: int = Query(500, ge=1, le=5000)):
+    """Virtual hardware version and VMware Tools state for every VM.
+
+    Grouped rather than listed: an estate-wide answer needs the distribution
+    and the outliers, not several hundred rows. Hardware versions are compared
+    against the newest one actually present, not a hardcoded compatibility
+    table, so this cannot go stale or invent a limit that does not apply here.
+
+    Templates are counted separately — a template on old hardware is a stale
+    template, which is a different problem from a running VM on old hardware.
+    """
+    si = get_si()
+    content = si.RetrieveContent()
+    view = get_view(content, vim.VirtualMachine)
+
+    hardware = {}
+    tools_version_status = {}
+    tools_running = {}
+    rows = []
+    inaccessible = []
+
+    for vm in view.view:
+        config = vm.config
+        if config is None:
+            # No config means vCenter cannot read the VM (orphaned, or the
+            # host is disconnected). Counted, not silently skipped.
+            inaccessible.append(vm.name)
+            continue
+
+        guest = vm.guest
+        hw = config.version
+        is_template = bool(config.template)
+        status = str(getattr(guest, "toolsVersionStatus2", None) or
+                     getattr(guest, "toolsVersionStatus", None) or "unknown")
+        running = str(getattr(guest, "toolsRunningStatus", None) or "unknown")
+
+        bucket = hardware.setdefault(hw, {"total": 0, "templates": 0, "vms": []})
+        bucket["total"] += 1
+        if is_template:
+            bucket["templates"] += 1
+        if len(bucket["vms"]) < 20:
+            bucket["vms"].append(vm.name)
+
+        tools_version_status[status] = tools_version_status.get(status, 0) + 1
+        tools_running[running] = tools_running.get(running, 0) + 1
+
+        if len(rows) < limit:
+            rows.append({
+                "name": vm.name,
+                "hardware_version": hw,
+                "template": is_template,
+                "power_state": str(vm.runtime.powerState),
+                "tools_version": getattr(guest, "toolsVersion", None),
+                "tools_version_status": status,
+                "tools_running": running,
+                "guest_os": getattr(guest, "guestFullName", None) or config.guestFullName,
+            })
+
+    view.Destroy()
+
+    def _hw_number(text):
+        try:
+            return int(str(text).split("-")[-1])
+        except (ValueError, AttributeError):
+            return -1
+
+    ordered = sorted(hardware, key=_hw_number, reverse=True)
+    newest = ordered[0] if ordered else None
+    behind = {hw: hardware[hw]["total"] for hw in ordered[1:]}
+
+    return {
+        "vm_count": sum(b["total"] for b in hardware.values()),
+        "inaccessible_vms": inaccessible,
+        "hardware_versions": {
+            "newest_in_use": newest,
+            "distinct_versions": len(hardware),
+            "not_on_newest": sum(behind.values()),
+            "by_version": [
+                {"hardware_version": hw,
+                 "count": hardware[hw]["total"],
+                 "templates": hardware[hw]["templates"],
+                 "sample_vms": hardware[hw]["vms"],
+                 "sample_truncated": hardware[hw]["total"] > len(hardware[hw]["vms"])}
+                for hw in ordered
+            ],
+        },
+        "tools_version_status": tools_version_status,
+        "tools_running_status": tools_running,
+        "notes": [
+            "Hardware versions are compared with the newest version present in "
+            "this estate, not with a fixed maximum — being behind the newest is "
+            "not automatically a fault.",
+            "toolsVersion is a build number, not a product version.",
+            "Powered-off VMs report tools as not running; that is expected and "
+            "is not evidence of a problem.",
+        ],
+        "vms": rows,
+        "vms_truncated": len(rows) < sum(b["total"] for b in hardware.values()),
+    }
+
+
 @app.get("/vm/details")
 
 def vm_details(name: str):
