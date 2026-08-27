@@ -434,6 +434,49 @@ def vms():
         "/api/ni/entities/vms"
     )
 
+def list_entity_refs(path: str, limit: int, page_size: int = 100, max_pages: int = 50) -> tuple:
+    """Collect entity references across pages.
+
+    Network Insight returns 10 entities per page with an opaque `cursor`.
+    Fetching only the first page made 57 VMs look like 10, and a caller had no
+    way to tell that from a small estate.
+
+    Returns (refs, total_count).
+    """
+    refs = []
+    cursor = None
+    total = None
+
+    for _ in range(max_pages):
+        if len(refs) >= limit:
+            break
+
+        params = {"size": min(page_size, limit - len(refs))}
+        if cursor:
+            params["cursor"] = cursor
+        page = client.request("GET", path, params=params)
+
+        batch = (page or {}).get("results") or []
+        if total is None:
+            total = (page or {}).get("total_count")
+        if not batch:
+            break
+        refs.extend(batch)
+
+        if isinstance(total, int) and len(refs) >= total:
+            break
+
+        next_cursor = (page or {}).get("cursor")
+        # A missing cursor means no next page; an unchanged one would loop
+        # forever. Page length is not a usable signal here: the server caps
+        # pages at 10 whatever size is requested.
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    return refs[:limit], (total if total is not None else len(refs))
+
+
 @app.get("/ni/vms/inventory")
 def vms_inventory(
     limit: int = Query(50, ge=1, le=200, description="Maximum VMs to return"),
@@ -449,9 +492,7 @@ def vms_inventory(
     Fetching the details here turns an unbounded number of round trips into
     one, so the model gets the whole picture and can report a real total.
     """
-    listing = client.request("GET", "/api/ni/entities/vms")
-    refs = (listing or {}).get("results") or []
-    total_known = (listing or {}).get("total_count", len(refs))
+    refs, total_known = list_entity_refs("/api/ni/entities/vms", limit)
 
     def fetch(ref):
         entity_id = ref.get("entity_id")
@@ -465,7 +506,7 @@ def vms_inventory(
             return {"entity_id": entity_id, "error": "could not fetch VM detail"}
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        details = list(pool.map(fetch, refs[:limit]))
+        details = list(pool.map(fetch, refs))
 
     vms_out = []
     for detail in details:
@@ -512,19 +553,27 @@ def vms_inventory(
             record["power_state"] = detail["power_state"]
         vms_out.append(record)
 
+    fetched = len(vms_out)
+
     if vlan:
         wanted = vlan.strip().lower()
         vms_out = [v for v in vms_out if any(wanted == n.lower() for n in v.get("port_groups", []))]
 
+    # Compare what we fetched against the estate, not against the page size.
+    # Upstream paginates, so len(refs) reported "not truncated" while showing
+    # 10 of 57. Measured before the VLAN filter, which legitimately shortens
+    # the list without meaning anything was missed.
+    incomplete = isinstance(total_known, int) and fetched < total_known
+
     return {
         "vm_count": len(vms_out),
+        "vms_examined": fetched,
         "total_vms_known": total_known,
-        # Say so explicitly: a silently truncated list reads like a full one.
-        "truncated": len(refs) > limit,
+        "truncated": incomplete,
         "hint": (
-            f"Showing {limit} of {len(refs)} VMs. Call again with limit={min(len(refs), 200)} "
-            "for the complete list."
-        ) if len(refs) > limit else None,
+            f"Examined {fetched} of {total_known} VMs; the rest were not fetched. "
+            "Say so rather than presenting this as the whole estate."
+        ) if incomplete else None,
         "filter": {"vlan": vlan} if vlan else None,
         "vms": vms_out,
     }
