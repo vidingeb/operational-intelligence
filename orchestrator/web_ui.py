@@ -192,6 +192,81 @@ HTML_PAGE = """<!DOCTYPE html>
             font-family: inherit;
         }
         .pdf-button:hover { background: #1d5c3c; }
+        .bar-button {
+            background: #0f3460;
+            color: #81d4fa;
+            border: 1px solid #2a4a7f;
+            border-radius: 4px;
+            padding: 0.1rem 0.5rem;
+            font-size: 0.72rem;
+            cursor: pointer;
+            font-family: inherit;
+        }
+        .bar-button:hover { background: #17518f; }
+        .bar-button:disabled { opacity: 0.5; cursor: default; }
+        .memory-state { color: #9fb3c8; font-style: italic; }
+        .panel {
+            background: #16213e;
+            border-bottom: 1px solid #0f3460;
+            padding: 0.8rem 2rem 1rem;
+            font-size: 0.8rem;
+            max-height: 45vh;
+            overflow-y: auto;
+        }
+        .panel h2 {
+            font-size: 0.8rem;
+            color: #81d4fa;
+            margin: 0.4rem 0;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .panel-section { margin-bottom: 0.9rem; }
+        .panel-row {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            margin-bottom: 0.4rem;
+            flex-wrap: wrap;
+        }
+        .panel-row input[type="text"] {
+            flex: 1;
+            min-width: 18rem;
+            background: #0f3460;
+            border: 1px solid #2a4a7f;
+            color: #e8e8e8;
+            border-radius: 4px;
+            padding: 0.3rem 0.5rem;
+            font-family: inherit;
+            font-size: 0.8rem;
+        }
+        .panel-row input[type="number"] {
+            width: 3.2rem;
+            background: #0f3460;
+            border: 1px solid #2a4a7f;
+            color: #e8e8e8;
+            border-radius: 4px;
+            padding: 0.25rem 0.3rem;
+            font-family: inherit;
+        }
+        .panel-row select {
+            background: #0f3460;
+            border: 1px solid #2a4a7f;
+            color: #e8e8e8;
+            border-radius: 4px;
+            padding: 0.25rem 0.4rem;
+            font-family: inherit;
+            font-size: 0.78rem;
+        }
+        .panel-row .hint { color: #9fb3c8; font-size: 0.72rem; }
+        .panel-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.25rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+        }
+        .panel-item span { flex: 1; }
+        .panel-empty { color: #9fb3c8; font-style: italic; padding: 0.25rem 0; }
         .message.error {
             align-self: flex-start;
             background: #3e1a1a;
@@ -340,7 +415,37 @@ HTML_PAGE = """<!DOCTYPE html>
         <span>LLM: {{LLM_BACKEND}}</span>
         <span>APIs: {{API_BACKEND}}</span>
         <span id="timer"></span>
+        <span id="memory-state" class="memory-state" title="Follow-up questions see earlier turns in this conversation">new conversation</span>
+        <button id="new-chat-btn" class="bar-button" title="Forget the current thread and start fresh">New chat</button>
+        <button id="panel-btn" class="bar-button" title="Scheduled questions and stored reports">Schedules &amp; reports</button>
         <span id="gpu-strip" class="gpu-strip"></span>
+    </div>
+    <div id="panel" class="panel" hidden>
+        <div class="panel-section">
+            <h2>Schedule a question</h2>
+            <div class="panel-row">
+                <input type="text" id="sched-question" placeholder="e.g. Which VMs have no recent restore point?">
+            </div>
+            <div class="panel-row">
+                <select id="sched-kind">
+                    <option value="daily">Daily</option>
+                    <option value="hourly">Hourly</option>
+                    <option value="weekly">Weekly</option>
+                </select>
+                <select id="sched-weekday" hidden></select>
+                <span id="sched-at">at</span>
+                <input type="number" id="sched-hour" min="0" max="23" value="7" title="Hour, UTC">
+                <span>:</span>
+                <input type="number" id="sched-minute" min="0" max="59" value="0" title="Minute">
+                <span class="hint">UTC</span>
+                <button id="sched-add" class="bar-button">Add schedule</button>
+            </div>
+            <div id="sched-list" class="panel-list"></div>
+        </div>
+        <div class="panel-section">
+            <h2>Stored reports</h2>
+            <div id="runs-list" class="panel-list"></div>
+        </div>
     </div>
     <div id="chat-container">
         <div class="message assistant">{{WELCOME}}</div>
@@ -359,6 +464,8 @@ HTML_PAGE = """<!DOCTYPE html>
         const modelSelect = document.getElementById('model-select');
         const scopeSelect = document.getElementById('scope-select');
         const timerEl = document.getElementById('timer');
+        const memoryState = document.getElementById('memory-state');
+        const panel = document.getElementById('panel');
         let timerInterval = null;
 
         userInput.addEventListener('keydown', (e) => {
@@ -388,6 +495,209 @@ HTML_PAGE = """<!DOCTYPE html>
         // exported report so a printed page says what was asked.
         let lastQuestion = '';
 
+        // --- conversation memory ---------------------------------------------
+        //
+        // The id is the whole of the client's state. History lives in the
+        // orchestrator's database, so a reload picks the thread back up rather
+        // than losing it with the tab.
+
+        let conversationId = null;
+
+        function setMemoryState(turns) {
+            if (!conversationId) {
+                memoryState.textContent = 'new conversation';
+                memoryState.title = 'Nothing remembered yet';
+                return;
+            }
+            memoryState.textContent = turns
+                ? 'remembering ' + turns + (turns === 1 ? ' turn' : ' turns')
+                : 'conversation started';
+            memoryState.title = 'Follow-up questions see earlier turns in this '
+                + 'conversation (id ' + conversationId + ')';
+        }
+
+        function newConversation() {
+            conversationId = null;
+            setMemoryState(0);
+            addMessage('Started a new conversation. Earlier questions are no '
+                       + 'longer used as context.', 'thinking');
+        }
+
+        document.getElementById('new-chat-btn')
+            .addEventListener('click', newConversation);
+
+        // --- schedules and stored reports -------------------------------------
+
+        const kindSelect = document.getElementById('sched-kind');
+        const weekdaySelect = document.getElementById('sched-weekday');
+        const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday',
+                           'Friday', 'Saturday', 'Sunday'];
+
+        DAY_NAMES.forEach((name, index) => {
+            const option = document.createElement('option');
+            option.value = String(index);
+            option.textContent = name;
+            weekdaySelect.appendChild(option);
+        });
+
+        function syncScheduleControls() {
+            const kind = kindSelect.value;
+            weekdaySelect.hidden = kind !== 'weekly';
+            document.getElementById('sched-hour').hidden = kind === 'hourly';
+            document.getElementById('sched-at').hidden = kind === 'hourly';
+        }
+        kindSelect.addEventListener('change', syncScheduleControls);
+        syncScheduleControls();
+
+        document.getElementById('panel-btn').addEventListener('click', () => {
+            panel.hidden = !panel.hidden;
+            if (!panel.hidden) { refreshSchedules(); refreshRuns(); }
+        });
+
+        function row(text, className) {
+            const el = document.createElement('div');
+            el.className = className || 'panel-item';
+            el.textContent = text;
+            return el;
+        }
+
+        async function refreshSchedules() {
+            const list = document.getElementById('sched-list');
+            list.textContent = '';
+            try {
+                const data = await (await fetch('/api/schedules')).json();
+                if (!data.schedules.length) {
+                    list.appendChild(row('No schedules yet.', 'panel-empty'));
+                    return;
+                }
+                data.schedules.forEach(s => {
+                    const item = document.createElement('div');
+                    item.className = 'panel-item';
+                    const text = document.createElement('span');
+                    text.textContent = s.question + '  —  ' + s.description
+                        + '  —  next ' + s.next_run.replace('T', ' ');
+                    item.appendChild(text);
+
+                    const runNow = document.createElement('button');
+                    runNow.className = 'bar-button';
+                    runNow.textContent = 'Run now';
+                    runNow.addEventListener('click', () => runScheduleNow(s.id, runNow));
+                    item.appendChild(runNow);
+
+                    const remove = document.createElement('button');
+                    remove.className = 'bar-button';
+                    remove.textContent = 'Delete';
+                    remove.addEventListener('click', async () => {
+                        await fetch('/api/schedules/' + s.id, {method: 'DELETE'});
+                        refreshSchedules();
+                    });
+                    item.appendChild(remove);
+                    list.appendChild(item);
+                });
+            } catch (e) {
+                list.appendChild(row('Could not load schedules: ' + e.message,
+                                     'panel-empty'));
+            }
+        }
+
+        async function runScheduleNow(id, button) {
+            button.disabled = true;
+            button.textContent = 'Running...';
+            try {
+                const run = await (await fetch('/api/schedules/' + id + '/run',
+                                               {method: 'POST'})).json();
+                refreshRuns();
+                showRun(run);
+            } catch (e) {
+                addMessage('Scheduled run failed: ' + e.message, 'error');
+            }
+            button.disabled = false;
+            button.textContent = 'Run now';
+        }
+
+        async function refreshRuns() {
+            const list = document.getElementById('runs-list');
+            list.textContent = '';
+            try {
+                const data = await (await fetch('/api/runs?limit=25')).json();
+                if (!data.runs.length) {
+                    list.appendChild(row('No reports stored yet.', 'panel-empty'));
+                    return;
+                }
+                data.runs.forEach(r => {
+                    const item = document.createElement('div');
+                    item.className = 'panel-item';
+                    const text = document.createElement('span');
+                    text.textContent = r.started_at.replace('T', ' ') + '  —  '
+                        + r.question + (r.status === 'ok' ? '' : '  [' + r.status + ']');
+                    item.appendChild(text);
+                    const open = document.createElement('button');
+                    open.className = 'bar-button';
+                    open.textContent = 'Open';
+                    open.addEventListener('click', async () => {
+                        const full = await (await fetch('/api/runs/' + r.id)).json();
+                        showRun(full);
+                    });
+                    item.appendChild(open);
+                    list.appendChild(item);
+                });
+            } catch (e) {
+                list.appendChild(row('Could not load reports: ' + e.message,
+                                     'panel-empty'));
+            }
+        }
+
+        // A stored report is rendered through exactly the same path as a live
+        // answer, so it gets the same tables, CSV buttons and PDF export.
+        function showRun(run) {
+            panel.hidden = true;
+            addMessage(run.question, 'user');
+            if (run.status === 'ok') {
+                lastQuestion = run.question;
+                addMessage(run.answer, 'assistant',
+                           (run.model || 'scheduled') + ' · '
+                           + run.started_at.replace('T', ' '), run);
+            } else {
+                addMessage('That scheduled run failed: ' + (run.error || 'unknown'),
+                           'error');
+            }
+        }
+
+        document.getElementById('sched-add').addEventListener('click', async () => {
+            const question = document.getElementById('sched-question').value.trim();
+            if (!question) {
+                addMessage('A schedule needs a question.', 'error');
+                return;
+            }
+            const body = {
+                question: question,
+                kind: kindSelect.value,
+                hour: parseInt(document.getElementById('sched-hour').value, 10) || 0,
+                minute: parseInt(document.getElementById('sched-minute').value, 10) || 0,
+                model: modelSelect.value || null,
+                scope: scopeSelect.value || 'all'
+            };
+            if (kindSelect.value === 'weekly') {
+                body.weekday = parseInt(weekdaySelect.value, 10);
+            }
+            const response = await fetch('/api/schedules', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body)
+            });
+            if (!response.ok) {
+                const err = await response.json();
+                addMessage('Schedule rejected: ' + (err.detail || 'unknown'), 'error');
+                return;
+            }
+            const created = await response.json();
+            document.getElementById('sched-question').value = '';
+            addMessage('Scheduled: ' + question + ' (' + created.description
+                       + ', next run ' + created.next_run.replace('T', ' ') + ')',
+                       'thinking');
+            refreshSchedules();
+        });
+
         async function sendMessage() {
             const message = userInput.value.trim();
             if (!message) return;
@@ -407,7 +717,8 @@ HTML_PAGE = """<!DOCTYPE html>
                 const response = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message, model, scope: scopeSelect.value || 'all' }),
+                    body: JSON.stringify({ message, model, scope: scopeSelect.value || 'all',
+                                           conversation_id: conversationId }),
                 });
 
                 stopTimer();
@@ -415,6 +726,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
                 if (response.ok) {
                     const data = await response.json();
+                    conversationId = data.conversation_id || conversationId;
+                    setMemoryState(data.history_turns || 0);
                     addMessage(data.answer, 'assistant', data.model, data);
                     refreshTelemetry();
                 } else {
@@ -1098,8 +1411,69 @@ async def chat(request: dict):
                 "message": request["message"],
                 "model": request.get("model"),
                 "scope": request.get("scope", "all"),
+                "conversation_id": request.get("conversation_id"),
             },
         )
+        response.raise_for_status()
+        return response.json()
+
+
+# Schedules and stored reports are plain pass-throughs. The UI holds no state
+# of its own: everything it shows survives a browser refresh because it lives in
+# the orchestrator's database, not in a tab.
+
+@app.get("/api/schedules")
+async def list_schedules():
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(f"{ORCHESTRATOR_URL}/schedules")
+        response.raise_for_status()
+        return response.json()
+
+
+@app.post("/api/schedules")
+async def create_schedule(request: dict):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.post(f"{ORCHESTRATOR_URL}/schedules", json=request)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=response.status_code,
+                                detail=response.json().get("detail", "Rejected"))
+        return response.json()
+
+
+@app.delete("/api/schedules/{schedule_id}")
+async def delete_schedule(schedule_id: str):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.delete(f"{ORCHESTRATOR_URL}/schedules/{schedule_id}")
+        response.raise_for_status()
+        return response.json()
+
+
+@app.post("/api/schedules/{schedule_id}/run")
+async def run_schedule(schedule_id: str):
+    # A scheduled question does the same tool-calling work as an interactive
+    # one, so it needs the same generous ceiling.
+    async with httpx.AsyncClient(timeout=600.0) as client:
+        response = await client.post(
+            f"{ORCHESTRATOR_URL}/schedules/{schedule_id}/run")
+        response.raise_for_status()
+        return response.json()
+
+
+@app.get("/api/runs")
+async def list_runs(limit: int = 50):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(f"{ORCHESTRATOR_URL}/runs",
+                                    params={"limit": limit})
+        response.raise_for_status()
+        return response.json()
+
+
+@app.get("/api/runs/{run_id}")
+async def get_run(run_id: str):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(f"{ORCHESTRATOR_URL}/runs/{run_id}")
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="No such report")
         response.raise_for_status()
         return response.json()
 

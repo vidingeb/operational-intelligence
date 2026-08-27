@@ -27,13 +27,36 @@ import json
 import urllib.parse
 import time
 import secrets
+from contextlib import asynccontextmanager
 import httpx
 import asyncio
+from datetime import datetime, timezone
 from typing import Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="On-Prem AI Orchestrator", version="1.1")
+import store
+import schedule_times
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    """Open the state database and start the schedule runner.
+
+    A lifespan handler rather than @app.on_event: the latter is deprecated, and
+    a scheduler that silently stops starting after a FastAPI upgrade is exactly
+    the kind of quiet failure this system keeps running into.
+    """
+    store.init_db()
+    task = asyncio.create_task(scheduler_loop()) if SCHEDULER_ENABLED else None
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
+
+
+app = FastAPI(title="On-Prem AI Orchestrator", version="1.2", lifespan=lifespan)
 
 # Configuration — env-overridable so the same code runs single- or split-site
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
@@ -1334,7 +1357,7 @@ class Usage:
 
 
 async def chat_with_tools(user_message: str, model: str = None, conversation: list = None,
-                          scope: str = "all") -> dict:
+                          scope: str = "all", read_only: bool = False) -> dict:
     """Send a message to Ollama with tool-calling, execute tools, return the answer.
 
     Returns {"answer", "usage", "tools_called"}.
@@ -1343,9 +1366,17 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
     call *more* tools based on what it found. This is what makes cross-system
     questions work ("find the critical alerts, then look up those VMs"), since
     the second lookup depends on the first one's output.
+
+    ``read_only=True`` withholds every state-changing tool regardless of
+    ENABLE_WRITE_TOOLS. Scheduled runs use it: nobody is watching a job that
+    fires at 07:00, so an unattended run must not be able to propose, let alone
+    perform, a change.
     """
     use_model = model or DEFAULT_MODEL
     tools = TOOLS_BY_SCOPE.get(scope, TOOLS)
+    if read_only:
+        tools = [t for t in tools
+                 if not TOOL_SPECS.get(t["function"]["name"], {}).get("write")]
     if conversation is None:
         conversation = [{"role": "system", "content": prompt_for(scope)}]
 
@@ -1392,6 +1423,28 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
 
             names = [tc["function"]["name"] for tc in tool_calls]
             tools_called.extend(names)
+
+            # Defence in depth. Withholding the schemas should be enough, but a
+            # model can invent a name it was never offered, and "the model
+            # shouldn't do that" is not a control.
+            if read_only:
+                refused = [tc for tc in tool_calls
+                           if TOOL_SPECS.get(tc["function"]["name"], {}).get("write")]
+                if refused:
+                    for tc in refused:
+                        conversation.append({
+                            "role": "tool",
+                            "name": tc["function"]["name"],
+                            "content": json.dumps({
+                                "error": "refused",
+                                "reason": "This run is read-only. State-changing "
+                                          "tools are not available to unattended "
+                                          "or scheduled runs.",
+                            }),
+                        })
+                    tool_calls = [tc for tc in tool_calls if tc not in refused]
+                    if not tool_calls:
+                        continue
 
             results = await asyncio.gather(*[
                 call_api(tc["function"]["name"], tc["function"].get("arguments", {}))
@@ -1444,6 +1497,7 @@ class ChatRequest(BaseModel):
     message: str
     model: str = None  # Optional model override
     scope: str = "all"  # "all", or one of SYSTEMS: vcenter / vcf_ops / vcf_networks
+    conversation_id: str = None  # Continue an existing conversation; None starts one
 
 class ChatResponse(BaseModel):
     answer: str
@@ -1452,6 +1506,8 @@ class ChatResponse(BaseModel):
     tools_called: list = []
     telemetry: dict = {}
     pending_actions: list = []
+    conversation_id: str = None
+    history_turns: int = 0  # Prior exchanges replayed into this answer
 
 
 class ConfirmRequest(BaseModel):
@@ -1658,6 +1714,25 @@ async def health():
     }
 
 
+HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "6"))
+
+
+def build_conversation(scope: str, conversation_id: str = None) -> tuple:
+    """The message list to start from, plus how many prior turns it replays.
+
+    Memory is prose only. Tool results are not replayed: one estate question can
+    return 12k tokens of JSON, so three of those would evict the actual question
+    from the context window and the model would answer the wrong thing while
+    looking perfectly confident.
+    """
+    messages = [{"role": "system", "content": prompt_for(scope)}]
+    if not conversation_id:
+        return messages, 0
+    prior = store.history(conversation_id, limit_turns=HISTORY_TURNS)
+    messages.extend(prior)
+    return messages, len(prior) // 2
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Ask a question about your VMware infrastructure."""
@@ -1679,8 +1754,16 @@ async def chat(request: ChatRequest):
             status_code=400,
             detail=f"Unknown scope: {request.scope}. Valid: {sorted(TOOLS_BY_SCOPE)}",
         )
+    conversation_id = request.conversation_id or store.create_conversation()
+    conversation, replayed = build_conversation(request.scope, request.conversation_id)
     try:
-        result = await chat_with_tools(request.message, model=use_model, scope=request.scope)
+        result = await chat_with_tools(request.message, model=use_model,
+                                       conversation=conversation,
+                                       scope=request.scope)
+        # Persist after the answer, not before: a failed question should not
+        # leave a dangling user turn that the next question replays as context.
+        store.add_message(conversation_id, "user", request.message)
+        store.add_message(conversation_id, "assistant", result["answer"])
         # Telemetry is best-effort decoration; a dead exporter must not fail a
         # question that was answered successfully.
         return ChatResponse(
@@ -1690,6 +1773,8 @@ async def chat(request: ChatRequest):
             tools_called=result["tools_called"],
             pending_actions=result.get("pending_actions", []),
             telemetry=await fetch_telemetry(),
+            conversation_id=conversation_id,
+            history_turns=replayed,
         )
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail=f"Cannot reach Ollama at {OLLAMA_URL} — is it running and reachable?")
@@ -1729,6 +1814,184 @@ async def list_tools():
         }
         for t in ACTIVE_TOOLS
     ]
+
+
+# --- Conversations, schedules and stored reports ------------------------------
+#
+# Memory and scheduling live here rather than in a separate agent because the
+# value is in the browser: a follow-up question that knows what "those" refers
+# to, and a report that runs at 07:00 whether or not anyone opens the page.
+
+SCHEDULER_TICK = int(os.getenv("SCHEDULER_TICK", "30"))
+SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() in ("1", "true", "yes")
+
+
+class ScheduleRequest(BaseModel):
+    question: str
+    kind: str = "daily"           # hourly | daily | weekly
+    hour: int = 7
+    minute: int = 0
+    weekday: Optional[int] = None  # 0 = Monday, weekly only
+    model: Optional[str] = None
+    scope: str = "all"
+
+
+async def run_scheduled(schedule: dict) -> str:
+    """Execute one scheduled question and store the result.
+
+    Read-only, always. Nobody is watching at 07:00, so an unattended run gets
+    no state-changing tools even if writes are enabled for interactive use.
+    """
+    run_id = store.start_run(schedule["question"], schedule_id=schedule["id"],
+                             model=schedule.get("model"),
+                             scope=schedule.get("scope", "all"))
+    try:
+        conversation = [{"role": "system",
+                         "content": prompt_for(schedule.get("scope", "all"))}]
+        # Tell a recurring job what it said last time, so a daily report can
+        # lead with what changed instead of restating the estate every morning.
+        previous = store.previous_answer(schedule["id"])
+        if previous:
+            conversation.append({
+                "role": "user",
+                "content": ("For context, your previous answer to this same "
+                            f"scheduled question on {previous['started_at']} was:\n\n"
+                            f"{previous['answer']}\n\n"
+                            "Lead with what has changed since then. Say so "
+                            "explicitly if nothing has."),
+            })
+            conversation.append({"role": "assistant",
+                                 "content": "Understood. I will report changes since then."})
+        result = await chat_with_tools(
+            schedule["question"], model=schedule.get("model"),
+            conversation=conversation, scope=schedule.get("scope", "all"),
+            read_only=True)
+        store.finish_run(run_id, answer=plain_text(result["answer"]),
+                         tools_called=result["tools_called"],
+                         usage=result["usage"])
+    except Exception as exc:
+        # A failed run is recorded, not swallowed. A schedule that silently
+        # stopped producing reports is the failure mode worth avoiding.
+        store.finish_run(run_id, error=f"{type(exc).__name__}: {exc}")
+    return run_id
+
+
+async def scheduler_loop() -> None:
+    """Fire due schedules, one at a time.
+
+    Sequential on purpose: these are 30-second-to-5-minute tool-calling runs
+    against five production APIs, and three firing at once would be a
+    self-inflicted load test.
+    """
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            for schedule in store.due_schedules(now.isoformat(timespec="seconds")):
+                # Move the schedule forward *before* running it. A run that
+                # crashes the process must not leave the job permanently due and
+                # re-firing on every restart.
+                following = schedule_times.catch_up(
+                    schedule["kind"], schedule["hour"], schedule["minute"],
+                    schedule["weekday"], now=now)
+                store.mark_schedule_ran(
+                    schedule["id"], following.isoformat(timespec="seconds"))
+                await run_scheduled(schedule)
+        except Exception as exc:  # keep ticking; a bad row must not stop the loop
+            print(f"[scheduler] tick failed: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(SCHEDULER_TICK)
+
+
+@app.get("/conversations")
+async def get_conversations(limit: int = 50):
+    return {"conversations": store.list_conversations(limit=limit)}
+
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    messages = store.history(conversation_id, limit_turns=1000)
+    if not messages:
+        raise HTTPException(status_code=404, detail="No such conversation")
+    return {"conversation_id": conversation_id, "messages": messages}
+
+
+@app.delete("/conversations/{conversation_id}")
+async def remove_conversation(conversation_id: str):
+    store.delete_conversation(conversation_id)
+    return {"deleted": conversation_id}
+
+
+@app.get("/schedules")
+async def get_schedules():
+    items = store.list_schedules()
+    for item in items:
+        item["description"] = schedule_times.describe(
+            item["kind"], item["hour"], item["minute"], item["weekday"])
+    return {"schedules": items, "scheduler_running": SCHEDULER_ENABLED,
+            "now": store.utcnow()}
+
+
+@app.post("/schedules")
+async def add_schedule(request: ScheduleRequest):
+    if request.scope not in TOOLS_BY_SCOPE:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown scope: {request.scope}")
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="A schedule needs a question")
+    try:
+        first = schedule_times.next_due(request.kind, request.hour,
+                                        request.minute, request.weekday)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    sid = store.create_schedule(
+        request.question.strip(), request.kind, request.hour, request.minute,
+        weekday=request.weekday, model=request.model, scope=request.scope,
+        next_run=first.isoformat(timespec="seconds"))
+    return {"id": sid, "next_run": first.isoformat(timespec="seconds"),
+            "description": schedule_times.describe(
+                request.kind, request.hour, request.minute, request.weekday)}
+
+
+@app.delete("/schedules/{schedule_id}")
+async def remove_schedule(schedule_id: str):
+    if not store.get_schedule(schedule_id):
+        raise HTTPException(status_code=404, detail="No such schedule")
+    store.delete_schedule(schedule_id)
+    return {"deleted": schedule_id}
+
+
+@app.post("/schedules/{schedule_id}/enabled")
+async def toggle_schedule(schedule_id: str, enabled: bool = True):
+    if not store.get_schedule(schedule_id):
+        raise HTTPException(status_code=404, detail="No such schedule")
+    store.set_schedule_enabled(schedule_id, enabled)
+    return {"id": schedule_id, "enabled": enabled}
+
+
+@app.post("/schedules/{schedule_id}/run")
+async def run_schedule_now(schedule_id: str):
+    """Run a schedule immediately, without waiting for its slot.
+
+    The point is to see the report a schedule will produce before trusting it to
+    run unattended at 07:00.
+    """
+    schedule = store.get_schedule(schedule_id)
+    if not schedule:
+        raise HTTPException(status_code=404, detail="No such schedule")
+    run_id = await run_scheduled(schedule)
+    return store.get_run(run_id)
+
+
+@app.get("/runs")
+async def get_runs(limit: int = 50, schedule_id: str = None):
+    return {"runs": store.list_runs(limit=limit, schedule_id=schedule_id)}
+
+
+@app.get("/runs/{run_id}")
+async def get_single_run(run_id: str):
+    run = store.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="No such run")
+    return run
 
 
 if __name__ == "__main__":

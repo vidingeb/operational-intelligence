@@ -6,3 +6,8 @@ __pycache__/
 
 # Unredacted screenshot originals - never publish
 assets/originals/
+
+# Runtime state: conversations, schedules and stored reports
+*.db
+*.db-wal
+*.db-shm

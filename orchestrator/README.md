@@ -36,6 +36,10 @@ environment set behaves exactly as before.
 | `DEFAULT_MODEL` | `llama3.1:8b` | Model used when the request omits one |
 | `OLLAMA_TIMEOUT` | per-model | Seconds; overrides the built-in ceiling |
 | `ORCHESTRATOR_URL` | `http://localhost:8090` | Used by `web_ui.py` only |
+| `STATE_DB` | `orchestrator/state.db` | Conversations, schedules and stored reports |
+| `HISTORY_TURNS` | `6` | Prior exchanges replayed into a follow-up question |
+| `SCHEDULER_ENABLED` | `true` | Set false to run without the schedule runner |
+| `SCHEDULER_TICK` | `30` | Seconds between checks for a due schedule |
 
 ## Split-site deployment (remote inference)
 
@@ -98,6 +102,68 @@ devices expire (default 180 days) and would silently drop off.
 > alerts, capacity) to a machine that network's owner does not control. Get
 > explicit sign-off first. A lab or nested environment reproduces the same
 > setup with none of the exposure.
+
+## Deployment on the orchestrator VM
+
+Two services, both reading this repo from `/opt/operational-intelligence`:
+
+| Unit | What it runs |
+|---|---|
+| `orchestrator.service` | `orchestrator.py` — the agent loop and API on :8090 |
+| `orchestrator-ui.service` | `web_ui.py` — the chat page |
+
+```bash
+cd /opt/operational-intelligence
+git pull
+systemctl restart orchestrator orchestrator-ui
+```
+
+Both are restarted together because `web_ui.py` and `orchestrator.py` change in
+step. `systemctl is-active` only reports that a process is alive; to confirm the
+code actually deployed, ask the page for something the new version serves:
+
+```bash
+curl -s http://localhost:8090/schedules | head -c 200
+```
+
+## Memory and scheduled reports
+
+The chat endpoint is stateless unless given a `conversation_id`. Pass one and
+the previous exchanges are replayed, which is what makes "and which of those are
+powered off?" resolve. Only prose is replayed — tool results are not, because a
+single estate answer can be 12k tokens of JSON and three of those would push the
+real question out of the context window.
+
+```bash
+# First question - returns a conversation_id
+curl -X POST http://localhost:8090/chat -H "Content-Type: application/json" \
+  -d '{"message": "what VMs are running?"}'
+
+# Follow-up, in the same thread
+curl -X POST http://localhost:8090/chat -H "Content-Type: application/json" \
+  -d '{"message": "which of those are powered off?", "conversation_id": "abc123"}'
+```
+
+Schedules run questions unattended and store the answer:
+
+```bash
+curl -X POST http://localhost:8090/schedules -H "Content-Type: application/json" \
+  -d '{"question": "Which VMs have no recent restore point?", "kind": "daily", "hour": 7, "minute": 0}'
+
+curl http://localhost:8090/schedules      # what is scheduled, and when it next runs
+curl http://localhost:8090/runs           # stored reports
+curl -X POST http://localhost:8090/schedules/<id>/run   # run one now, without waiting
+```
+
+Times are **UTC**. A schedule that shifts by an hour twice a year is a bug that
+takes months to notice.
+
+**Scheduled runs are always read-only.** State-changing tools are withheld from
+them regardless of `ENABLE_WRITE_TOOLS`, and a call to one is refused even if
+the model names it anyway — nobody is watching a job that fires at 07:00.
+
+A missed window fires **once**, not once per missed slot: two days of downtime
+must not release two days of backlog against five production APIs.
 
 ## Usage
 
