@@ -464,6 +464,13 @@ def vms_inventory(
             elif isinstance(entry, str):
                 ips.append(entry)
 
+        # Link-local addresses are noise on every VM and mean nothing to an
+        # operator; the model previously reported them as a column of their
+        # own. Keep them only when a VM has nothing else.
+        routable = [ip for ip in ips if not ip.lower().startswith("fe80:")]
+        if routable:
+            ips = sorted(routable, key=lambda ip: (":" in ip, ip))
+
         networks = []
         for entry in detail.get("layer2_networks") or []:
             if isinstance(entry, dict):
@@ -496,6 +503,10 @@ def vms_inventory(
         "total_vms_known": total_known,
         # Say so explicitly: a silently truncated list reads like a full one.
         "truncated": len(refs) > limit,
+        "hint": (
+            f"Showing {limit} of {len(refs)} VMs. Call again with limit={min(len(refs), 200)} "
+            "for the complete list."
+        ) if len(refs) > limit else None,
         "filter": {"vlan": vlan} if vlan else None,
         "vms": vms_out,
     }
