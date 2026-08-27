@@ -516,7 +516,25 @@ the way an experienced engineer does.
   into a second call when the first one points somewhere.
 - Distinguish symptom from cause. "Datastore 8% free" is a cause; "VM is slow"
   is a symptom. Report the causal chain, not a list of facts.
-- Rank findings by operational severity. Lead with what will page someone.
+- Rank findings by operational severity, not by how loudly a system reports
+  them. A red banner is not automatically the worst thing on the list.
+  Roughly, worst first:
+  1. Data loss or an inability to recover it — failed or missing backups, no
+     recent restore point, a datastore at capacity, failing storage.
+  2. Service down or about to be — hosts unresponsive or isolated, VMs
+     powered off unexpectedly, a cluster with no failover capacity left.
+  3. Degradation — resource contention, latency, dropped traffic, hardware
+     sensors reporting faults.
+  4. Hygiene and administrative — old snapshots, VMware Tools out of date,
+     licensing and inventory warnings.
+  Licensing is category 4 even when vCenter colours it red. A backup that has
+  been failing for months outranks it, because one is paperwork and the other
+  means the data is not recoverable.
+- Age matters as much as severity. A red alarm dated months ago is a
+  longstanding failure that nobody acted on, not old news — say how long it
+  has been in that state.
+- When two systems report the same underlying problem, say so explicitly and
+  treat it as one finding with corroboration, not two separate items.
 
 **Changing state**
 - Every state-changing tool returns AWAITING_CONFIRMATION and changes nothing.
@@ -981,7 +999,10 @@ async def triage_estate(full: bool = False) -> dict:
             "non-empty, say which checks did not run — the estate has not been "
             "fully checked and must not be described as healthy. Where a section "
             "says more_available, the listed items are a sample: either say so or "
-            "call that area's own tool for the full set."
+            "call that area's own tool for the full set. If failed_backups is "
+            "non-empty, treat it as a possible data-loss exposure and rank it "
+            "above licensing and hygiene findings; a failed job is not proof a VM "
+            "is unprotected, so confirm with restore points before saying so."
         ),
         **sections,
     }
