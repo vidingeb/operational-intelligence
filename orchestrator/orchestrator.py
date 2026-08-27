@@ -395,11 +395,15 @@ REGISTRY = [
        "VCF Operations alerts and low-free datastores in one call",
        {"name": (Str, True, "Exact host name")}, local="triage_host"),
     _t("triage_estate", "LOCAL", "local://triage/estate",
-       "Estate-wide health sweep across all three systems: critical vCenter alarms, "
+       "Estate-wide health sweep across all five systems: critical vCenter alarms, "
        "VCF Operations alerts, network alerts, low-free datastores, old snapshots, "
-       "and VMs with VMware Tools not running. Use for 'how is everything', "
-       "'any problems', morning-check and reporting questions",
-       {}, local="triage_estate"),
+       "VMs with VMware Tools not running, error-level logs and failed backups. "
+       "Use for 'how is everything', 'any problems', morning-check and reporting "
+       "questions. Returns a count plus a sample per section; set full=true only "
+       "when the complete lists are genuinely needed, as it is much larger",
+       {"full": ("boolean", False,
+                 "Return every record instead of a sample per section.")},
+       local="triage_estate"),
 ]
 
 # networks_flows and networks_path are constrained by what Network Insight
@@ -530,6 +534,11 @@ the way an experienced engineer does.
 - Be concise and specific. An operator wants "esx03: 94% memory, 3 VMs
   ballooning" not a paragraph of narration.
 - Say what you checked, so the boundaries of the answer are visible.
+- Output is displayed as plain text, not rendered Markdown. Do not use
+  Markdown tables — the pipes and dashes appear literally and are unreadable.
+  Never emit HTML such as <br>. Use short labelled lines and simple "- " bullets.
+- A sample is not a complete set. If a result carries "showing" or
+  "more_available", say so rather than presenting it as everything there is.
 - Always finish with a written answer, even when the data was incomplete."""
 
 SYSTEM_PROMPT = """You are an on-premises VMware infrastructure assistant with
@@ -838,6 +847,10 @@ async def triage_vm(name: str) -> dict:
             "flows": (flows.get("flows") or [])[:15],
         }
 
+    # 50 full log events is the largest single contributor here, and the model
+    # reads the first handful to spot a pattern rather than all of them.
+    data["logs"] = _condense(data.get("logs"), keep=10)
+
     return {
         "triage_target": name,
         "target_type": "VirtualMachine",
@@ -870,6 +883,8 @@ async def triage_host(name: str) -> dict:
     for section in ("hosts", "host_usage", "vcenter_alarms", "ops_alerts", "network_alerts"):
         data[section] = _filter_mentions(data[section], name)
 
+    data["logs"] = _condense(data.get("logs"), keep=10)
+
     return {
         "triage_target": name,
         "target_type": "HostSystem",
@@ -883,8 +898,65 @@ async def triage_host(name: str) -> dict:
     }
 
 
-async def triage_estate() -> dict:
-    """Estate-wide health sweep across all three systems."""
+# Keys that hold the actual findings in a wrapper response. Checked in order,
+# so a payload with both "results" and "events" condenses on the meaningful one.
+_RESULT_KEYS = ("alarms", "alerts", "events", "datastores", "snapshots",
+                "vms", "hosts", "clusters", "jobs", "sessions", "results")
+
+
+def _condense(section: Any, keep: int = 5) -> Any:
+    """Reduce one triage section to a count plus a sample.
+
+    An estate sweep gathers ten sections from five systems, and passing all of
+    them through whole cost ~49,500 input tokens for a single question. Most of
+    that is detail the model never reads: it needs to know that eight
+    datastores are low and which are worst, not the full record for each.
+
+    The count is always the true total, and "showing" says how much of it is
+    here, so a sample is never mistaken for the whole set. Sections that
+    failed are passed through untouched — a failure must stay visible.
+    """
+    if isinstance(section, dict):
+        if section.get("error"):
+            return section
+        for key in _RESULT_KEYS:
+            value = section.get(key)
+            if isinstance(value, list):
+                condensed = {k: v for k, v in section.items()
+                             if not isinstance(v, (list, dict))}
+                condensed["count"] = len(value)
+                condensed[key] = value[:keep]
+                if len(value) > keep:
+                    condensed["showing"] = f"{keep} of {len(value)}"
+                    condensed["more_available"] = (
+                        "Call the specific tool for this area to see the rest. "
+                        "Do not describe this sample as the complete list."
+                    )
+                return condensed
+        return section
+
+    if isinstance(section, list):
+        if len(section) <= keep:
+            return section
+        return {
+            "count": len(section),
+            "showing": f"{keep} of {len(section)}",
+            "sample": section[:keep],
+            "more_available": ("Call the specific tool for this area to see the "
+                               "rest. Do not describe this sample as complete."),
+        }
+
+    return section
+
+
+async def triage_estate(full: bool = False) -> dict:
+    """Estate-wide health sweep across all five systems.
+
+    Sections are condensed to counts plus a sample unless full is set, because
+    the uncondensed sweep is large enough to crowd the context window — at
+    which point earlier tool results are silently lost rather than reported
+    as missing.
+    """
     data = await _gather({
         "vcenter_alarms": ("vcenter_alarms", {}),
         "ops_critical_alerts": ("ops_critical_alerts", {}),
@@ -898,17 +970,53 @@ async def triage_estate() -> dict:
         "failed_backups": ("veeam_failed_jobs", {"hours": 24, "failed_only": True}),
     })
     failed = [k for k, v in data.items() if isinstance(v, dict) and v.get("error")]
+    sections = data if full else {k: _condense(v) for k, v in data.items()}
     return {
         "triage_target": "estate",
         "systems_consulted": ["vCenter", "VCF Operations", "VCF Networks", "Logs", "Veeam"],
         "sections_failed": failed,
+        "detail_level": "full" if full else "counts plus a sample per section",
         "guidance": (
             "Report by severity, naming specific objects. If sections_failed is "
             "non-empty, say which checks did not run — the estate has not been "
-            "fully checked and must not be described as healthy."
+            "fully checked and must not be described as healthy. Where a section "
+            "says more_available, the listed items are a sample: either say so or "
+            "call that area's own tool for the full set."
         ),
-        **data,
+        **sections,
     }
+
+
+# --- Output shaping ----------------------------------------------------------
+#
+# The chat pane renders plain text, not Markdown: it builds messages with
+# createTextNode, so a Markdown table arrives as literal "|---|---|" pipes and
+# an HTML <br> arrives as the characters "<br>". The system prompt tells the
+# model this, but a prompt is a request rather than a guarantee, so the common
+# cases are also repaired here — server-side, where they can be tested.
+
+_TABLE_RULE = re.compile(r"^\s*\|[\s|:\-]+\|\s*$", re.M)
+_TABLE_ROW = re.compile(r"^\s*\|(.+?)\|\s*$", re.M)
+_HTML_BREAK = re.compile(r"<br\s*/?>", re.I)
+
+
+def plain_text(answer: str) -> str:
+    """Flatten Markdown tables and HTML breaks for a plain-text surface.
+
+    Table rows become "cell  -  cell" lines, which stay readable without a
+    renderer. Nothing else is touched: bullets and headings are legible as
+    written, and rewriting them further risks mangling content.
+    """
+    if not answer:
+        return answer
+    text = _HTML_BREAK.sub(" ", answer)
+    text = _TABLE_RULE.sub("", text)
+    text = _TABLE_ROW.sub(
+        lambda m: "  -  ".join(c.strip() for c in m.group(1).split("|") if c.strip()),
+        text,
+    )
+    # Collapse the blank lines left behind by removed separator rows.
+    return re.sub(r"\n{3,}", "\n\n", text)
 
 
 LOCAL_HANDLERS = {
@@ -1376,7 +1484,7 @@ async def chat(request: ChatRequest):
         # Telemetry is best-effort decoration; a dead exporter must not fail a
         # question that was answered successfully.
         return ChatResponse(
-            answer=result["answer"],
+            answer=plain_text(result["answer"]),
             model=use_model,
             usage=result["usage"],
             tools_called=result["tools_called"],
