@@ -40,6 +40,10 @@ $services = @(
        Required = @("OPS_PASSWORD") }
     @{ Name = "mcp-networks"; Dir = "vcfNetworks"; Module = "vcf_networks_api:app";  Port = 8082
        Required = @("NI_USERNAME", "NI_PASSWORD") }
+    @{ Name = "mcp-logs";     Dir = "vcfLogs";     Module = "vcf_logs_api:app";      Port = 8083
+       Required = @("LOGS_PASSWORD") }
+    @{ Name = "mcp-veeam";    Dir = "veeam";       Module = "veeam_api:app";         Port = 8084
+       Required = @("VEEAM_USER", "VEEAM_PASSWORD") }
 )
 
 Assert-Admin
@@ -125,8 +129,9 @@ foreach ($svc in $services) {
 Start-Sleep -Seconds 6
 
 Write-Host "`n=== Health ===" -ForegroundColor Cyan
-$checks = @{ 8080 = "/health"; 8081 = "/ops/health"; 8082 = "/ni/health" }
-foreach ($port in 8080, 8081, 8082) {
+$checks = @{ 8080 = "/health"; 8081 = "/ops/health"; 8082 = "/ni/health"
+             8083 = "/logs/health"; 8084 = "/veeam/health" }
+foreach ($port in 8080, 8081, 8082, 8083, 8084) {
     $url = "http://localhost:$port$($checks[$port])"
     try {
         $resp = Invoke-RestMethod -Uri $url -TimeoutSec 20

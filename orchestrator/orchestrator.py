@@ -74,6 +74,8 @@ def timeout_for(model: str) -> float:
 VCENTER_BASE = f"{MCP_SERVER}:8080"
 OPS_BASE = f"{MCP_SERVER}:8081"
 NETWORKS_BASE = f"{MCP_SERVER}:8082"
+LOGS_BASE = f"{MCP_SERVER}:8083"
+VEEAM_BASE = f"{MCP_SERVER}:8084"
 
 # Tool definitions for Ollama (subset of most useful operations)
 # --- Tool registry -----------------------------------------------------------
@@ -334,6 +336,45 @@ REGISTRY = [
        "Take an ESXi host out of maintenance mode",
        {"name": (Str, True, "Host name")}, write=True),
 
+    # --- VCF Operations for Logs -------------------------------------------
+    _t("logs_search", "GET", f"{LOGS_BASE}/logs/search",
+       "Free-text search of infrastructure logs. Use when a question needs evidence of "
+       "what actually happened — errors, failures, restarts, specific messages",
+       {"contains": (Str, False, "Substring to match in the log text"),
+        "hours": (Int, False, "Look-back window in hours (default 1)"),
+        "limit": (Int, False, "Max events (default 100)")}),
+    _t("logs_errors", "GET", f"{LOGS_BASE}/logs/errors",
+       "Recent error-level log activity across the estate. Use for 'what is failing' "
+       "and as corroboration when an alarm needs explaining",
+       {"hours": (Int, False, "Look-back window in hours (default 1)"),
+        "limit": (Int, False, "Max events (default 100)")}),
+    _t("logs_for_object", "GET", f"{LOGS_BASE}/logs/for/{{name}}",
+       "Log events mentioning a named VM, host, datastore or service. Use to find out "
+       "WHY something failed after an alarm or alert has said THAT it failed",
+       {"name": (Str, True, "VM, host or object name"),
+        "hours": (Int, False, "Look-back window in hours (default 24)"),
+        "limit": (Int, False, "Max events (default 100)")}),
+
+    # --- Veeam Backup & Replication ----------------------------------------
+    _t("veeam_protection", "GET", f"{VEEAM_BASE}/veeam/protection/{{vm_name}}",
+       "Whether a specific VM is actually backed up, and how old its newest restore "
+       "point is. Derived from restore points, not job status — a job can report "
+       "success while skipping a VM. Use before any destructive change to a VM",
+       {"vm_name": (Str, True, "Exact VM name"),
+        "stale_after_hours": (Int, False, "Age at which a backup counts as stale (default 48)")}),
+    _t("veeam_failed_jobs", "GET", f"{VEEAM_BASE}/veeam/sessions",
+       "Recent Veeam job runs and their outcome. Set failed_only=true for backup failures",
+       {"hours": (Int, False, "Look-back window in hours (default 24)"),
+        "failed_only": (Bool, False, "Only sessions that did not succeed"),
+        "limit": (Int, False, "Max sessions (default 200)")}),
+    _t("veeam_unprotected", "GET", f"{VEEAM_BASE}/veeam/unprotected",
+       "Objects known to Veeam that have no restore points. Note this cannot prove the "
+       "estate is fully protected — a VM never added to a job does not appear at all",
+       {"limit": (Int, False, "Max objects (default 200)")}),
+    _t("veeam_jobs", "GET", f"{VEEAM_BASE}/veeam/jobs",
+       "Configured Veeam backup jobs",
+       {"limit": (Int, False, "Max jobs (default 100)")}),
+
     # --- Triage ------------------------------------------------------------
     # Composite, cross-system, executed in-process. A senior engineer does not
     # answer "what is wrong with adc01" with one lookup; they gather state,
@@ -420,6 +461,16 @@ SYSTEMS = {
         "label": "VCF Networks",
         "base": NETWORKS_BASE,
         "summary": "traffic flows, VM network placement, NSX segments, firewall rules and connectivity",
+    },
+    "logs": {
+        "label": "Logs",
+        "base": LOGS_BASE,
+        "summary": "infrastructure log search and error events — evidence of what actually happened",
+    },
+    "backup": {
+        "label": "Veeam Backup",
+        "base": VEEAM_BASE,
+        "summary": "backup jobs, job outcomes, restore points and which VMs are actually protected",
     },
 }
 
@@ -764,7 +815,7 @@ async def _gather(sections: dict) -> dict:
 
 
 async def triage_vm(name: str) -> dict:
-    """Everything relevant to one VM, from all three systems, in one call."""
+    """Everything relevant to one VM, from all five systems, in one call."""
     data = await _gather({
         "vm": ("vcenter_vm_details", {"name": name}),
         "snapshots": ("vcenter_vm_snapshots", {"name": name}),
@@ -772,6 +823,8 @@ async def triage_vm(name: str) -> dict:
         "vcenter_alarms": ("vcenter_alarms", {}),
         "ops_alerts": ("ops_alerts", {"activeOnly": True, "pageSize": 200}),
         "recent_flows": ("networks_flow_inventory", {"vm": name, "hours": 24, "limit": 200}),
+        "logs": ("logs_for_object", {"name": name, "hours": 24, "limit": 50}),
+        "backup": ("veeam_protection", {"vm_name": name}),
     })
 
     data["vcenter_alarms"] = _filter_mentions(data["vcenter_alarms"], name)
@@ -788,12 +841,14 @@ async def triage_vm(name: str) -> dict:
     return {
         "triage_target": name,
         "target_type": "VirtualMachine",
-        "systems_consulted": ["vCenter", "VCF Operations", "VCF Networks"],
+        "systems_consulted": ["vCenter", "VCF Operations", "VCF Networks", "Logs", "Veeam"],
         "guidance": (
             "Alarms and alerts were matched by name, so an empty list means none "
             "mentioned this VM, not that the estate is healthy. Any section "
             "containing 'error' was not collected — say so rather than treating "
-            "it as a clean result."
+            "it as a clean result. Logs explain why something failed once alarms "
+            "have established that it did. Check 'backup' before recommending "
+            "anything destructive."
         ),
         **data,
     }
@@ -809,6 +864,7 @@ async def triage_host(name: str) -> dict:
         "ops_alerts": ("ops_alerts", {"activeOnly": True, "pageSize": 200}),
         "datastores_low": ("vcenter_datastores_lowfree", {"threshold_percent": 20}),
         "network_alerts": ("networks_alerts", {}),
+        "logs": ("logs_for_object", {"name": name, "hours": 24, "limit": 50}),
     })
 
     for section in ("hosts", "host_usage", "vcenter_alarms", "ops_alerts", "network_alerts"):
@@ -817,7 +873,7 @@ async def triage_host(name: str) -> dict:
     return {
         "triage_target": name,
         "target_type": "HostSystem",
-        "systems_consulted": ["vCenter", "VCF Operations", "VCF Networks"],
+        "systems_consulted": ["vCenter", "VCF Operations", "VCF Networks", "Logs"],
         "guidance": (
             "Before proposing maintenance mode, check cluster capacity in 'clusters': "
             "the VMs on this host must fit elsewhere. Sections containing 'error' "
@@ -838,11 +894,13 @@ async def triage_estate() -> dict:
         "vmtools_notrunning": ("vcenter_vmtools_notrunning", {}),
         "clusters": ("vcenter_clusters_summary", {}),
         "hosts": ("vcenter_list_hosts", {}),
+        "log_errors": ("logs_errors", {"hours": 24, "limit": 50}),
+        "failed_backups": ("veeam_failed_jobs", {"hours": 24, "failed_only": True}),
     })
     failed = [k for k, v in data.items() if isinstance(v, dict) and v.get("error")]
     return {
         "triage_target": "estate",
-        "systems_consulted": ["vCenter", "VCF Operations", "VCF Networks"],
+        "systems_consulted": ["vCenter", "VCF Operations", "VCF Networks", "Logs", "Veeam"],
         "sections_failed": failed,
         "guidance": (
             "Report by severity, naming specific objects. If sections_failed is "
@@ -1265,14 +1323,16 @@ async def health():
     Always returns 200 so a probe can read the detail; use the `status`
     field rather than the HTTP code to decide if the system is usable.
     """
-    ollama, vcenter, ops, networks = await asyncio.gather(
+    ollama, vcenter, ops, networks, logs, backup = await asyncio.gather(
         _probe_ollama(),
         _probe_api("vcenter", VCENTER_BASE, "/health"),
         _probe_api("vcf_ops", OPS_BASE, "/ops/health"),
         _probe_api("vcf_networks", NETWORKS_BASE, "/ni/health"),
+        _probe_api("logs", LOGS_BASE, "/logs/health"),
+        _probe_api("backup", VEEAM_BASE, "/veeam/health"),
     )
 
-    apis = [vcenter, ops, networks]
+    apis = [vcenter, ops, networks, logs, backup]
     if not ollama["reachable"]:
         status = "unavailable"  # no inference, nothing works
     elif not all(a["reachable"] for a in apis):

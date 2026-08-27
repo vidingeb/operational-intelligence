@@ -178,7 +178,7 @@ def test_triage_filters_alarms_to_the_named_object():
     assert o._filter_mentions({"alarms": rows}, "adc01") == [rows[0]]
 
 
-def test_triage_vm_consults_all_three_systems():
+def test_triage_vm_consults_every_system():
     async def fake_call(tool, args=None, confirmed=False):
         return {"tool": tool, "args": args}
 
@@ -189,8 +189,10 @@ def test_triage_vm_consults_all_three_systems():
         o.call_api = real
 
     assert out["triage_target"] == "adc01"
-    assert set(out["systems_consulted"]) == {"vCenter", "VCF Operations", "VCF Networks"}
-    for section in ("vm", "snapshots", "storage", "vcenter_alarms", "ops_alerts", "recent_flows"):
+    assert set(out["systems_consulted"]) == {
+        "vCenter", "VCF Operations", "VCF Networks", "Logs", "Veeam"}
+    for section in ("vm", "snapshots", "storage", "vcenter_alarms", "ops_alerts",
+                    "recent_flows", "logs", "backup"):
         assert section in out
 
 

@@ -36,12 +36,38 @@ HTML_PAGE = """<!DOCTYPE html>
             align-items: center;
             gap: 1rem;
         }
+
+        /* Vendor strip. Deliberately monograms rather than official logos:
+           the real marks are trademarked and are not committed to this repo. */
+        .vendors {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .vendor {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 3px 9px 3px 6px;
+            border: 1px solid #24405f;
+            border-radius: 999px;
+            background: #10182c;
+            font-size: 11px;
+            letter-spacing: 0.04em;
+            color: #90a4ae;
+            white-space: nowrap;
+        }
+        .vendor .dot {
+            width: 9px; height: 9px; border-radius: 2px; flex: none;
+        }
+        .vendor[data-live="down"] { opacity: 0.45; }
+        .vendor[data-live="down"] .dot { background: #546e7a !important; }
         header h1 {
             font-size: 1.3rem;
             color: #4fc3f7;
         }
-        header .badge {
-            background: #0f3460;
+        header .badge {            background: #0f3460;
             color: #81d4fa;
             padding: 0.2rem 0.6rem;
             border-radius: 12px;
@@ -217,8 +243,14 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
     <header>
         <h1>🖥️ On-Prem AI Assistant</h1>
-        <span class="badge">vCenter · VCF Ops · Networks</span>
+        <span class="badge">vCenter · VCF Ops · Networks · Logs · Veeam</span>
         <span class="badge">100% On-Premises</span>
+        <span class="vendors">
+            <span class="vendor" id="v-broadcom"><span class="dot" style="background:#cc092f"></span>Broadcom</span>
+            <span class="vendor" id="v-dell"><span class="dot" style="background:#0076ce"></span>Dell</span>
+            <span class="vendor" id="v-intel"><span class="dot" style="background:#0068b5"></span>Intel</span>
+            <span class="vendor" id="v-veeam"><span class="dot" style="background:#00b336"></span>Veeam</span>
+        </span>
     </header>
     <div class="info-bar">
         <span>LLM: {{LLM_BACKEND}}</span>
@@ -436,6 +468,35 @@ Try asking me:
             return box;
         }
 
+        // --- vendor strip -----------------------------------------------------
+        //
+        // The chips are wired to real health rather than being decoration: a
+        // greyed vendor means that system is not answering. Intel has no probe
+        // of its own and stays lit.
+
+        async function updateVendors() {
+            try {
+                const r = await fetch('/api/health');
+                if (!r.ok) return;
+                const h = await r.json();
+                const apis = {};
+                (h.apis || []).forEach(a => { apis[a.name] = a.reachable; });
+
+                const vmware = ['vcenter', 'vcf_ops', 'vcf_networks']
+                    .filter(n => n in apis);
+                const vmwareUp = vmware.length === 0 || vmware.some(n => apis[n]);
+                set('v-broadcom', vmwareUp);
+                if ('backup' in apis) set('v-veeam', apis.backup);
+                // The GB10 is the Dell box doing inference.
+                set('v-dell', !!(h.inference && h.inference.reachable));
+            } catch (e) { /* the strip is cosmetic; never break the page */ }
+        }
+
+        function set(id, up) {
+            const el = document.getElementById(id);
+            if (el) el.setAttribute('data-live', up ? 'up' : 'down');
+        }
+
         // --- token accounting -------------------------------------------------
 
         function buildUsageBar(data) {
@@ -563,6 +624,8 @@ Try asking me:
             }
         }
         loadOptions();
+        updateVendors();
+        setInterval(updateVendors, 30000);
 
         setInterval(refreshTelemetry, 5000);
     </script>
@@ -633,6 +696,18 @@ async def cancel(request: dict):
             raise HTTPException(status_code=response.status_code,
                                 detail=response.json().get("detail", response.text))
         return response.json()
+
+
+@app.get("/api/health")
+async def health():
+    """Backend health, used to light or grey the vendor strip."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{ORCHESTRATOR_URL}/health")
+            response.raise_for_status()
+            return response.json()
+    except Exception:
+        return {}
 
 
 @app.get("/api/models")
