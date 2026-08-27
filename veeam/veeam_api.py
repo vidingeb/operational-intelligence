@@ -392,6 +392,36 @@ def unprotected(limit: int = Query(200, ge=1, le=500)):
     }
 
 
+@app.get("/veeam/version")
+def version():
+    """What Veeam build this actually is.
+
+    /api/v1/serverInfo is the same endpoint the api-version negotiation
+    settles against, so it is known to answer. Field names are read off the
+    payload rather than assumed: whatever Veeam calls them, the full response
+    is returned alongside, so an unexpected shape is visible instead of
+    silently producing nulls.
+    """
+    data = request("GET", "/api/v1/serverInfo")
+    if not isinstance(data, dict):
+        return {"unexpected_shape": True, "raw": data}
+
+    known = {
+        "name": data.get("name"),
+        "build_version": data.get("buildVersion"),
+        "patch_level": data.get("patchLevel"),
+        "database_vendor": data.get("databaseVendor"),
+    }
+    return {
+        "product": "Veeam Backup & Replication",
+        **{k: v for k, v in known.items() if v is not None},
+        "rest_api_version": _session["api_version"],
+        "api_version_confirmed": "version_unconfirmed" not in _session,
+        "fields_returned_by_server": sorted(data),
+        "raw": data,
+    }
+
+
 @app.get("/veeam/raw")
 def raw(path: str = Query(..., description="Path under the Veeam API, e.g. /api/v1/jobs"),
         limit: int = Query(5, ge=1, le=50)):

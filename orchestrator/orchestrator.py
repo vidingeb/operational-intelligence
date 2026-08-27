@@ -252,6 +252,9 @@ REGISTRY = [
        {"cluster_id": (Str, True, "VCF Networks cluster entity ID")}),
     _t("networks_alerts", "GET", f"{NETWORKS_BASE}/ni/alerts",
        "Active network alerts (problems) from VCF Networks"),
+    _t("networks_version", "GET", f"{NETWORKS_BASE}/ni/version",
+       "Version of VCF Operations for Networks (Network Insight) itself. For a "
+       "question spanning more than one product, prefer estate_versions"),
     _t("networks_alert_details", "GET", f"{NETWORKS_BASE}/ni/alerts/{{problem_id}}",
        "Detail for one network alert by problem ID",
        {"problem_id": (Str, True, "Problem ID from networks_alerts")}),
@@ -359,6 +362,9 @@ REGISTRY = [
        {"name": (Str, True, "VM, host or object name"),
         "hours": (Int, False, "Look-back window in hours (default 24)"),
         "limit": (Int, False, "Max events (default 100)")}),
+    _t("logs_version", "GET", f"{LOGS_BASE}/logs/version",
+       "Version of VCF Operations for Logs itself. For a question spanning more "
+       "than one product, prefer estate_versions"),
 
     # --- Veeam Backup & Replication ----------------------------------------
     _t("veeam_protection", "GET", f"{VEEAM_BASE}/veeam/protection/{{vm_name}}",
@@ -379,6 +385,9 @@ REGISTRY = [
     _t("veeam_jobs", "GET", f"{VEEAM_BASE}/veeam/jobs",
        "Configured Veeam backup jobs",
        {"limit": (Int, False, "Max jobs (default 100)")}),
+    _t("veeam_version", "GET", f"{VEEAM_BASE}/veeam/version",
+       "Veeam Backup & Replication build and REST API version. For a question "
+       "spanning more than one product, prefer estate_versions"),
 
     # --- Triage ------------------------------------------------------------
     # Composite, cross-system, executed in-process. A senior engineer does not
@@ -409,6 +418,14 @@ REGISTRY = [
        {"full": ("boolean", False,
                  "Return every record instead of a sample per section.")},
        local="triage_estate"),
+    _t("estate_versions", "LOCAL", "local://versions/estate",
+       "Software versions across the whole estate in one call: vCenter, every "
+       "ESXi host, VCF Operations for Logs, VCF Operations for Networks and "
+       "Veeam. Use for 'what versions are we running', 'what software is in the "
+       "cluster' or any question spanning more than one product. Also reports "
+       "which systems have no version source (NSX is not integrated), so the "
+       "answer can say what was not checked",
+       local="estate_versions"),
 ]
 
 # networks_flows and networks_path are constrained by what Network Insight
@@ -562,6 +579,10 @@ the way an experienced engineer does.
   Never emit HTML such as <br>. Use short labelled lines and simple "- " bullets.
 - A sample is not a complete set. If a result carries "showing" or
   "more_available", say so rather than presenting it as everything there is.
+- Never offer to run a query you have no tool for. Saying "let me know and I
+  can run a targeted query" when no such tool exists sounds helpful and is
+  untrue. State the limit and stop: "NSX is not integrated, so I cannot read
+  its version."
 - Always finish with a written answer, even when the data was incomplete."""
 
 SYSTEM_PROMPT = """You are an on-premises VMware infrastructure assistant with
@@ -1013,6 +1034,63 @@ async def triage_estate(full: bool = False) -> dict:
     }
 
 
+async def estate_versions() -> dict:
+    """What software the estate is running, gathered from every system at once.
+
+    Answering this by hand took four separate tool calls, so it is one call
+    here. The uncovered systems are listed explicitly: asked "what are we
+    running", a model given only partial data will otherwise present that
+    partial list as the whole estate.
+    """
+    data = await _gather({
+        "vcenter": ("vcenter_about", {}),
+        "hosts": ("vcenter_list_hosts", {}),
+        "logs": ("logs_version", {}),
+        "veeam": ("veeam_version", {}),
+        "networks": ("networks_version", {}),
+    })
+
+    hosts = data.pop("hosts")
+    if isinstance(hosts, dict) and not hosts.get("error"):
+        rows = hosts.get("hosts") if isinstance(hosts.get("hosts"), list) else []
+        builds = {}
+        for row in rows:
+            key = (row.get("version"), row.get("build"))
+            builds.setdefault(key, []).append(row.get("name"))
+        data["esxi_hosts"] = {
+            "host_count": len(rows),
+            "distinct_builds": len(builds),
+            "builds": [
+                {"version": v, "build": b, "host_count": len(names),
+                 "hosts": sorted(n for n in names if n)}
+                for (v, b), names in builds.items()
+            ],
+        }
+    else:
+        data["esxi_hosts"] = hosts
+
+    failed = [k for k, v in data.items() if isinstance(v, dict) and v.get("error")]
+    return {
+        "covered": ["vCenter", "ESXi hosts", "VCF Operations for Logs",
+                    "VCF Operations for Networks", "Veeam Backup & Replication"],
+        "not_covered": {
+            "NSX": "No NSX wrapper is deployed — NSX version cannot be read.",
+            "VCF Operations": "No version endpoint on the VCF Operations wrapper.",
+            "SDDC Manager": "Not integrated.",
+        },
+        "sections_failed": failed,
+        "guidance": (
+            "Report the versions found, then state plainly which systems could "
+            "not be checked, using not_covered and sections_failed. Do not "
+            "present this as the complete estate software inventory, and do not "
+            "offer to run a query for an uncovered system — there is no tool "
+            "for it. If distinct_builds is greater than 1 the hosts are not on "
+            "a uniform build, which is worth calling out."
+        ),
+        **data,
+    }
+
+
 # --- Output shaping ----------------------------------------------------------
 #
 # The chat pane renders plain text, not Markdown: it builds messages with
@@ -1049,6 +1127,7 @@ LOCAL_HANDLERS = {
     "triage_vm": triage_vm,
     "triage_host": triage_host,
     "triage_estate": triage_estate,
+    "estate_versions": estate_versions,
 }
 
 

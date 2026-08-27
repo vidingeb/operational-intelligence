@@ -21,9 +21,13 @@ NI_DOMAIN_TYPE = os.getenv("NI_DOMAIN_TYPE", os.getenv("NI_DOMAIN", "LOCAL"))
 
 REQUEST_TIMEOUT = int(os.getenv("NI_TIMEOUT", "30"))
 
+# One source of truth: root and /ni/health previously reported 1.5.0 and 1.6.0
+# for the same running process.
+SERVICE_VERSION = "1.7.0"
+
 app = FastAPI(
     title="Local VCF Operations for Networks API Proxy",
-    version="1.5.0",
+    version=SERVICE_VERSION,
     description="Local proxy API for Copilot Studio / agent access to VCF Operations for Networks."
 )
 
@@ -206,7 +210,7 @@ def build_search_filter(query: str) -> str:
 def root():
     return {
         "service": "Local VCF Operations for Networks API Proxy",
-        "version": "1.5.0",
+        "version": SERVICE_VERSION,
         "base_url": NI_BASE_URL,
         "verify_ssl": VERIFY_SSL
     }
@@ -222,7 +226,7 @@ def health():
     """
     info = {
         "service": "vcf-networks-api-proxy",
-        "version": "1.6.0",
+        "version": SERVICE_VERSION,
         "target": NI_BASE_URL,
         "domain_type": NI_DOMAIN_TYPE,
         "auth_mode": "api-token",
@@ -317,7 +321,19 @@ def list_nsx_t1(
 
 @app.get("/ni/version")
 def version():
-    return client.request("GET", "/api/ni/info/version")
+    """Network Insight product version, labelled and with the payload intact."""
+    data = client.request("GET", "/api/ni/info/version")
+    if not isinstance(data, dict):
+        return {"unexpected_shape": True, "raw": data}
+    return {
+        "product": "VMware VCF Operations for Networks (Network Insight)",
+        **{k: v for k, v in {
+            "version": data.get("version"),
+            "build_number": data.get("build_number") or data.get("buildNumber"),
+        }.items() if v is not None},
+        "fields_returned_by_server": sorted(data),
+        "raw": data,
+    }
 
 
 @app.get("/ni/infra/nodes")

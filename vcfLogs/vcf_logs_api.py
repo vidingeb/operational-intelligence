@@ -333,6 +333,31 @@ def logs_for(
     return result
 
 
+@app.get("/logs/version")
+def version():
+    """VCF Operations for Logs product version.
+
+    /api/v2/version answered 401 unauthenticated during discovery, which is
+    how we know it exists — with a session token it should return the build.
+    The whole payload is included because these field names have not been
+    seen yet and should not be guessed at.
+    """
+    data = request("GET", "/api/v2/version")
+    if not isinstance(data, dict):
+        return {"unexpected_shape": True, "raw": data}
+    known = {
+        "version": data.get("version"),
+        "release_name": data.get("releaseName"),
+        "build": data.get("build") or data.get("buildNumber"),
+    }
+    return {
+        "product": "VMware VCF Operations for Logs (Aria Operations for Logs)",
+        **{k: v for k, v in known.items() if v is not None},
+        "fields_returned_by_server": sorted(data),
+        "raw": data,
+    }
+
+
 @app.get("/logs/raw")
 def raw(
     path: str = Query(..., description="Path under the logs API, e.g. /api/v2/events/timestamp>0"),
