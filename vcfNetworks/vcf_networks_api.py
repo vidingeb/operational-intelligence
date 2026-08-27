@@ -437,6 +437,57 @@ def clusters():
 def cluster_details(cluster_id: str):
     return client.request("GET", f"/api/ni/entities/clusters/{cluster_id}")
 
+MAX_HYDRATE = 20
+
+
+def hydrate_flows(results: Dict[str, Any], size: int) -> list:
+    """Turn flow entity references into readable flow records.
+
+    Search only returns {entity_id, entity_type, time}, which tells a caller
+    nothing about the traffic. Each reference is fetched and flattened into
+    the fields people actually ask about: who talked to whom, on what port,
+    and whether the firewall allowed it. Capped so a broad query cannot fan
+    out into hundreds of upstream calls.
+    """
+    refs = (results or {}).get("results") or []
+    out = []
+
+    for ref in refs[:min(size, MAX_HYDRATE)]:
+        entity_id = ref.get("entity_id")
+        if not entity_id:
+            continue
+        try:
+            flow = client.request(
+                "GET",
+                f"/api/ni/entities/flows/{quote(str(entity_id), safe='')}",
+            )
+        except HTTPException:
+            out.append({"entity_id": entity_id, "error": "could not fetch flow detail"})
+            continue
+
+        port = flow.get("port") or {}
+        out.append({
+            "entity_id": entity_id,
+            "name": flow.get("name"),
+            "source_ip": (flow.get("source_ip") or {}).get("ip_address"),
+            "destination_ip": (flow.get("destination_ip") or {}).get("ip_address"),
+            "port": port.get("display") or port.get("start"),
+            "protocol": flow.get("protocol"),
+            "traffic_type": flow.get("traffic_type"),
+            "firewall_action": flow.get("firewall_action"),
+            "source_host": (flow.get("source_host") or {}).get("entity_name"),
+            "destination_host": (flow.get("destination_host") or {}).get("entity_name"),
+            "source_l2_network": (flow.get("source_l2_network") or {}).get("entity_name"),
+        })
+
+    if len(refs) > len(out):
+        out.append({
+            "note": f"{len(refs)} flows matched, {len(out)} shown. "
+                    f"Narrow the filter or reduce the time window for more detail."
+        })
+    return out
+
+
 @app.get("/ni/flows")
 def flows(
     source: Optional[str] = Query(None, description="Source VM name or IP."),
@@ -499,7 +550,12 @@ def flows(
             },
         )
 
-    return {"filter_used": expression, "time_range": payload["time_range"], "results": results}
+    return {
+        "filter_used": expression,
+        "time_range": payload["time_range"],
+        "flow_count": (results or {}).get("total_count", 0),
+        "flows": hydrate_flows(results, size),
+    }
 
 
 @app.get("/ni/flows/recent")
