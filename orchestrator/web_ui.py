@@ -150,6 +150,48 @@ HTML_PAGE = """<!DOCTYPE html>
             font-family: inherit;
         }
         .csv-button:hover { background: #17518f; }
+        /* Markdown blocks. Without these the model's "### Heading" and
+           "**Observation:**" arrive as literal characters, which is fine on
+           screen but unusable in an exported report. */
+        .message h3, .message h4, .message h5 {
+            margin: 0.9rem 0 0.4rem;
+            color: #81d4fa;
+            font-size: 0.95rem;
+            line-height: 1.3;
+        }
+        .message h4 { font-size: 0.88rem; }
+        .message h5 { font-size: 0.83rem; }
+        .message p { margin: 0.45rem 0; }
+        .message ul, .message ol { margin: 0.45rem 0; padding-left: 1.3rem; }
+        .message li { margin: 0.15rem 0; }
+        .message code {
+            background: rgba(255,255,255,0.08);
+            border-radius: 3px;
+            padding: 0.05rem 0.3rem;
+            font-size: 0.82em;
+        }
+        .message hr {
+            border: 0;
+            border-top: 1px solid #2a4a7f;
+            margin: 0.9rem 0;
+        }
+        .message-tools {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            margin-bottom: 0.4rem;
+        }
+        .pdf-button {
+            background: #14402a;
+            color: #7fe0a8;
+            border: 1px solid #245c3d;
+            border-radius: 4px;
+            padding: 0.15rem 0.5rem;
+            font-size: 0.72rem;
+            cursor: pointer;
+            font-family: inherit;
+        }
+        .pdf-button:hover { background: #1d5c3c; }
         .message.error {
             align-self: flex-start;
             background: #3e1a1a;
@@ -342,12 +384,17 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
+        // The question that produced the current answer, carried into the
+        // exported report so a printed page says what was asked.
+        let lastQuestion = '';
+
         async function sendMessage() {
             const message = userInput.value.trim();
             if (!message) return;
 
             const model = modelSelect.value;
 
+            lastQuestion = message;
             addMessage(message, 'user');
             userInput.value = '';
             sendBtn.disabled = true;
@@ -397,6 +444,51 @@ HTML_PAGE = """<!DOCTYPE html>
 
         const TABLE_ROW = /^\\s*\\|(.+)\\|\\s*$/;
         const TABLE_SEP = /^\\s*\\|[\\s:|-]+\\|\\s*$/;
+        const HEADING = /^(#{1,6})\\s+(.*)$/;
+        const HRULE = /^\\s*(-{3,}|\\*{3,}|_{3,})\\s*$/;
+        const BULLET = /^\\s*[-*+]\\s+(.*)$/;
+        const NUMBERED = /^\\s*\\d+[.)]\\s+(.*)$/;
+        // Escape, bold, code, italic - in that order, so ** is not eaten by *.
+        const INLINE = /(\\\\.)|(\\*\\*[^*]+\\*\\*)|(`[^`]+`)|(\\*[^*\\n]+\\*)/g;
+
+        function inlineParts(text) {
+            const t = (text === null || text === undefined) ? '' : String(text);
+            const parts = [];
+            let last = 0;
+            let m;
+            INLINE.lastIndex = 0;
+            while ((m = INLINE.exec(t)) !== null) {
+                if (m.index > last) {
+                    parts.push({kind: 'text', value: t.slice(last, m.index)});
+                }
+                if (m[1]) parts.push({kind: 'text', value: m[1].slice(1)});
+                else if (m[2]) parts.push({kind: 'strong', value: m[2].slice(2, -2)});
+                else if (m[3]) parts.push({kind: 'code', value: m[3].slice(1, -1)});
+                else parts.push({kind: 'em', value: m[4].slice(1, -1)});
+                last = m.index + m[0].length;
+            }
+            if (last < t.length) parts.push({kind: 'text', value: t.slice(last)});
+            return parts;
+        }
+
+        function renderInline(el, text) {
+            inlineParts(text).forEach(part => {
+                if (part.kind === 'text') {
+                    el.appendChild(document.createTextNode(part.value));
+                } else {
+                    const tag = part.kind === 'strong' ? 'strong'
+                              : part.kind === 'code' ? 'code' : 'em';
+                    const node = document.createElement(tag);
+                    node.textContent = part.value;
+                    el.appendChild(node);
+                }
+            });
+        }
+
+        // A CSV of "**Low** (degradation)" should read "Low (degradation)".
+        function stripInline(text) {
+            return inlineParts(text).map(p => p.value).join('');
+        }
 
         function splitCells(line) {
             return line.replace(/^\\s*\\|/, '').replace(/\\|\\s*$/, '')
@@ -410,7 +502,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         function toCsv(header, rows) {
             return [header].concat(rows)
-                .map(r => r.map(csvEscape).join(','))
+                .map(r => r.map(c => csvEscape(stripInline(c))).join(','))
                 .join('\\r\\n');
         }
 
@@ -454,7 +546,7 @@ HTML_PAGE = """<!DOCTYPE html>
             const headRow = document.createElement('tr');
             header.forEach(cell => {
                 const th = document.createElement('th');
-                th.textContent = cell;
+                renderInline(th, cell);
                 headRow.appendChild(th);
             });
             thead.appendChild(headRow);
@@ -465,7 +557,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 const tr = document.createElement('tr');
                 for (let i = 0; i < header.length; i++) {
                     const td = document.createElement('td');
-                    td.textContent = row[i] === undefined ? '' : row[i];
+                    renderInline(td, row[i] === undefined ? '' : row[i]);
                     tr.appendChild(td);
                 }
                 tbody.appendChild(tr);
@@ -475,6 +567,56 @@ HTML_PAGE = """<!DOCTYPE html>
             return block;
         }
 
+        function renderBlocks(container, lines) {
+            let i = 0;
+            while (i < lines.length) {
+                if (!lines[i].trim()) { i++; continue; }
+
+                const heading = HEADING.exec(lines[i]);
+                if (heading) {
+                    // Clamp to h3..h5: the page already owns h1/h2.
+                    const level = Math.min(Math.max(heading[1].length + 2, 3), 5);
+                    const el = document.createElement('h' + level);
+                    renderInline(el, heading[2]);
+                    container.appendChild(el);
+                    i++;
+                    continue;
+                }
+
+                if (HRULE.test(lines[i])) {
+                    container.appendChild(document.createElement('hr'));
+                    i++;
+                    continue;
+                }
+
+                if (BULLET.test(lines[i]) || NUMBERED.test(lines[i])) {
+                    const ordered = !BULLET.test(lines[i]);
+                    const list = document.createElement(ordered ? 'ol' : 'ul');
+                    while (i < lines.length) {
+                        const item = BULLET.exec(lines[i]) || NUMBERED.exec(lines[i]);
+                        if (!item) break;
+                        const li = document.createElement('li');
+                        renderInline(li, item[1]);
+                        list.appendChild(li);
+                        i++;
+                    }
+                    container.appendChild(list);
+                    continue;
+                }
+
+                const paragraph = [];
+                while (i < lines.length && lines[i].trim() &&
+                       !HEADING.test(lines[i]) && !HRULE.test(lines[i]) &&
+                       !BULLET.test(lines[i]) && !NUMBERED.test(lines[i])) {
+                    paragraph.push(lines[i]);
+                    i++;
+                }
+                const p = document.createElement('p');
+                renderInline(p, paragraph.join('\\n'));
+                container.appendChild(p);
+            }
+        }
+
         function renderBody(container, text) {
             const lines = String(text).split('\\n');
             let buffer = [];
@@ -482,7 +624,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
             function flushText() {
                 if (buffer.length) {
-                    container.appendChild(document.createTextNode(buffer.join('\\n')));
+                    renderBlocks(container, buffer);
                     buffer = [];
                 }
             }
@@ -515,14 +657,98 @@ HTML_PAGE = """<!DOCTYPE html>
             flushText();
         }
 
+        // --- PDF export -------------------------------------------------------
+        //
+        // No PDF library, on purpose: this runs on an estate that should not
+        // need to fetch a vendored megabyte from a CDN to print a report. The
+        // browser already has a PDF writer behind Ctrl-P, so the export opens a
+        // clean print view and calls it. The cost is that the user picks
+        // "Save as PDF" in the dialog rather than getting a direct download.
+
+        const PRINT_CSS = [
+            'body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;',
+            '       color: #111; margin: 24px; }',
+            'h1 { font-size: 18px; margin: 0 0 2px; }',
+            '.meta { color: #555; font-size: 11px; margin-bottom: 14px; }',
+            '.question { font-size: 13px; font-weight: 600; margin: 0 0 16px;',
+            '            padding: 8px 10px; background: #f2f4f7;',
+            '            border-left: 3px solid #7a8ba0; }',
+            'table { border-collapse: collapse; font-size: 10px; width: 100%;',
+            '        margin: 4px 0 14px; }',
+            'th, td { border: 1px solid #999; padding: 3px 6px; text-align: left; }',
+            'th { background: #eceff3; }',
+            'h3, h4, h5 { margin: 14px 0 4px; font-size: 13px; }',
+            'p { margin: 6px 0; font-size: 12px; }',
+            'ul, ol { margin: 6px 0; padding-left: 18px; font-size: 12px; }',
+            'li { margin: 2px 0; }',
+            'code { background: #eee; padding: 0 3px; }',
+            'hr { border: 0; border-top: 1px solid #ccc; margin: 12px 0; }',
+            '.message-tools, .table-tools, .model-tag, .usage-bar, .confirm-box',
+            '  { display: none !important; }',
+            // Repeat headers on every page and avoid splitting a row.
+            '@media print { @page { margin: 14mm; }',
+            '  thead { display: table-header-group; }',
+            '  tr { break-inside: avoid; page-break-inside: avoid; } }'
+        ].join('\\n');
+
+        function exportPdf(messageDiv, model, question) {
+            const win = window.open('', '_blank');
+            if (!win) {
+                addMessage('Could not open the report window. Allow pop-ups for '
+                           + 'this site, then try again.', 'error');
+                return;
+            }
+            const doc = win.document;
+            const stamp = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+            doc.title = 'Estate report ' + stamp;
+            const style = doc.createElement('style');
+            style.textContent = PRINT_CSS;
+            doc.head.appendChild(style);
+
+            const title = doc.createElement('h1');
+            title.textContent = 'Operational status report';
+            doc.body.appendChild(title);
+
+            const meta = doc.createElement('div');
+            meta.className = 'meta';
+            meta.textContent = 'Generated ' + stamp + ' UTC'
+                + (model ? '  |  model: ' + model : '')
+                + '  |  source: live estate APIs, read-only';
+            doc.body.appendChild(meta);
+
+            if (question) {
+                const q = doc.createElement('div');
+                q.className = 'question';
+                q.textContent = question;
+                doc.body.appendChild(q);
+            }
+
+            doc.body.appendChild(doc.importNode(messageDiv, true));
+            win.focus();
+            // Give the imported nodes a tick to lay out before the dialog opens.
+            win.setTimeout(function () { win.print(); }, 300);
+        }
+
         function addMessage(text, type, model, data) {
             const div = document.createElement('div');
             div.className = 'message ' + type;
             if (model && type === 'assistant') {
+                const tools = document.createElement('div');
+                tools.className = 'message-tools';
                 const tag = document.createElement('div');
                 tag.className = 'model-tag';
                 tag.textContent = model;
-                div.appendChild(tag);
+                const question = lastQuestion;
+                const pdfButton = document.createElement('button');
+                pdfButton.className = 'pdf-button';
+                pdfButton.textContent = 'Export PDF';
+                pdfButton.title = 'Opens a print view; choose "Save as PDF"';
+                pdfButton.addEventListener('click',
+                    () => exportPdf(div, model, question));
+                tools.appendChild(pdfButton);
+                tools.appendChild(tag);
+                div.appendChild(tools);
                 renderBody(div, '\\n' + text);
                 const usage = buildUsageBar(data);
                 if (usage) div.appendChild(usage);
