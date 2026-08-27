@@ -96,54 +96,93 @@ def _login(api_version: str):
 
 
 def authenticate(force: bool = False) -> Dict[str, Any]:
-    """Log in, working out the API version the server will accept.
+    """Log in, then work out which API version the server will serve data on.
 
-    Tries candidates newest-first and keeps the one that authenticates. Which
-    version worked is reported rather than hidden, because it identifies the
-    build and explains any endpoint that later 404s.
+    The version is deliberately not negotiated at the token endpoint. Probing
+    veeam01 with a deliberately invalid user showed every candidate version
+    returning 401: credentials are checked first, so the header is never
+    reached and any value appears to be accepted. Negotiating there would
+    always "succeed" on the first candidate and then fail on real calls —
+    a check that cannot fail, which is worse than no check.
+
+    So the token is obtained once, and the version is settled against an
+    endpoint that actually returns data.
     """
     _require_credentials()
     if not force and _session["token"] and time.time() < _session["expires_at"]:
         return _session
 
-    attempts = []
     versions = [PINNED_VERSION] if PINNED_VERSION else CANDIDATE_VERSIONS
 
-    for version in versions:
+    try:
+        response = _login(versions[0])
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Cannot reach {VEEAM_URL}: {exc}. On Windows, check the "
+                   f"'Veeam Backup Server RESTful API Service' is running — it "
+                   f"is a separate service from the backup service itself, and "
+                   f"is Delayed Start, so it lags a reboot by a minute or two.",
+        )
+
+    if response.status_code == 401:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Veeam rejected user '{VEEAM_USER}'. The version header is not "
+                   f"checked at this endpoint, so this is a credential problem, "
+                   f"not a version problem.",
+        )
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Veeam login failed: {response.text[:500]}",
+        )
+
+    body = response.json()
+    _session.update({
+        "token": body["access_token"],
+        "expires_at": time.time() + max(int(body.get("expires_in", 900)) - 60, 60),
+        "api_version": versions[0],
+    })
+
+    if not PINNED_VERSION:
+        _session["api_version"] = _negotiate_version(_session["token"])
+
+    return _session
+
+
+def _negotiate_version(token: str) -> str:
+    """Find a version the server will actually serve data on.
+
+    Tried newest-first against a cheap read. Whichever value works is reported
+    on every response, because it identifies the build and explains any
+    endpoint that later 404s.
+    """
+    attempts = []
+    for version in CANDIDATE_VERSIONS:
         try:
-            response = _login(version)
+            probe = requests.get(
+                f"{VEEAM_URL}/api/v1/serverInfo",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "x-api-version": version,
+                    "Accept": "application/json",
+                },
+                verify=VERIFY_SSL,
+                timeout=TIMEOUT,
+            )
         except requests.RequestException as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Cannot reach {VEEAM_URL}: {exc}. On Windows, check the "
-                       f"'Veeam Backup & Replication REST API Service' is running — "
-                       f"it is a separate service from the backup service itself.",
-            )
+            attempts.append(f"{version} -> {exc}")
+            continue
 
-        if response.status_code == 200:
-            body = response.json()
-            _session.update({
-                "token": body["access_token"],
-                "expires_at": time.time() + max(int(body.get("expires_in", 900)) - 60, 60),
-                "api_version": version,
-            })
-            return _session
+        if probe.status_code == 200:
+            return version
+        attempts.append(f"{version} -> {probe.status_code}: {probe.text[:120]}")
 
-        attempts.append(f"{version} -> {response.status_code}: {response.text[:200]}")
-        # Wrong credentials fail identically on every version, so stop early
-        # rather than locking the account out with repeated bad attempts.
-        if response.status_code == 401 and "version" not in response.text.lower():
-            raise HTTPException(
-                status_code=401,
-                detail=f"Veeam rejected user '{VEEAM_USER}'. Checked API version {version}.",
-            )
-
-    raise HTTPException(
-        status_code=502,
-        detail=f"No supported Veeam API version. Tried: {' | '.join(attempts)}. "
-               f"The rejection text usually names the expected value — set "
-               f"VEEAM_API_VERSION to pin it.",
-    )
+    # Data calls will now carry the newest candidate and may fail, but saying
+    # so is better than reporting a version that was never confirmed.
+    _session["version_unconfirmed"] = attempts
+    return CANDIDATE_VERSIONS[0]
 
 
 def request(method: str, path: str, **kwargs) -> Any:
@@ -208,6 +247,8 @@ def health():
         "user": VEEAM_USER,
         "api_version": session["api_version"],
         "version_negotiated": PINNED_VERSION is None,
+        "version_confirmed": "version_unconfirmed" not in session,
+        "version_attempts": session.get("version_unconfirmed"),
         "authenticated": True,
     }
 
