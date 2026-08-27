@@ -506,3 +506,49 @@ def test_tool_output_is_never_replayed(chat_client):
     cid = client.post("/chat", json={"message": "first"}).json()["conversation_id"]
     client.post("/chat", json={"message": "second", "conversation_id": cid})
     assert all(m["role"] in ("system", "user", "assistant") for m in seen[1])
+
+
+# --- Regression: the chat 500 hunt ---------------------------------------
+
+def test_store_works_without_an_explicit_init(tmp_path):
+    """Using the store before init_db must not raise "no such table".
+
+    The live chat endpoint returned a bare 500 and the first reproduction was
+    exactly this error. Depending on a startup hook to create the schema makes
+    every other entry point a latent failure.
+    """
+    db = str(tmp_path / "fresh.db")
+    store._INITIALISED.discard(db)
+    cid = store.create_conversation(title="no init called", path=db)
+    store.add_message(cid, "user", "hello", path=db)
+    assert [m["content"] for m in store.history(cid, path=db)] == ["hello"]
+
+
+def test_connections_are_closed(tmp_path):
+    """Each operation must close its connection, not just commit it.
+
+    ``with sqlite3.connect(...)`` commits and leaves the handle open, so a
+    long-lived service leaks one descriptor per request until it cannot open
+    any more.
+    """
+    db = str(tmp_path / "fds.db")
+    store.init_db(db)
+    opened = []
+    real = store.sqlite3.connect
+
+    def tracking(*a, **k):
+        conn = real(*a, **k)
+        opened.append(conn)
+        return conn
+
+    store.sqlite3.connect = tracking
+    try:
+        for i in range(5):
+            store.create_conversation(title=f"c{i}", path=db)
+    finally:
+        store.sqlite3.connect = real
+
+    assert len(opened) == 5
+    for conn in opened:
+        with pytest.raises(store.sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")

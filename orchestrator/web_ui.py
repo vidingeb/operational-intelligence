@@ -1414,7 +1414,15 @@ async def chat(request: dict):
                 "conversation_id": request.get("conversation_id"),
             },
         )
-        response.raise_for_status()
+        # raise_for_status() discards the orchestrator's message and returns a
+        # bare "Internal Server Error", which turned a one-line diagnosis into
+        # a guessing game. Pass the detail through.
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("detail", response.text[:500])
+            except Exception:
+                detail = response.text[:500]
+            raise HTTPException(status_code=response.status_code, detail=detail)
         return response.json()
 
 

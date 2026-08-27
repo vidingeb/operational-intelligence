@@ -12,6 +12,7 @@ enabled so the scheduler writing a run cannot block the UI reading one.
 Times are stored as ISO-8601 UTC strings. Not local time: a schedule that
 silently shifts by an hour twice a year is a bug that takes months to notice.
 """
+import contextlib
 import json
 import os
 import sqlite3
@@ -81,16 +82,46 @@ def new_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
+_INITIALISED = set()
+
+
 def connect(path: str = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(path or DB_PATH)
+    """Open a connection, creating the schema the first time a path is used.
+
+    Self-initialising on purpose. Relying on a startup hook means any path that
+    reaches the database another way fails with "no such table", which reads
+    like data loss rather than a missing migration.
+    """
+    target = path or DB_PATH
+    conn = sqlite3.connect(target)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    if target not in _INITIALISED:
+        conn.executescript(SCHEMA)
+        conn.commit()
+        _INITIALISED.add(target)
     return conn
 
 
+@contextlib.contextmanager
+def session(path: str = None):
+    """A connection that commits on success and always closes.
+
+    ``with sqlite3.connect(...)`` commits but does not close, which leaks a file
+    descriptor per call. That is invisible in a test run and fatal in a service
+    that stays up for weeks.
+    """
+    conn = connect(path)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def init_db(path: str = None) -> None:
-    with connect(path) as conn:
+    with session(path) as conn:
         conn.executescript(SCHEMA)
 
 
@@ -99,7 +130,7 @@ def init_db(path: str = None) -> None:
 def create_conversation(title: str = "", path: str = None) -> str:
     cid = new_id()
     now = utcnow()
-    with connect(path) as conn:
+    with session(path) as conn:
         conn.execute(
             "INSERT INTO conversations (id, title, created_at, updated_at)"
             " VALUES (?, ?, ?, ?)", (cid, title[:120], now, now))
@@ -114,7 +145,7 @@ def add_message(conversation_id: str, role: str, content: str,
     requests racing on the same conversation cannot both claim the same seq and
     silently drop one of the messages.
     """
-    with connect(path) as conn:
+    with session(path) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO conversations (id, title, created_at, updated_at)"
             " VALUES (?, ?, ?, ?)",
@@ -146,7 +177,7 @@ def history(conversation_id: str, limit_turns: int = 6, path: str = None) -> lis
     The model gets what was asked and what it concluded, which is what a
     follow-up like "and which of those are powered on?" actually needs.
     """
-    with connect(path) as conn:
+    with session(path) as conn:
         rows = conn.execute(
             "SELECT role, content FROM messages WHERE conversation_id = ?"
             " ORDER BY seq DESC LIMIT ?",
@@ -155,7 +186,7 @@ def history(conversation_id: str, limit_turns: int = 6, path: str = None) -> lis
 
 
 def list_conversations(limit: int = 50, path: str = None) -> list:
-    with connect(path) as conn:
+    with session(path) as conn:
         rows = conn.execute(
             "SELECT c.id, c.title, c.created_at, c.updated_at,"
             "       (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS messages"
@@ -165,7 +196,7 @@ def list_conversations(limit: int = 50, path: str = None) -> list:
 
 
 def delete_conversation(conversation_id: str, path: str = None) -> None:
-    with connect(path) as conn:
+    with session(path) as conn:
         conn.execute("DELETE FROM messages WHERE conversation_id = ?",
                      (conversation_id,))
         conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
@@ -177,7 +208,7 @@ def create_schedule(question: str, kind: str, hour: int, minute: int,
                     weekday=None, model=None, scope: str = "all",
                     next_run: str = "", path: str = None) -> str:
     sid = new_id()
-    with connect(path) as conn:
+    with session(path) as conn:
         conn.execute(
             "INSERT INTO schedules (id, question, model, scope, kind, hour, minute,"
             " weekday, enabled, next_run, last_run, created_at)"
@@ -188,21 +219,21 @@ def create_schedule(question: str, kind: str, hour: int, minute: int,
 
 
 def list_schedules(path: str = None) -> list:
-    with connect(path) as conn:
+    with session(path) as conn:
         rows = conn.execute(
             "SELECT * FROM schedules ORDER BY next_run").fetchall()
     return [dict(r) for r in rows]
 
 
 def get_schedule(schedule_id: str, path: str = None):
-    with connect(path) as conn:
+    with session(path) as conn:
         row = conn.execute("SELECT * FROM schedules WHERE id = ?",
                            (schedule_id,)).fetchone()
     return dict(row) if row else None
 
 
 def due_schedules(now_iso: str, path: str = None) -> list:
-    with connect(path) as conn:
+    with session(path) as conn:
         rows = conn.execute(
             "SELECT * FROM schedules WHERE enabled = 1 AND next_run <= ?"
             " ORDER BY next_run", (now_iso,)).fetchall()
@@ -210,20 +241,20 @@ def due_schedules(now_iso: str, path: str = None) -> list:
 
 
 def mark_schedule_ran(schedule_id: str, next_run: str, path: str = None) -> None:
-    with connect(path) as conn:
+    with session(path) as conn:
         conn.execute(
             "UPDATE schedules SET last_run = ?, next_run = ? WHERE id = ?",
             (utcnow(), next_run, schedule_id))
 
 
 def set_schedule_enabled(schedule_id: str, enabled: bool, path: str = None) -> None:
-    with connect(path) as conn:
+    with session(path) as conn:
         conn.execute("UPDATE schedules SET enabled = ? WHERE id = ?",
                      (1 if enabled else 0, schedule_id))
 
 
 def delete_schedule(schedule_id: str, path: str = None) -> None:
-    with connect(path) as conn:
+    with session(path) as conn:
         conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
 
 
@@ -232,7 +263,7 @@ def delete_schedule(schedule_id: str, path: str = None) -> None:
 def start_run(question: str, schedule_id=None, model=None, scope: str = "all",
               path: str = None) -> str:
     rid = new_id()
-    with connect(path) as conn:
+    with session(path) as conn:
         conn.execute(
             "INSERT INTO runs (id, schedule_id, question, model, scope, status,"
             " started_at) VALUES (?, ?, ?, ?, ?, 'running', ?)",
@@ -242,7 +273,7 @@ def start_run(question: str, schedule_id=None, model=None, scope: str = "all",
 
 def finish_run(run_id: str, answer: str = None, error: str = None,
                tools_called=None, usage=None, path: str = None) -> None:
-    with connect(path) as conn:
+    with session(path) as conn:
         conn.execute(
             "UPDATE runs SET status = ?, answer = ?, error = ?, tools_called = ?,"
             " usage = ?, finished_at = ? WHERE id = ?",
@@ -260,7 +291,7 @@ def list_runs(limit: int = 50, schedule_id=None, path: str = None) -> list:
         args.append(schedule_id)
     query += " ORDER BY started_at DESC LIMIT ?"
     args.append(limit)
-    with connect(path) as conn:
+    with session(path) as conn:
         rows = conn.execute(query, args).fetchall()
     out = []
     for r in rows:
@@ -271,7 +302,7 @@ def list_runs(limit: int = 50, schedule_id=None, path: str = None) -> list:
 
 
 def get_run(run_id: str, path: str = None):
-    with connect(path) as conn:
+    with session(path) as conn:
         row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     if not row:
         return None
@@ -287,7 +318,7 @@ def previous_answer(schedule_id: str, path: str = None):
     Used to tell a recurring job what it said last time, so a daily report can
     describe what changed rather than restating the same 52 VMs every morning.
     """
-    with connect(path) as conn:
+    with session(path) as conn:
         row = conn.execute(
             "SELECT answer, started_at FROM runs WHERE schedule_id = ?"
             " AND status = 'ok' AND answer IS NOT NULL"
