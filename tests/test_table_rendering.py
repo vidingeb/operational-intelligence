@@ -19,6 +19,7 @@ what the browser receives.
 Still unproven by these tests: how it looks. Borders, column widths and the
 Download button are visual, and only a browser can confirm them.
 """
+import json
 import os
 import re
 import sys
@@ -445,3 +446,37 @@ def test_print_css_hides_the_buttons_and_repeats_table_headers():
         assert hidden in css, f"{hidden} would print into the report"
     assert "display: table-header-group" in css, "headers must repeat per page"
     assert "break-inside: avoid" in css, "rows must not split across pages"
+
+
+# --- Regression: "Error: [object Object]" ---------------------------------
+
+def _format_error_src():
+    """The formatError function as the browser receives it."""
+    script = _script()
+    start = script.index("function formatError")
+    end = script.index("async function sendMessage")
+    return script[start:end]
+
+
+def test_format_error_renders_a_validation_list():
+    """A FastAPI 422 detail must read as text, not "[object Object]".
+
+    The live chat failed with a validation error and the pane showed
+    "Error: [object Object]", so the server was telling us exactly what was
+    wrong and the UI was destroying the message on the way to the screen.
+    """
+    detail = [{"type": "string_type", "loc": ["body", "conversation_id"],
+               "msg": "Input should be a valid string"}]
+    out = dukpy.evaljs(_format_error_src()
+                       + "formatError(%s, 422)" % json.dumps(detail))
+    assert "conversation_id" in out
+    assert "valid string" in out
+    assert "object Object" not in out
+
+
+def test_format_error_handles_strings_objects_and_nothing():
+    src = _format_error_src()
+    assert dukpy.evaljs(src + "formatError('plain message', 500)") == "plain message"
+    assert "503" in dukpy.evaljs(src + "formatError(null, 503)")
+    assert "boom" in dukpy.evaljs(src + 'formatError({"why": "boom"}, 500)')
+    assert "object Object" not in dukpy.evaljs(src + 'formatError({"why": "boom"}, 500)')

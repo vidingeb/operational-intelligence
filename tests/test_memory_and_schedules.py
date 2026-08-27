@@ -552,3 +552,28 @@ def test_connections_are_closed(tmp_path):
     for conn in opened:
         with pytest.raises(store.sqlite3.ProgrammingError):
             conn.execute("SELECT 1")
+
+
+# --- Regression: "Error: [object Object]" ---------------------------------
+
+def test_chat_accepts_an_explicit_null_conversation_id(chat_client):
+    """The exact body the web UI proxy sends must be accepted.
+
+    The proxy always includes conversation_id, so a first message sends JSON
+    null. Pydantic does not validate a *default* of None but does validate an
+    explicitly supplied one, so `conversation_id: str = None` returned 422
+    instantly. Every test until now built the model in Python or omitted the
+    key, so the one shape the browser actually sends was never exercised.
+    """
+    client, _seen = chat_client
+    body = {"message": "hello", "model": None, "scope": "all",
+            "conversation_id": None}
+    response = client.post("/chat", json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()["conversation_id"]
+
+
+def test_chat_rejects_a_wrongly_typed_conversation_id(client):
+    """Optional must not become "anything goes"."""
+    response = client.post("/chat", json={"message": "hi", "conversation_id": 12})
+    assert response.status_code == 422

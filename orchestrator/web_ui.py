@@ -687,7 +687,7 @@ HTML_PAGE = """<!DOCTYPE html>
             });
             if (!response.ok) {
                 const err = await response.json();
-                addMessage('Schedule rejected: ' + (err.detail || 'unknown'), 'error');
+                addMessage('Schedule rejected: ' + formatError(err.detail, response.status), 'error');
                 return;
             }
             const created = await response.json();
@@ -697,6 +697,26 @@ HTML_PAGE = """<!DOCTYPE html>
                        'thinking');
             refreshSchedules();
         });
+
+        // FastAPI reports validation failures as a list of objects. String
+        // concatenation turns those into "[object Object]", which is how a
+        // precise, actionable server error became an unreadable one on screen.
+        function formatError(detail, status) {
+            if (typeof detail === 'string' && detail) { return detail; }
+            if (Array.isArray(detail)) {
+                const lines = detail.map(function (item) {
+                    if (typeof item === 'string') { return item; }
+                    const where = Array.isArray(item.loc) ? item.loc.join('.') : '';
+                    const msg = item.msg || JSON.stringify(item);
+                    return where ? where + ': ' + msg : msg;
+                });
+                if (lines.length) { return lines.join('; '); }
+            }
+            if (detail && typeof detail === 'object') {
+                try { return JSON.stringify(detail); } catch (e) { /* fall through */ }
+            }
+            return status ? 'Request failed (HTTP ' + status + ')' : 'Unknown error';
+        }
 
         async function sendMessage() {
             const message = userInput.value.trim();
@@ -731,8 +751,9 @@ HTML_PAGE = """<!DOCTYPE html>
                     addMessage(data.answer, 'assistant', data.model, data);
                     refreshTelemetry();
                 } else {
-                    const err = await response.json();
-                    addMessage('Error: ' + (err.detail || 'Unknown error'), 'error');
+                    let err = {};
+                    try { err = await response.json(); } catch (e) { /* not JSON */ }
+                    addMessage('Error: ' + formatError(err.detail, response.status), 'error');
                 }
             } catch (e) {
                 stopTimer();
@@ -1140,7 +1161,7 @@ HTML_PAGE = """<!DOCTYPE html>
                         body: JSON.stringify({token: action.confirmation_token}),
                     });
                     const d = await r.json();
-                    if (!r.ok) { finish('Failed: ' + (d.detail || r.status), 'bad'); return; }
+                    if (!r.ok) { finish('Failed: ' + formatError(d.detail, r.status), 'bad'); return; }
                     // Report the verified state, not merely that the call returned.
                     const after = d.state_after && (d.state_after.power_state
                         || d.state_after.maintenance_mode);

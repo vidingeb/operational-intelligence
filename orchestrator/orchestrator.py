@@ -1495,9 +1495,13 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
 
 class ChatRequest(BaseModel):
     message: str
-    model: str = None  # Optional model override
+    # These must be Optional, not `str = None`. Pydantic skips validating a
+    # default, but an explicitly sent JSON null is validated against the
+    # annotation and rejected with a 422 — and the UI proxy always sends
+    # conversation_id, null included, on a first message.
+    model: Optional[str] = None  # Optional model override
     scope: str = "all"  # "all", or one of SYSTEMS: vcenter / vcf_ops / vcf_networks
-    conversation_id: str = None  # Continue an existing conversation; None starts one
+    conversation_id: Optional[str] = None  # Continue an existing conversation; None starts one
 
 class ChatResponse(BaseModel):
     answer: str
@@ -1506,7 +1510,7 @@ class ChatResponse(BaseModel):
     tools_called: list = []
     telemetry: dict = {}
     pending_actions: list = []
-    conversation_id: str = None
+    conversation_id: Optional[str] = None
     history_turns: int = 0  # Prior exchanges replayed into this answer
 
 
@@ -1982,7 +1986,7 @@ async def run_schedule_now(schedule_id: str):
 
 
 @app.get("/runs")
-async def get_runs(limit: int = 50, schedule_id: str = None):
+async def get_runs(limit: int = 50, schedule_id: Optional[str] = None):
     return {"runs": store.list_runs(limit=limit, schedule_id=schedule_id)}
 
 
