@@ -23,35 +23,118 @@ import vcf_networks_api as m  # noqa: E402
 
 LIVE_VERSION = {"api_version": "9.0.2.0"}
 
+# Verbatim from the live collector node.
+LIVE_NODE = {
+    "id": "10000:901:4351403602829049222",
+    "entity_type": "Node",
+    "node_type": "PROXY_VM",
+    "node_id": "I2BK8VIZSDKDM4JET8JL47AFW0",
+    "ip_address": "10.0.0.169",
+    "name": "Collector_10.0.0.169",
+    "is_physical_flow_collector": False,
+    "version": "9.0.2.0.25119537",
+    "health": {"health_status": "HEALTHY",
+               "health_details": [{"message": "SUCCEEDED", "code": "0"}]},
+}
+LIVE_NODE_LIST = {"results": [{"id": LIVE_NODE["id"], "entity_type": "Node"}],
+                  "total_count": 1}
+
+
+def _routes(monkeypatch, info=None, listing=None, detail=None):
+    """Route the two-step node lookup: refs first, then each entity by id."""
+    def fake(method, path, **kw):
+        if path == "/api/ni/info/version":
+            return info if info is not None else LIVE_VERSION
+        if path == "/api/ni/infra/nodes":
+            return listing if listing is not None else LIVE_NODE_LIST
+        if path.startswith("/api/ni/infra/nodes/"):
+            if isinstance(detail, Exception):
+                raise detail
+            return detail if detail is not None else LIVE_NODE
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr(m.client, "request", fake)
+
 
 def _patch(monkeypatch, payload):
     monkeypatch.setattr(m.client, "request", lambda method, path, **kw: payload)
 
 
 def test_api_version_is_reported_as_an_api_version(monkeypatch):
-    _patch(monkeypatch, LIVE_VERSION)
+    _routes(monkeypatch)
     out = m.version()
 
     assert out["api_version"] == "9.0.2.0"
-    assert out["fields_returned_by_server"] == ["api_version"]
 
 
-def test_missing_product_version_is_stated_not_faked(monkeypatch):
-    _patch(monkeypatch, LIVE_VERSION)
+def test_node_build_comes_from_the_node_record(monkeypatch):
+    """The build is only reachable by fetching the entity by id."""
+    _routes(monkeypatch)
     out = m.version()
 
-    assert out["product_version"] is None
-    assert "do not present it as the product version" in out["product_version_note"]
-    assert "version" not in out or out.get("version") is None
+    assert out["node_build"] == "9.0.2.0.25119537"
+    assert out["nodes"][0]["name"] == "Collector_10.0.0.169"
+    assert out["nodes"][0]["health_status"] == "HEALTHY"
 
 
-def test_a_real_product_version_would_be_used(monkeypatch):
-    """If a future release starts returning one, report it and drop the note."""
-    _patch(monkeypatch, {"api_version": "9.0.2.0", "version": "6.14.0"})
+def test_collector_build_is_not_called_the_platform_version(monkeypatch):
+    """Live estate returns one PROXY_VM collector and no PLATFORM node.
+
+    Reporting its build as "the Network Insight version" repeats the error
+    this endpoint was just corrected for.
+    """
+    _routes(monkeypatch)
     out = m.version()
 
-    assert out["version"] == "6.14.0"
-    assert "product_version_note" not in out
+    assert out["node_types_reported"] == ["PROXY_VM"]
+    assert "not necessarily the Network Insight platform" in out["platform_version_note"]
+
+
+def test_platform_node_present_means_no_caveat(monkeypatch):
+    platform = dict(LIVE_NODE, node_type="PLATFORM", name="Platform_10.0.0.168")
+    _routes(monkeypatch, detail=platform)
+
+    assert "platform_version_note" not in m.version()
+
+
+def test_differing_node_builds_make_no_single_claim(monkeypatch):
+    listing = {"results": [{"id": "a"}, {"id": "b"}], "total_count": 2}
+    seen = []
+
+    def fake(method, path, **kw):
+        if path == "/api/ni/info/version":
+            return LIVE_VERSION
+        if path == "/api/ni/infra/nodes":
+            return listing
+        seen.append(path)
+        return dict(LIVE_NODE, version=f"9.0.2.0.2511953{len(seen)}")
+
+    monkeypatch.setattr(m.client, "request", fake)
+    out = m.version()
+
+    assert out["node_build"] is None
+    assert "differing builds" in out["node_build_note"]
+
+
+def test_one_node_failing_does_not_lose_the_rest(monkeypatch):
+    _routes(monkeypatch, detail=RuntimeError("node gone"))
+    out = m.version()
+
+    assert out["nodes"][0]["error"].endswith("node gone")
+    assert out["api_version"] == "9.0.2.0", "api_version must survive a node failure"
+
+
+def test_node_listing_failure_is_reported(monkeypatch):
+    def fake(method, path, **kw):
+        if path == "/api/ni/info/version":
+            return LIVE_VERSION
+        raise RuntimeError("nodes unreachable")
+
+    monkeypatch.setattr(m.client, "request", fake)
+    out = m.version()
+
+    assert "nodes unreachable" in out["node_lookup_error"]
+    assert out["api_version"] == "9.0.2.0"
 
 
 def test_health_reads_the_field_that_exists(monkeypatch):
@@ -81,21 +164,13 @@ def test_service_version_is_consistent():
     assert m.root()["version"] == m.SERVICE_VERSION
 
 
-def test_unexpected_shape_is_reported(monkeypatch):
-    _patch(monkeypatch, ["not", "a", "dict"])
-
-    assert m.version()["unexpected_shape"] is True
-
-
 def test_raw_passthrough_reports_shape(monkeypatch):
     """Networks was the only wrapper without one, so every probe against NI
     needed a code change and a restart first."""
-    payload = {"results": [{"id": "10000:901:435", "entity_type": "Node"}],
-               "total_count": 1}
-    _patch(monkeypatch, payload)
+    _patch(monkeypatch, LIVE_NODE_LIST)
 
     out = m.raw(path="/api/ni/infra/nodes")
 
     assert out["path"] == "/api/ni/infra/nodes"
     assert out["top_level_keys"] == ["results", "total_count"]
-    assert out["response"] == payload
+    assert out["response"] == LIVE_NODE_LIST

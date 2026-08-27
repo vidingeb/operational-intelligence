@@ -324,34 +324,71 @@ def list_nsx_t1(
 
 @app.get("/ni/version")
 def version():
-    """Network Insight version information.
+    """Network Insight version information, per node.
 
-    /api/ni/info/version returns only api_version — no product version or
-    build. Verified live: the payload is exactly {"api_version": "9.0.2.0"}.
-    That is reported as an API version rather than dressed up as the product
-    version, because they are not the same thing and an answer that conflates
-    them is wrong even when the number looks right.
+    /api/ni/info/version returns only api_version — no product version. The
+    build number lives on the node records, reached in two steps because the
+    node list returns bare entity references (id and entity_type only).
+
+    Versions are reported per node with the node's type, because the live
+    estate returns a single PROXY_VM collector here rather than the platform
+    appliance. Calling a collector's build "the Network Insight version" is
+    the same mistake as calling the API version the product version.
     """
     data = client.request("GET", "/api/ni/info/version")
-    if not isinstance(data, dict):
-        return {"unexpected_shape": True, "raw": data}
+    api_version = data.get("api_version") if isinstance(data, dict) else None
+
+    nodes = []
+    node_error = None
+    try:
+        listing = client.request("GET", "/api/ni/infra/nodes")
+        refs = listing.get("results", []) if isinstance(listing, dict) else []
+        for ref in refs[:20]:
+            node_id = ref.get("id")
+            if not node_id:
+                continue
+            try:
+                detail = client.request("GET", f"/api/ni/infra/nodes/{node_id}")
+            except Exception as exc:
+                nodes.append({"id": node_id, "error": f"{type(exc).__name__}: {exc}"})
+                continue
+            health = detail.get("health") or {}
+            nodes.append({
+                "name": detail.get("name"),
+                "node_type": detail.get("node_type"),
+                "ip_address": detail.get("ip_address"),
+                "version": detail.get("version"),
+                "health_status": health.get("health_status"),
+            })
+    except Exception as exc:
+        node_error = f"{type(exc).__name__}: {exc}"
+
+    builds = {n.get("version") for n in nodes if n.get("version")}
+    types_seen = sorted({n.get("node_type") for n in nodes if n.get("node_type")})
 
     out = {
         "product": "VMware VCF Operations for Networks (Network Insight)",
-        "api_version": data.get("api_version"),
-        "fields_returned_by_server": sorted(data),
-        "raw": data,
+        "api_version": api_version,
+        "nodes": nodes,
+        "node_types_reported": types_seen,
+        "fields_returned_by_server": sorted(data) if isinstance(data, dict) else None,
+        "raw_info_version": data,
     }
-    # Only if a future release starts returning them.
-    for key, source in (("version", "version"), ("build_number", "build_number")):
-        if data.get(source) is not None:
-            out[key] = data[source]
-    if "version" not in out:
-        out["product_version"] = None
-        out["product_version_note"] = (
-            "Network Insight does not expose a product version or build at "
-            "this endpoint — only the API version. Report api_version as an "
-            "API version; do not present it as the product version."
+    if node_error:
+        out["node_lookup_error"] = node_error
+    if len(builds) == 1:
+        out["node_build"] = builds.pop()
+    elif len(builds) > 1:
+        out["node_build"] = None
+        out["node_build_note"] = f"Nodes report differing builds: {sorted(builds)}"
+
+    if "PLATFORM" not in types_seen:
+        out["platform_version_note"] = (
+            "No PLATFORM node was returned — only "
+            f"{', '.join(types_seen) or 'nothing'}. The build shown is that "
+            "node's, not necessarily the Network Insight platform appliance's. "
+            "Attribute it to the node, and do not present it as the product "
+            "version of the whole deployment."
         )
     return out
 
