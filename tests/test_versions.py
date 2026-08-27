@@ -213,3 +213,12 @@ def test_version_tuple_parsing():
     assert o._version_tuple("9.0.2-internal") is None
     assert o._version_tuple(None) is None
     assert o._version_tuple("") is None
+
+
+def test_nsx_is_described_as_unreadable_not_absent(fake_apis):
+    """The model reported "no NSX integration in this estate" while nsxmgr01-03
+    were visible in the VM list. NSX is present; only our wrapper is missing."""
+    note = run(o.estate_versions())["not_covered"]["NSX"]
+
+    assert "IS deployed" in note
+    assert "never that NSX is absent" in note

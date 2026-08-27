@@ -1150,9 +1150,17 @@ async def estate_versions() -> dict:
                     "VCF Operations for Logs",
                     "VCF Operations for Networks", "Veeam Backup & Replication"],
         "not_covered": {
-            "NSX": "No NSX wrapper is deployed — NSX version cannot be read.",
+            "NSX": (
+                "NSX IS deployed in this estate — nsxmgr01, nsxmgr02 and "
+                "nsxmgr03 are visible as VMs in vCenter — but there is no NSX "
+                "wrapper, so its version cannot be read. Say the version is "
+                "unavailable, never that NSX is absent or not in use."
+            ),
             "VCF Operations": "No version endpoint on the VCF Operations wrapper.",
-            "SDDC Manager": "Not integrated.",
+            "SDDC Manager": (
+                "sddcmgr01 exists in vCenter but is not integrated, so its "
+                "version cannot be read."
+            ),
         },
         "sections_failed": failed,
         **({"version_alignment": alignment} if alignment else {}),
@@ -1162,10 +1170,12 @@ async def estate_versions() -> dict:
             "present this as the complete estate software inventory, and do not "
             "offer to run a query for an uncovered system — there is no tool "
             "for it. If distinct_builds is greater than 1 the hosts are not on "
-            "a uniform build, which is worth calling out. For VM hardware, give "
-            "the distribution rather than listing VMs, and treat being behind "
-            "the newest version as a planning observation, not a fault. Tools "
-            "not running on a powered-off VM is normal and should not be "
+            "a uniform build, which is worth calling out. For VM hardware, use "
+            "hardware_versions.summary for the on-newest count — do not infer "
+            "it from the distribution list, which has been misread as 'most "
+            "VMs are on the newest version' when the opposite was true. Treat "
+            "being behind the newest as a planning observation, not a fault. "
+            "Tools not running on a powered-off VM is normal and should not be "
             "reported as a problem."
         ),
         **data,

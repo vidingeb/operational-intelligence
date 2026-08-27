@@ -146,3 +146,34 @@ def test_limit_truncates_rows_but_not_counts(monkeypatch):
     assert len(out["vms"]) == 3
     assert out["vms_truncated"] is True
     assert out["vm_count"] == 10, "the count must cover every VM, not just returned rows"
+
+
+def test_summary_states_the_on_newest_count_as_a_sentence(monkeypatch):
+    """Live run: 11 of 63 on vmx-22, and the model still said "most VMs are
+    already on the newest hardware version". The counts were in the payload
+    and were not used, so the conclusion is now stated outright."""
+    vms = ([_FakeVM(f"new{i}", "vmx-22") for i in range(11)] +
+           [_FakeVM(f"old{i}", "vmx-13") for i in range(52)])
+    m = _load(vms, monkeypatch)
+
+    hw = m.vm_versions(limit=1)["hardware_versions"]
+    assert hw["on_newest"] == 11
+    assert hw["not_on_newest"] == 52
+    assert hw["summary"] == "11 of 63 VMs are on vmx-22; 52 are on older hardware versions."
+
+
+def test_all_on_newest_summary(monkeypatch):
+    vms = [_FakeVM("a", "vmx-22"), _FakeVM("b", "vmx-22")]
+    m = _load(vms, monkeypatch)
+
+    hw = m.vm_versions(limit=1)["hardware_versions"]
+    assert hw["on_newest"] == 2 and hw["not_on_newest"] == 0
+    assert "2 of 2" in hw["summary"]
+
+
+def test_no_readable_vms_makes_no_claim(monkeypatch):
+    m = _load([], monkeypatch)
+
+    out = m.vm_versions(limit=1)
+    assert out["vm_count"] == 0
+    assert out["hardware_versions"]["summary"] == "No VM hardware versions were readable."

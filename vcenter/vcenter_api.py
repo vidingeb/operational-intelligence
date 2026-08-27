@@ -481,14 +481,25 @@ def vm_versions(limit: int = Query(500, ge=1, le=5000)):
     ordered = sorted(hardware, key=_hw_number, reverse=True)
     newest = ordered[0] if ordered else None
     behind = {hw: hardware[hw]["total"] for hw in ordered[1:]}
+    on_newest = hardware[newest]["total"] if newest else 0
+    total = sum(b["total"] for b in hardware.values())
 
     return {
-        "vm_count": sum(b["total"] for b in hardware.values()),
+        "vm_count": total,
         "inaccessible_vms": inaccessible,
         "hardware_versions": {
             "newest_in_use": newest,
             "distinct_versions": len(hardware),
+            "on_newest": on_newest,
             "not_on_newest": sum(behind.values()),
+            # Stated as a sentence because a model reading the distribution
+            # list reported "most VMs are already on the newest version" when
+            # 52 of 63 were not. The counts were present and were not used.
+            "summary": (
+                f"{on_newest} of {total} VMs are on {newest}; "
+                f"{sum(behind.values())} are on older hardware versions."
+                if newest else "No VM hardware versions were readable."
+            ),
             "by_version": [
                 {"hardware_version": hw,
                  "count": hardware[hw]["total"],
@@ -531,7 +542,7 @@ def vm_versions(limit: int = Query(500, ge=1, le=5000)):
             "normal state for appliances, not a problem to report.",
         ],
         "vms": rows,
-        "vms_truncated": len(rows) < sum(b["total"] for b in hardware.values()),
+        "vms_truncated": len(rows) < total,
     }
 
 
