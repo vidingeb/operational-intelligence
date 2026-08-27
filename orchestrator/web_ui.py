@@ -155,6 +155,35 @@ HTML_PAGE = """<!DOCTYPE html>
             color: #ffcc02;
             font-weight: bold;
         }
+        .gpu-strip {
+            margin-left: auto;
+            display: flex;
+            gap: 14px;
+            align-items: center;
+            font-variant-numeric: tabular-nums;
+        }
+        .gpu-strip .metric { display: flex; gap: 5px; align-items: baseline; }
+        .gpu-strip .metric b { color: #76b900; font-weight: 600; }
+        .gpu-strip .label { opacity: 0.6; font-size: 0.85em; }
+        .gpu-dot {
+            width: 7px; height: 7px; border-radius: 50%;
+            background: #76b900; display: inline-block;
+        }
+        .gpu-dot.busy { animation: pulse 1s ease-in-out infinite; }
+        .gpu-dot.stale { background: #888; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+        .usage-bar {
+            margin-top: 10px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(255,255,255,0.12);
+            font-size: 0.78em;
+            opacity: 0.75;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            font-variant-numeric: tabular-nums;
+        }
+        .usage-bar .tools { opacity: 0.8; font-style: italic; }
     </style>
 </head>
 <body>
@@ -167,6 +196,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <span>LLM: {{LLM_BACKEND}}</span>
         <span>APIs: {{API_BACKEND}}</span>
         <span id="timer"></span>
+        <span id="gpu-strip" class="gpu-strip"></span>
     </div>
     <div id="chat-container">
         <div class="message assistant">Hello! I'm your on-premises VMware infrastructure assistant. I can query vCenter, VCF Operations, and VCF Networks — all running locally with no cloud dependency.
@@ -250,7 +280,8 @@ Try asking me:
 
                 if (response.ok) {
                     const data = await response.json();
-                    addMessage(data.answer, 'assistant', data.model);
+                    addMessage(data.answer, 'assistant', data.model, data);
+                    refreshTelemetry();
                 } else {
                     const err = await response.json();
                     addMessage('Error: ' + (err.detail || 'Unknown error'), 'error');
@@ -265,7 +296,7 @@ Try asking me:
             userInput.focus();
         }
 
-        function addMessage(text, type, model) {
+        function addMessage(text, type, model, data) {
             const div = document.createElement('div');
             div.className = 'message ' + type;
             if (model && type === 'assistant') {
@@ -274,6 +305,8 @@ Try asking me:
                 tag.textContent = model;
                 div.appendChild(tag);
                 div.appendChild(document.createTextNode('\\n' + text));
+                const usage = buildUsageBar(data);
+                if (usage) div.appendChild(usage);
             } else {
                 div.textContent = text;
             }
@@ -281,6 +314,94 @@ Try asking me:
             chatContainer.scrollTop = chatContainer.scrollHeight;
             return div;
         }
+
+        // --- token accounting -------------------------------------------------
+
+        function buildUsageBar(data) {
+            const u = data && data.usage;
+            if (!u || !u.total_tokens) return null;
+
+            const bar = document.createElement('div');
+            bar.className = 'usage-bar';
+
+            const parts = [
+                u.total_tokens.toLocaleString() + ' tokens',
+                u.prompt_tokens.toLocaleString() + ' in / ' +
+                    u.completion_tokens.toLocaleString() + ' out',
+            ];
+            if (u.tokens_per_second) parts.push(u.tokens_per_second + ' tok/s');
+            if (u.rounds > 1) parts.push(u.rounds + ' model rounds');
+            if (u.total_seconds) parts.push(u.total_seconds + 's');
+
+            parts.forEach(t => {
+                const s = document.createElement('span');
+                s.textContent = t;
+                bar.appendChild(s);
+            });
+
+            const calls = (data.tools_called || []);
+            if (calls.length) {
+                const s = document.createElement('span');
+                s.className = 'tools';
+                // Same tool can be called more than once across rounds; show counts.
+                const counts = {};
+                calls.forEach(c => { counts[c] = (counts[c] || 0) + 1; });
+                s.textContent = 'tools: ' + Object.entries(counts)
+                    .map(([n, c]) => c > 1 ? n + '×' + c : n).join(', ');
+                bar.appendChild(s);
+            }
+
+            const gpu = data.telemetry && data.telemetry.gpu;
+            if (gpu && gpu.power_watts != null) {
+                const s = document.createElement('span');
+                s.textContent = gpu.power_watts.toFixed(1) + ' W on ' +
+                    (gpu.name || 'GPU');
+                bar.appendChild(s);
+            }
+            return bar;
+        }
+
+        // --- live inference-host telemetry -----------------------------------
+
+        const gpuStrip = document.getElementById('gpu-strip');
+
+        function metric(label, value, cls) {
+            return '<span class="metric ' + (cls || '') + '">' +
+                   '<b>' + value + '</b><span class="label">' + label + '</span></span>';
+        }
+
+        async function refreshTelemetry() {
+            try {
+                const r = await fetch('/api/telemetry');
+                if (!r.ok) throw new Error('http ' + r.status);
+                const t = await r.json();
+                if (t.enabled === false || t.error || !t.gpu || t.gpu.error) {
+                    gpuStrip.innerHTML = '';
+                    return;
+                }
+                const busy = (t.gpu.utilization_percent || 0) > 20;
+                let html = '<span class="gpu-dot' + (busy ? ' busy' : '') + '"></span>';
+                html += metric('GPU', Math.round(t.gpu.utilization_percent) + '%');
+                html += metric('', t.gpu.power_watts.toFixed(1) + ' W');
+                if (t.gpu.temperature_c != null) {
+                    html += metric('', Math.round(t.gpu.temperature_c) + '°C');
+                }
+                if (t.memory && t.memory.total_gb) {
+                    html += metric('unified',
+                        t.memory.used_gb.toFixed(0) + '/' + t.memory.total_gb.toFixed(0) + ' GB');
+                }
+                const resident = (t.models_resident || []).filter(m => m.resident_gb);
+                if (resident.length) {
+                    html += metric('resident', resident[0].resident_gb.toFixed(0) + ' GB');
+                }
+                gpuStrip.innerHTML = html;
+            } catch (e) {
+                gpuStrip.innerHTML = '';  // telemetry is optional; fail quietly
+            }
+        }
+
+        refreshTelemetry();
+        setInterval(refreshTelemetry, 5000);
     </script>
 </body>
 </html>"""
@@ -317,6 +438,22 @@ async def chat(request: dict):
         )
         response.raise_for_status()
         return response.json()
+
+
+@app.get("/api/telemetry")
+async def telemetry():
+    """Proxy inference-host telemetry for the live GPU strip.
+
+    Short timeout and a soft failure: the strip is decoration, and a slow or
+    absent exporter must never stall the page.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            response = await client.get(f"{ORCHESTRATOR_URL}/telemetry")
+            response.raise_for_status()
+            return response.json()
+    except Exception as exc:
+        return {"enabled": False, "error": str(exc)}
 
 
 if __name__ == "__main__":

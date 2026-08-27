@@ -427,8 +427,74 @@ def summarize_tool_result(data, limit: int = TOOL_RESULT_LIMIT) -> str:
     }, default=str)
 
 
-async def chat_with_tools(user_message: str, model: str = None, conversation: list = None) -> str:
-    """Send a message to Ollama with tool-calling, execute tools, return final answer.
+# Optional inference-host telemetry (GPU utilisation, power, unified memory).
+# Empty disables the feature — the orchestrator runs fine without it.
+GB10_TELEMETRY_URL = os.getenv("GB10_TELEMETRY_URL", "").rstrip("/")
+
+
+async def fetch_telemetry() -> dict:
+    """Best-effort telemetry from the inference host.
+
+    Never raises: this decorates an answer, and a telemetry outage must not
+    turn a successful question into an error.
+    """
+    if not GB10_TELEMETRY_URL:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(f"{GB10_TELEMETRY_URL}/telemetry")
+            response.raise_for_status()
+            return response.json()
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+class Usage:
+    """Accumulates Ollama token counters across the rounds of one question.
+
+    A single question can involve several model calls (decide on tools, read
+    results, decide again, answer). Reporting only the last call would badly
+    understate the work done, so every round is summed.
+
+    Ollama durations are nanoseconds.
+    """
+
+    def __init__(self):
+        self.rounds = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_ns = 0
+        self.eval_ns = 0
+        self.load_ns = 0
+
+    def add(self, payload: dict) -> None:
+        self.rounds += 1
+        self.prompt_tokens += payload.get("prompt_eval_count", 0) or 0
+        self.completion_tokens += payload.get("eval_count", 0) or 0
+        self.total_ns += payload.get("total_duration", 0) or 0
+        self.eval_ns += payload.get("eval_duration", 0) or 0
+        self.load_ns += payload.get("load_duration", 0) or 0
+
+    def as_dict(self) -> dict:
+        eval_s = self.eval_ns / 1e9
+        return {
+            "rounds": self.rounds,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.prompt_tokens + self.completion_tokens,
+            "generation_seconds": round(eval_s, 2),
+            "total_seconds": round(self.total_ns / 1e9, 2),
+            "model_load_seconds": round(self.load_ns / 1e9, 2),
+            # Measured over generation time only, which is the figure that
+            # reflects the hardware rather than API and tool latency.
+            "tokens_per_second": round(self.completion_tokens / eval_s, 1) if eval_s else None,
+        }
+
+
+async def chat_with_tools(user_message: str, model: str = None, conversation: list = None) -> dict:
+    """Send a message to Ollama with tool-calling, execute tools, return the answer.
+
+    Returns {"answer", "usage", "tools_called"}.
 
     Runs an agentic loop: the model may call tools, see the results, and then
     call *more* tools based on what it found. This is what makes cross-system
@@ -440,6 +506,9 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
         conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     conversation.append({"role": "user", "content": user_message})
+
+    usage = Usage()
+    tools_called = []
 
     # Large models need a longer ceiling; OLLAMA_TIMEOUT overrides
     timeout = timeout_for(use_model)
@@ -456,7 +525,9 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
                 body["tools"] = TOOLS
             response = await client.post(f"{OLLAMA_URL}/api/chat", json=body)
             response.raise_for_status()
-            return response.json()["message"]
+            payload = response.json()
+            usage.add(payload)
+            return payload["message"]
 
         for _ in range(MAX_TOOL_ROUNDS):
             assistant_message = await ask(include_tools=True)
@@ -466,8 +537,15 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
             if not tool_calls:
                 content = (assistant_message.get("content") or "").strip()
                 if content:
-                    return content
+                    return {
+                        "answer": content,
+                        "usage": usage.as_dict(),
+                        "tools_called": tools_called,
+                    }
                 break  # empty answer with no tool calls — force a synthesis pass
+
+            names = [tc["function"]["name"] for tc in tool_calls]
+            tools_called.extend(names)
 
             results = await asyncio.gather(*[
                 call_api(tc["function"]["name"], tc["function"].get("arguments", {}))
@@ -493,10 +571,15 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
             ),
         })
         final = await ask(include_tools=False)
-        return (final.get("content") or "").strip() or (
+        answer = (final.get("content") or "").strip() or (
             "The model returned an empty response. Try rephrasing, or use a "
             "model with stronger tool-calling support."
         )
+        return {
+            "answer": answer,
+            "usage": usage.as_dict(),
+            "tools_called": tools_called,
+        }
 
 
 # --- API Endpoints ---
@@ -508,6 +591,9 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     model: str
+    usage: dict = {}
+    tools_called: list = []
+    telemetry: dict = {}
 
 
 @app.get("/config")
@@ -524,6 +610,7 @@ async def config():
         "max_tool_rounds": MAX_TOOL_ROUNDS,
         "tool_count": len(TOOLS),
         "write_tools_enabled": ENABLE_WRITE_TOOLS,
+        "telemetry_url": GB10_TELEMETRY_URL or None,
     }
 
 
@@ -604,12 +691,28 @@ async def chat(request: ChatRequest):
     if use_model not in AVAILABLE_MODELS:
         raise HTTPException(status_code=400, detail=f"Unknown model: {use_model}. Available: {list(AVAILABLE_MODELS.keys())}")
     try:
-        answer = await chat_with_tools(request.message, model=use_model)
-        return ChatResponse(answer=answer, model=use_model)
+        result = await chat_with_tools(request.message, model=use_model)
+        # Telemetry is best-effort decoration; a dead exporter must not fail a
+        # question that was answered successfully.
+        return ChatResponse(
+            answer=result["answer"],
+            model=use_model,
+            usage=result["usage"],
+            tools_called=result["tools_called"],
+            telemetry=await fetch_telemetry(),
+        )
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail=f"Cannot reach Ollama at {OLLAMA_URL} — is it running and reachable?")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/telemetry")
+async def telemetry():
+    """Live inference-host telemetry, for dashboards that poll independently."""
+    if not GB10_TELEMETRY_URL:
+        return {"enabled": False, "reason": "GB10_TELEMETRY_URL is not set"}
+    return {"enabled": True, **await fetch_telemetry()}
 
 
 @app.get("/models")
