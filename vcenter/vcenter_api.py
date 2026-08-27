@@ -138,6 +138,34 @@ def list_hosts():
     return result
 
 
+@app.get("/about")
+def about():
+    """vCenter Server's own version, build and API level.
+
+    Added because the assistant could report ESXi versions from the host
+    inventory but had no way to answer "what version is vCenter", and said so
+    while offering to run a query no tool existed for. The host build numbers
+    say nothing about the vCenter managing them.
+    """
+    content = get_si().RetrieveContent()
+    info = content.about
+    return {
+        "product": info.fullName,
+        "name": info.name,
+        "vendor": info.vendor,
+        "version": info.version,
+        "build": info.build,
+        "api_type": info.apiType,
+        "api_version": info.apiVersion,
+        "os_type": info.osType,
+        "license_product_name": info.licenseProductName,
+        "license_product_version": info.licenseProductVersion,
+        "instance_uuid": info.instanceUuid,
+        "note": ("This is the vCenter Server itself. ESXi host versions are "
+                 "separate and can differ from it and from each other."),
+    }
+
+
 @app.get("/vms")
 def list_vms():
     si = get_si()

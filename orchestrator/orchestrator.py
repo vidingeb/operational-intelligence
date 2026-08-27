@@ -107,6 +107,11 @@ def _t(name, method, url, description, params=None, write=False, local=None):
 
 REGISTRY = [
     # --- vCenter: inventory -------------------------------------------------
+    _t("vcenter_about", "GET", f"{VCENTER_BASE}/about",
+       "vCenter Server's own version, build, API version and licence edition. "
+       "Use for 'what version is vCenter' or 'what are we running'. This is the "
+       "vCenter appliance itself, not the ESXi hosts — their versions come from "
+       "vcenter_list_hosts and can differ"),
     _t("vcenter_list_hosts", "GET", f"{VCENTER_BASE}/hosts",
        "List all ESXi hosts with status and resource usage"),
     _t("vcenter_list_vms", "GET", f"{VCENTER_BASE}/vms",
