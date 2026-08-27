@@ -43,6 +43,7 @@ AVAILABLE_MODELS = {
     "llama3.1:70b": {"name": "Llama 3.1 70B", "description": "Slow (~3-5min) — best accuracy"},
     "llama3.2": {"name": "Llama 3.2 3B", "description": "Fastest (~15-30s) — basic queries"},
     "gpt-oss:120b": {"name": "GPT-OSS 120B", "description": "Strongest multi-step tool calling — needs a GB10-class host"},
+    "gpt-oss:20b": {"name": "GPT-OSS 20B", "description": "Same family at ~13 GB — fits a laptop, for portable/offline use"},
 }
 
 # Models big enough to need a long ceiling rather than the default
@@ -668,6 +669,21 @@ async def _probe_api(name: str, base: str) -> dict:
     return info
 
 
+async def _installed_models() -> set[str]:
+    """Model names the configured Ollama host actually has.
+
+    Empty set means we could not ask, which is treated as "don't block".
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{OLLAMA_URL}/api/tags")
+            if resp.status_code == 200:
+                return {m.get("model", "") for m in resp.json().get("models", [])}
+    except Exception:
+        pass
+    return set()
+
+
 @app.get("/health")
 async def health():
     """Report whether inference and the backing APIs are actually reachable.
@@ -704,8 +720,16 @@ async def health():
 async def chat(request: ChatRequest):
     """Ask a question about your VMware infrastructure."""
     use_model = request.model or DEFAULT_MODEL
-    if use_model not in AVAILABLE_MODELS:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {use_model}. Available: {list(AVAILABLE_MODELS.keys())}")
+    # The curated list describes models; it does not decide which exist. Ask the
+    # inference host, so the same code works on the GB10 and on a laptop without
+    # editing a table every time a model is pulled.
+    installed = await _installed_models()
+    if installed and use_model not in installed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {use_model} is not installed on {OLLAMA_URL}. "
+                   f"Installed: {sorted(installed)}",
+        )
     try:
         result = await chat_with_tools(request.message, model=use_model)
         # Telemetry is best-effort decoration; a dead exporter must not fail a
@@ -733,8 +757,14 @@ async def telemetry():
 
 @app.get("/models")
 async def list_models():
-    """List available models."""
-    return AVAILABLE_MODELS
+    """List models, marking which are installed on the configured host."""
+    installed = await _installed_models()
+    out = {k: dict(v) for k, v in AVAILABLE_MODELS.items()}
+    for name in installed:
+        out.setdefault(name, {"name": name, "description": "Installed locally"})
+    for name, meta in out.items():
+        meta["installed"] = (name in installed) if installed else None
+    return out
 
 
 @app.get("/tools")

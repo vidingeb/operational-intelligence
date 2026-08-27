@@ -15,6 +15,15 @@ MODE="${1:-replay}"
 MODEL="${OPS_MODEL:-gpt-oss:20b}"
 OLLAMA="${OLLAMA_URL:-http://localhost:11434}"
 
+VENV="$HERE/.venv"
+if [ ! -x "$VENV/bin/python" ]; then
+    echo "Creating virtualenv"
+    python3 -m venv "$VENV"
+    "$VENV/bin/pip" install -q --upgrade pip
+    "$VENV/bin/pip" install -q -r "$REPO/orchestrator/requirements.txt"
+fi
+PY="$VENV/bin/python"
+
 if ! curl -sf -m 5 "$OLLAMA/api/tags" >/dev/null; then
     echo "Ollama is not responding at $OLLAMA - start it with: ollama serve" >&2
     exit 1
@@ -37,7 +46,7 @@ if [ "$MODE" = "live" ]; then
     echo "Using live APIs at $MCP"
 else
     echo "Replaying fixtures from $HERE/fixtures"
-    python3 "$HERE/replay.py" &
+    "$PY" "$HERE/replay.py" &
     pids+=($!)
     sleep 2
     MCP="http://localhost"
@@ -49,7 +58,7 @@ export DEFAULT_MODEL="$MODEL"
 export ORCHESTRATOR_URL="http://localhost:8090"
 
 echo "Starting orchestrator (model $MODEL)"
-python3 "$REPO/orchestrator/orchestrator.py" &
+"$PY" "$REPO/orchestrator/orchestrator.py" &
 pids+=($!)
 
 for _ in $(seq 1 20); do
@@ -58,7 +67,7 @@ for _ in $(seq 1 20); do
 done
 
 echo "Starting web UI"
-python3 "$REPO/orchestrator/web_ui.py" &
+"$PY" "$REPO/orchestrator/web_ui.py" &
 pids+=($!)
 sleep 2
 
