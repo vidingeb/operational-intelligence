@@ -259,15 +259,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <span id="gpu-strip" class="gpu-strip"></span>
     </div>
     <div id="chat-container">
-        <div class="message assistant">Hello! I'm your on-premises VMware infrastructure assistant. I can query vCenter, VCF Operations, and VCF Networks — all running locally with no cloud dependency.
-
-Try asking me:
-• "What VMs are running?"
-• "Are there any critical alerts?"
-• "Show me host resource usage"
-• "Which datastores are low on space?"
-
-💡 Tip: Use the model selector below — 8B is fast (~30-60s), 70B is smarter but slower (~3-5min).</div>
+        <div class="message assistant">{{WELCOME}}</div>
     </div>
     <div id="input-area">
         <select id="model-select"><option value="">Loading models...</option></select>
@@ -633,6 +625,42 @@ Try asking me:
 </html>"""
 
 
+def build_welcome(cfg: dict) -> str:
+    """Compose the greeting from the orchestrator's actual configuration.
+
+    The previous greeting was written by hand and named three systems and an
+    8B/70B model choice. Logs and Veeam were added, the models changed, and
+    the text kept confidently describing a setup that no longer existed —
+    the first thing anyone reads, and it was wrong.
+    """
+    systems = [s.get("label") for s in cfg.get("systems") or [] if s.get("label")]
+    if systems:
+        named = ", ".join(systems[:-1]) + " and " + systems[-1] if len(systems) > 1 else systems[0]
+        opening = (f"Hello. I'm your on-premises VMware assistant. I can query "
+                   f"{named} — all running locally, with nothing leaving your network.")
+    else:
+        # Orchestrator unreachable: say so rather than inventing a system list.
+        opening = ("Hello. I'm your on-premises VMware assistant. I could not reach "
+                   "the orchestrator, so I cannot say which systems are available "
+                   "yet — try a question and the error will tell you more.")
+
+    lines = [opening, "", "Try asking me:"]
+    lines += ['\u2022 "Is anything wrong in the estate right now?"',
+              '\u2022 "Any errors on the ESXi hosts in the last 24 hours?"',
+              '\u2022 "Which VMs have no recent restore point?"',
+              '\u2022 "Triage vm <name>" for everything known about one VM']
+
+    tools = cfg.get("tool_count")
+    if tools:
+        lines += ["", f"{tools} tools across {len(systems) or 'several'} systems."]
+    if cfg.get("write_tools_enabled"):
+        lines.append("Actions that change state are proposed for your confirmation, "
+                     "never run on their own.")
+    elif cfg:
+        lines.append("Read-only: state-changing actions are currently disabled.")
+    return "\n".join(lines)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     """Render the chat page, labelling the backends actually in use.
@@ -641,7 +669,7 @@ async def index():
     deployment shows the real inference host instead of a stale hardcoded IP.
     Uses /config, not /health, so page load never waits on probe timeouts.
     """
-    llm, apis = "unknown", "unknown"
+    llm, apis, cfg = "unknown", "unknown", {}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             cfg = (await client.get(f"{ORCHESTRATOR_URL}/config")).json()
@@ -650,13 +678,20 @@ async def index():
     except Exception:
         pass  # the page is still usable; the banner just says unknown
 
-    return HTML_PAGE.replace("{{LLM_BACKEND}}", llm).replace("{{API_BACKEND}}", apis)
+    return (HTML_PAGE
+            .replace("{{LLM_BACKEND}}", llm)
+            .replace("{{API_BACKEND}}", apis)
+            .replace("{{WELCOME}}", build_welcome(cfg)))
 
 
 @app.post("/api/chat")
 async def chat(request: dict):
     """Proxy to the orchestrator."""
-    timeout = 600.0 if "70b" in request.get("model", "") else 300.0
+    # Was 600s only when the model name contained "70b", which gave the
+    # largest model the shortest timeout as soon as the naming changed.
+    # Model size is not inferable from its name, so allow the long one always;
+    # a fast model simply returns sooner.
+    timeout = 600.0
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             f"{ORCHESTRATOR_URL}/chat",

@@ -91,3 +91,56 @@ def test_scalar_sections_pass_through():
 def test_section_without_a_known_result_key_is_untouched():
     section = {"cpu_percent": 91, "memory_percent": 78}
     assert o._condense(section) == section
+
+
+# --- build_welcome -----------------------------------------------------------
+#
+# The greeting was hardcoded and named three systems and an 8B/70B model
+# choice long after both had changed. It is the first thing anyone reads.
+
+import web_ui  # noqa: E402
+
+
+def _cfg(**kw):
+    base = {
+        "systems": [{"key": "vcenter", "label": "vCenter", "summary": ""},
+                    {"key": "logs", "label": "Logs", "summary": ""},
+                    {"key": "backup", "label": "Veeam", "summary": ""}],
+        "tool_count": 64,
+        "write_tools_enabled": False,
+    }
+    base.update(kw)
+    return base
+
+
+def test_welcome_names_every_configured_system():
+    text = web_ui.build_welcome(_cfg())
+    for label in ("vCenter", "Logs", "Veeam"):
+        assert label in text
+
+
+def test_welcome_does_not_invent_systems_when_config_is_missing():
+    """An unreachable orchestrator must not produce a confident wrong list."""
+    text = web_ui.build_welcome({})
+    assert "vCenter" not in text
+    assert "could not reach" in text.lower()
+
+
+def test_welcome_states_read_only_when_writes_are_disabled():
+    assert "read-only" in web_ui.build_welcome(_cfg()).lower()
+
+
+def test_welcome_promises_confirmation_when_writes_are_enabled():
+    text = web_ui.build_welcome(_cfg(write_tools_enabled=True))
+    assert "confirmation" in text.lower()
+    assert "read-only" not in text.lower()
+
+
+def test_welcome_reports_the_real_tool_count():
+    assert "64 tools" in web_ui.build_welcome(_cfg())
+
+
+def test_single_system_reads_correctly():
+    text = web_ui.build_welcome(_cfg(systems=[{"label": "vCenter"}]))
+    assert "query vCenter" in text
+    assert " and " not in text.split("Try asking")[0]

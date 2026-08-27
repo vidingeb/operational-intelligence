@@ -1374,6 +1374,11 @@ async def config():
         "tool_count": len(TOOLS),
         "write_tools_enabled": ENABLE_WRITE_TOOLS,
         "telemetry_url": GB10_TELEMETRY_URL or None,
+        # Exposed so the UI describes the systems actually wired up rather
+        # than a list written by hand, which went stale the moment logs and
+        # backup were added.
+        "systems": [{"key": key, "label": spec["label"], "summary": spec["summary"]}
+                    for key, spec in SYSTEMS.items()],
     }
 
 
