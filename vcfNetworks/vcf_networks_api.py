@@ -236,7 +236,10 @@ def health():
         upstream = client.request("GET", "/api/ni/info/version")
         info["status"] = "ok"
         if isinstance(upstream, dict):
-            info["upstream_version"] = upstream.get("version")
+            # This endpoint returns only api_version. Reading "version" here
+            # produced null on every call since it was written — a field that
+            # looks unremarkable next to status: ok.
+            info["upstream_api_version"] = upstream.get("api_version")
     except HTTPException as exc:
         info["status"] = "unavailable"
         info["error"] = exc.detail
@@ -321,19 +324,36 @@ def list_nsx_t1(
 
 @app.get("/ni/version")
 def version():
-    """Network Insight product version, labelled and with the payload intact."""
+    """Network Insight version information.
+
+    /api/ni/info/version returns only api_version — no product version or
+    build. Verified live: the payload is exactly {"api_version": "9.0.2.0"}.
+    That is reported as an API version rather than dressed up as the product
+    version, because they are not the same thing and an answer that conflates
+    them is wrong even when the number looks right.
+    """
     data = client.request("GET", "/api/ni/info/version")
     if not isinstance(data, dict):
         return {"unexpected_shape": True, "raw": data}
-    return {
+
+    out = {
         "product": "VMware VCF Operations for Networks (Network Insight)",
-        **{k: v for k, v in {
-            "version": data.get("version"),
-            "build_number": data.get("build_number") or data.get("buildNumber"),
-        }.items() if v is not None},
+        "api_version": data.get("api_version"),
         "fields_returned_by_server": sorted(data),
         "raw": data,
     }
+    # Only if a future release starts returning them.
+    for key, source in (("version", "version"), ("build_number", "build_number")):
+        if data.get(source) is not None:
+            out[key] = data[source]
+    if "version" not in out:
+        out["product_version"] = None
+        out["product_version_note"] = (
+            "Network Insight does not expose a product version or build at "
+            "this endpoint — only the API version. Report api_version as an "
+            "API version; do not present it as the product version."
+        )
+    return out
 
 
 @app.get("/ni/infra/nodes")
