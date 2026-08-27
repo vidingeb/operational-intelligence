@@ -356,6 +356,24 @@ def version():
     return out
 
 
+@app.get("/ni/raw")
+def raw(path: str = Query(..., description="Path under the NI API, e.g. /api/ni/infra/nodes")):
+    """Passthrough for discovering the real response shape.
+
+    The other two wrappers have had one of these for a while; this one did
+    not, so every probe against Network Insight needed a code change and a
+    service restart first. Network Insight in particular returns bare entity
+    references from its list endpoints — id and entity_type only — so finding
+    out what an entity actually contains means fetching it by id.
+    """
+    data = client.request("GET", path)
+    return {
+        "path": path,
+        "top_level_keys": sorted(data) if isinstance(data, dict) else None,
+        "response": data,
+    }
+
+
 @app.get("/ni/infra/nodes")
 def infra_nodes():
     return client.request("GET", "/api/ni/infra/nodes")

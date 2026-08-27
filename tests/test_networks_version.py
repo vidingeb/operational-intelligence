@@ -85,3 +85,17 @@ def test_unexpected_shape_is_reported(monkeypatch):
     _patch(monkeypatch, ["not", "a", "dict"])
 
     assert m.version()["unexpected_shape"] is True
+
+
+def test_raw_passthrough_reports_shape(monkeypatch):
+    """Networks was the only wrapper without one, so every probe against NI
+    needed a code change and a restart first."""
+    payload = {"results": [{"id": "10000:901:435", "entity_type": "Node"}],
+               "total_count": 1}
+    _patch(monkeypatch, payload)
+
+    out = m.raw(path="/api/ni/infra/nodes")
+
+    assert out["path"] == "/api/ni/infra/nodes"
+    assert out["top_level_keys"] == ["results", "total_count"]
+    assert out["response"] == payload
