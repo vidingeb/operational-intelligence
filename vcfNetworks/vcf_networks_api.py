@@ -519,3 +519,17 @@ def flows_recent(
         f"/api/ni/entities/flows?size={size}"
         f"&start_time={now - max(hours, 1) * 3600}&end_time={now}",
     )
+
+
+@app.get("/ni/flows/detail/{flow_id}")
+def flow_detail(flow_id: str):
+    """A single flow entity, with its real field names.
+
+    Useful for working out what the flow search DSL will accept: the filter
+    fields mirror the entity's own structure, and that structure varies
+    between Network Insight versions.
+    """
+    return client.request(
+        "GET",
+        f"/api/ni/entities/flows/{quote(flow_id, safe='')}",
+    )
