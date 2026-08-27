@@ -3,6 +3,7 @@ import re
 import time
 from typing import Any, Dict, Optional
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
@@ -414,6 +415,91 @@ def vms():
         "GET",
         "/api/ni/entities/vms"
     )
+
+@app.get("/ni/vms/inventory")
+def vms_inventory(
+    limit: int = Query(50, ge=1, le=200, description="Maximum VMs to return"),
+    vlan: Optional[str] = Query(None, description="Only VMs on this L2 network, e.g. vlan-1000"),
+):
+    """List VMs with their IPs and port groups in a single call.
+
+    Listing VMs returns entity references only, so answering "IP and port
+    group per VM" previously meant one detail call per VM. The model ran out
+    of tool rounds after three and presented those three as a sample, which
+    reads like an answer but is not one.
+
+    Fetching the details here turns an unbounded number of round trips into
+    one, so the model gets the whole picture and can report a real total.
+    """
+    listing = client.request("GET", "/api/ni/entities/vms")
+    refs = (listing or {}).get("results") or []
+    total_known = (listing or {}).get("total_count", len(refs))
+
+    def fetch(ref):
+        entity_id = ref.get("entity_id")
+        if not entity_id:
+            return None
+        try:
+            return client.request(
+                "GET", f"/api/ni/entities/vms/{quote(str(entity_id), safe='')}"
+            )
+        except HTTPException:
+            return {"entity_id": entity_id, "error": "could not fetch VM detail"}
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        details = list(pool.map(fetch, refs[:limit]))
+
+    vms_out = []
+    for detail in details:
+        if not detail:
+            continue
+        if detail.get("error"):
+            vms_out.append(detail)
+            continue
+
+        ips = []
+        for entry in detail.get("ip_addresses") or []:
+            if isinstance(entry, dict) and entry.get("ip_address"):
+                ips.append(entry["ip_address"])
+            elif isinstance(entry, str):
+                ips.append(entry)
+
+        networks = []
+        for entry in detail.get("layer2_networks") or []:
+            if isinstance(entry, dict):
+                label = entry.get("entity_name") or entry.get("name")
+                if label:
+                    networks.append(label)
+            elif isinstance(entry, str):
+                networks.append(entry)
+
+        record = {
+            "entity_id": detail.get("entity_id"),
+            "name": detail.get("name") or detail.get("entity_name"),
+            "ip_addresses": ips,
+            "port_groups": networks,
+        }
+        for key, source in (("host", "host"), ("cluster", "cluster"), ("vcenter", "vcenter_manager")):
+            value = detail.get(source)
+            if isinstance(value, dict) and value.get("entity_name"):
+                record[key] = value["entity_name"]
+        if detail.get("power_state"):
+            record["power_state"] = detail["power_state"]
+        vms_out.append(record)
+
+    if vlan:
+        wanted = vlan.strip().lower()
+        vms_out = [v for v in vms_out if any(wanted == n.lower() for n in v.get("port_groups", []))]
+
+    return {
+        "vm_count": len(vms_out),
+        "total_vms_known": total_known,
+        # Say so explicitly: a silently truncated list reads like a full one.
+        "truncated": len(refs) > limit,
+        "filter": {"vlan": vlan} if vlan else None,
+        "vms": vms_out,
+    }
+
 
 @app.get("/ni/vms/{vm_id}")
 def vm_details(vm_id: str):

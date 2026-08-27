@@ -212,10 +212,19 @@ REGISTRY = [
         "entity_type": (Str, False, "Entity type, e.g. VirtualMachine, Host, NSXSegment"),
         "size": (Int, False, "Max results")}),
     _t("networks_vms", "GET", f"{NETWORKS_BASE}/ni/vms",
-       "List VMs from a network perspective"),
+       "List VM entity references only. For IPs or port groups use "
+       "networks_vm_inventory instead — it returns them in one call"),
+    _t("networks_vm_inventory", "GET", f"{NETWORKS_BASE}/ni/vms/inventory",
+       "VMs with their IP addresses and port groups (VLANs) in a single call. "
+       "Use this for any question about which VMs are on which network, or "
+       "IP/port-group per VM. Optionally filter to one VLAN. Reports the total "
+       "VM count and whether the list was truncated",
+       {"limit": (Int, False, "Max VMs to return, default 50, max 200"),
+        "vlan": (Str, False, "Only VMs on this L2 network, e.g. vlan-1000")}),
     _t("networks_vm_details", "GET", f"{NETWORKS_BASE}/ni/vms/{{vm_id}}",
        "Network detail for one VM by entity ID: IPs, segments, attached networks. "
-       "Get the ID from networks_search first",
+       "Get the ID from networks_search first. Do not call this in a loop over "
+       "many VMs — use networks_vm_inventory",
        {"vm_id": (Str, True, "VCF Networks entity ID, e.g. 10000:1:4378167812621755938")}),
     _t("networks_hosts", "GET", f"{NETWORKS_BASE}/ni/hosts",
        "List hosts from a network perspective"),
