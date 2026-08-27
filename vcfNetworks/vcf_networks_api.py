@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from typing import Any, Dict, Optional
 
@@ -40,6 +41,8 @@ class SearchRequest(BaseModel):
 class PathRequest(BaseModel):
     source: str
     destination: str
+    port: Optional[str] = None
+    protocol: Optional[str] = None
 
 
 class NIClient:
@@ -307,14 +310,58 @@ def vcenter_data_sources():
     return client.request("GET", "/api/ni/data-sources/vcenters")
 
 
+def resolve_entity(name: str, entity_type: str = "VirtualMachine") -> Dict[str, Any]:
+    """Resolve a name or IP to a Network Insight entity reference.
+
+    The path API wants {entity_id, entity_type} objects, not names, so a
+    lookup has to happen first. IP addresses are passed through untouched —
+    the API accepts those directly and resolving them would be lossy.
+    """
+    text = name.strip()
+
+    # Already an entity ID, e.g. 10000:1:4378167812621755938
+    if re.fullmatch(r"\d+:\d+:\d+", text):
+        return {"entity_id": text, "entity_type": entity_type}
+
+    # An IP address: the API takes these as-is
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", text):
+        return {"ip": text}
+
+    result = client.request("POST", "/api/ni/search", json={
+        "entity_type": entity_type,
+        "filter": build_search_filter(text),
+        "size": 5,
+    })
+    results = (result or {}).get("results") or []
+    if not results:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No {entity_type} found matching '{name}'",
+        )
+    return {"entity_id": results[0].get("entity_id"), "entity_type": entity_type}
+
+
 @app.post("/ni/path")
 def path_lookup(body: PathRequest):
-    payload = {
-        "source": body.source,
-        "destination": body.destination
-    }
+    """Trace the network path between two entities.
 
-    return client.request("POST", "/api/ni/path", json=payload)
+    The upstream path is /api/ni/infra/path — not /api/ni/path — and it takes
+    structured entity references rather than bare names, so both endpoints are
+    resolved through search first.
+    """
+    payload = {
+        "source": resolve_entity(body.source),
+        "destination": resolve_entity(body.destination),
+    }
+    if body.port:
+        payload["port"] = body.port
+    if body.protocol:
+        payload["protocol"] = body.protocol
+
+    return {
+        "request": payload,
+        "path": client.request("POST", "/api/ni/infra/path", json=payload),
+    }
 
 
 @app.get("/ni/alerts")
@@ -362,18 +409,56 @@ def cluster_details(cluster_id: str):
 
 @app.get("/ni/flows")
 def flows(
-    source: Optional[str] = Query(None, description="Source VM/IP/entity."),
-    destination: Optional[str] = Query(None, description="Destination VM/IP/entity."),
+    source: Optional[str] = Query(None, description="Source VM name or IP."),
+    destination: Optional[str] = Query(None, description="Destination VM name or IP."),
     port: Optional[str] = Query(None, description="Optional destination port."),
     protocol: Optional[str] = Query(None, description="Optional protocol TCP/UDP."),
+    filter: Optional[str] = Query(None, description="Raw Network Insight filter expression, overrides the others."),
     size: int = Query(50, description="Max number of results.")
 ):
-    return {
-        "status": "not_mapped",
-        "message": "Token login and search are mapped. Flow endpoint still needs exact mapping from OpenAPI.",
-        "source": source,
-        "destination": destination,
-        "port": port,
-        "protocol": protocol,
-        "size": size
-    }
+    """Traffic flows, via the Network Insight search DSL.
+
+    Flows are not a REST collection in Network Insight; they are queried
+    through /api/ni/search with entity_type Flow and a filter expression.
+    Field naming in that DSL varies between versions, so `filter` is exposed
+    as an escape hatch: if the generated expression is rejected, the caller
+    can supply one that matches their appliance.
+    """
+    if filter:
+        expression = filter
+    else:
+        clauses = []
+        if source:
+            clauses.append(f"source_vm.name = '{source.replace(chr(39), chr(92) + chr(39))}'")
+        if destination:
+            clauses.append(f"destination_vm.name = '{destination.replace(chr(39), chr(92) + chr(39))}'")
+        if port:
+            clauses.append(f"port = {port}")
+        if protocol:
+            clauses.append(f"protocol = '{protocol.upper()}'")
+        if not clauses:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide at least one of source, destination, port, protocol, or a raw filter.",
+            )
+        expression = " and ".join(clauses)
+
+    payload = {"entity_type": "Flow", "filter": expression, "size": size}
+
+    try:
+        results = client.request("POST", "/api/ni/search", json=payload)
+    except HTTPException as exc:
+        # Surface the query that failed. A bare 400 from the appliance is
+        # impossible to act on without seeing the expression that caused it.
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "message": "Flow search rejected by VCF Networks",
+                "filter_used": expression,
+                "upstream": exc.detail,
+                "hint": "Field names in the flow DSL are version-specific. "
+                        "Retry with an explicit ?filter= expression.",
+            },
+        )
+
+    return {"filter_used": expression, "results": results}

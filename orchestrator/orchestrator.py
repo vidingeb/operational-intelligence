@@ -241,7 +241,17 @@ REGISTRY = [
        "Trace the network path between two entities — shows hops, segments and firewall rules "
        "along the way. Use for connectivity troubleshooting",
        {"source": (Str, True, "Source VM name or IP"),
-        "destination": (Str, True, "Destination VM name or IP")}),
+        "destination": (Str, True, "Destination VM name or IP"),
+        "port": (Str, False, "Destination port"),
+        "protocol": (Str, False, "TCP or UDP")}),
+    _t("networks_flows", "GET", f"{NETWORKS_BASE}/ni/flows",
+       "Traffic flows between VMs — actual observed conversations, bytes and ports. "
+       "Give a source and/or destination VM name",
+       {"source": (Str, False, "Source VM name or IP"),
+        "destination": (Str, False, "Destination VM name or IP"),
+        "port": (Str, False, "Destination port"),
+        "protocol": (Str, False, "TCP or UDP"),
+        "size": (Int, False, "Max results (default 50)")}),
     _t("networks_datasources", "GET", f"{NETWORKS_BASE}/ni/data-sources/vcenters",
        "vCenter data sources registered in VCF Networks — use to confirm collection coverage"),
     _t("networks_nodes", "GET", f"{NETWORKS_BASE}/ni/infra/nodes",
@@ -290,11 +300,9 @@ REGISTRY = [
        {"name": (Str, True, "Host name")}, write=True),
 ]
 
-# NOTE: /ni/flows is deliberately NOT registered. The upstream handler in
-# vcfNetworks/vcf_networks_api.py returns {"status": "not_mapped"} — it echoes
-# the query back without contacting Network Insight. Exposing it as a tool
-# would let the model present a stub as though it were flow data. Wire it once
-# the real Network Insight flow API is mapped.
+# networks_flows and networks_path depend on upstream mappings that vary by
+# Network Insight version. Both return the filter/payload they used alongside
+# the result, so a rejection is diagnosable rather than an opaque 4xx.
 
 # Write tools change production state, so they are opt-in.
 ENABLE_WRITE_TOOLS = os.getenv("ENABLE_WRITE_TOOLS", "false").lower() in ("1", "true", "yes")
