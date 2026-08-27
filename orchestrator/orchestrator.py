@@ -238,19 +238,26 @@ REGISTRY = [
        "List NSX Tier-1 gateways",
        {"query": (Str, False, "Tier-1 name filter"), "size": (Int, False, "Max results")}),
     _t("networks_path", "POST", f"{NETWORKS_BASE}/ni/path",
-       "Trace the network path between two entities — shows hops, segments and firewall rules "
-       "along the way. Use for connectivity troubleshooting",
+       "Firewall rules applying between two endpoints. NOTE: this does NOT return a hop-by-hop "
+       "network path — Network Insight has no public topology API. Use for 'what is blocking "
+       "traffic between A and B' questions, not 'what route does it take'",
        {"source": (Str, True, "Source VM name or IP"),
         "destination": (Str, True, "Destination VM name or IP"),
         "port": (Str, False, "Destination port"),
         "protocol": (Str, False, "TCP or UDP")}),
     _t("networks_flows", "GET", f"{NETWORKS_BASE}/ni/flows",
-       "Traffic flows between VMs — actual observed conversations, bytes and ports. "
-       "Give a source and/or destination VM name",
+       "Traffic flows between specific VMs — actual observed conversations, bytes and ports. "
+       "Give a source and/or destination VM name or IP",
        {"source": (Str, False, "Source VM name or IP"),
         "destination": (Str, False, "Destination VM name or IP"),
         "port": (Str, False, "Destination port"),
         "protocol": (Str, False, "TCP or UDP"),
+        "hours": (Int, False, "Look-back window in hours (default 24)"),
+        "size": (Int, False, "Max results (default 50)")}),
+    _t("networks_flows_recent", "GET", f"{NETWORKS_BASE}/ni/flows/recent",
+       "Recently observed traffic flows across the estate, unfiltered. Use to check whether flow "
+       "data is being collected, or for a general picture of current traffic",
+       {"hours": (Int, False, "Look-back window in hours (default 1)"),
         "size": (Int, False, "Max results (default 50)")}),
     _t("networks_datasources", "GET", f"{NETWORKS_BASE}/ni/data-sources/vcenters",
        "vCenter data sources registered in VCF Networks — use to confirm collection coverage"),
@@ -300,9 +307,10 @@ REGISTRY = [
        {"name": (Str, True, "Host name")}, write=True),
 ]
 
-# networks_flows and networks_path depend on upstream mappings that vary by
-# Network Insight version. Both return the filter/payload they used alongside
-# the result, so a rejection is diagnosable rather than an opaque 4xx.
+# networks_flows and networks_path are constrained by what Network Insight
+# actually exposes: there is no public topology API, so networks_path returns
+# firewall rules rather than hops. Both echo the filter/payload they used
+# alongside the result, so a rejection is diagnosable rather than an opaque 4xx.
 
 # Write tools change production state, so they are opt-in.
 ENABLE_WRITE_TOOLS = os.getenv("ENABLE_WRITE_TOOLS", "false").lower() in ("1", "true", "yes")
