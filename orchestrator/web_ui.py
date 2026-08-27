@@ -3,7 +3,7 @@ Simple chat web UI for the On-Prem AI Orchestrator.
 Serves a single-page chat interface on port 8091.
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 import os
 import httpx
@@ -115,6 +115,33 @@ HTML_PAGE = """<!DOCTYPE html>
         }
         #model-select:focus, #scope-select:focus { border-color: #4fc3f7; }
         #scope-select { color: #b0bec5; }
+
+        .confirm-box {
+            margin-top: 12px; padding: 12px 14px;
+            border: 1px solid #ffb74d; border-left: 4px solid #ffb74d;
+            border-radius: 6px; background: rgba(255,183,77,0.08);
+        }
+        .confirm-box.irreversible {
+            border-color: #ef5350; border-left-color: #ef5350;
+            background: rgba(239,83,80,0.10);
+        }
+        .confirm-title { font-weight: 600; color: #ffb74d; margin-bottom: 6px; }
+        .confirm-box.irreversible .confirm-title { color: #ef5350; }
+        .confirm-what { font-family: ui-monospace, Menlo, monospace; font-size: 13px; color: #e0e0e0; }
+        .confirm-desc { font-size: 13px; color: #b0bec5; margin-top: 4px; }
+        .confirm-warning { font-size: 13px; color: #ef9a9a; margin-top: 6px; }
+        .confirm-actions { margin-top: 10px; display: flex; gap: 8px; align-items: center; }
+        .confirm-actions button {
+            padding: 6px 14px; border-radius: 5px; border: none;
+            font-size: 13px; cursor: pointer;
+        }
+        .confirm-actions button:disabled { opacity: 0.5; cursor: default; }
+        .confirm-yes { background: #ef5350; color: #fff; }
+        .confirm-no { background: #37474f; color: #cfd8dc; }
+        .confirm-status { font-size: 13px; color: #b0bec5; }
+        .confirm-status.good { color: #81c784; }
+        .confirm-status.bad { color: #ef5350; }
+        .confirm-status.muted { color: #78909c; }
         #user-input {
             flex: 1;
             padding: 0.8rem 1rem;
@@ -302,12 +329,111 @@ Try asking me:
                 div.appendChild(document.createTextNode('\\n' + text));
                 const usage = buildUsageBar(data);
                 if (usage) div.appendChild(usage);
+                (data && data.pending_actions || []).forEach(a => {
+                    div.appendChild(buildConfirmBox(a));
+                });
             } else {
                 div.textContent = text;
             }
             chatContainer.appendChild(div);
             chatContainer.scrollTop = chatContainer.scrollHeight;
             return div;
+        }
+
+        // --- pending write confirmation --------------------------------------
+        //
+        // A proposed change is the only thing in this UI that can alter
+        // production, so it is deliberately not a link in a paragraph: the
+        // affected object and the irreversibility are stated on the button.
+
+        function buildConfirmBox(action) {
+            const box = document.createElement('div');
+            box.className = 'confirm-box' + (action.irreversible ? ' irreversible' : '');
+
+            const title = document.createElement('div');
+            title.className = 'confirm-title';
+            title.textContent = (action.irreversible ? '\\u26a0 Irreversible \\u2014 ' : '')
+                + 'Confirmation required';
+            box.appendChild(title);
+
+            const what = document.createElement('div');
+            const args = Object.entries(action.arguments || {})
+                .map(([k, v]) => k + '=' + v).join(', ');
+            what.textContent = action.tool + (args ? ' (' + args + ')' : '');
+            what.className = 'confirm-what';
+            box.appendChild(what);
+
+            if (action.action) {
+                const desc = document.createElement('div');
+                desc.className = 'confirm-desc';
+                desc.textContent = action.action;
+                box.appendChild(desc);
+            }
+            if (action.warning) {
+                const warn = document.createElement('div');
+                warn.className = 'confirm-warning';
+                warn.textContent = action.warning;
+                box.appendChild(warn);
+            }
+
+            const row = document.createElement('div');
+            row.className = 'confirm-actions';
+            const status = document.createElement('span');
+            status.className = 'confirm-status';
+
+            const run = document.createElement('button');
+            run.textContent = action.irreversible ? 'Confirm anyway' : 'Confirm';
+            run.className = 'confirm-yes';
+            const stop = document.createElement('button');
+            stop.textContent = 'Cancel';
+            stop.className = 'confirm-no';
+
+            function finish(text, cls) {
+                run.remove(); stop.remove();
+                status.textContent = text;
+                status.className = 'confirm-status ' + cls;
+            }
+
+            run.onclick = async () => {
+                run.disabled = stop.disabled = true;
+                status.textContent = 'Executing\\u2026';
+                try {
+                    const r = await fetch('/api/confirm', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({token: action.confirmation_token}),
+                    });
+                    const d = await r.json();
+                    if (!r.ok) { finish('Failed: ' + (d.detail || r.status), 'bad'); return; }
+                    // Report the verified state, not merely that the call returned.
+                    const after = d.state_after && (d.state_after.power_state
+                        || d.state_after.maintenance_mode);
+                    finish(d.status === 'EXECUTED'
+                        ? 'Executed' + (after ? ' \\u2014 now ' + after : '')
+                        : 'Failed: ' + JSON.stringify(d.result),
+                        d.status === 'EXECUTED' ? 'good' : 'bad');
+                } catch (e) {
+                    finish('Failed: ' + e.message, 'bad');
+                }
+            };
+
+            stop.onclick = async () => {
+                run.disabled = stop.disabled = true;
+                try {
+                    await fetch('/api/cancel', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({token: action.confirmation_token}),
+                    });
+                } catch (e) { /* cancelling is best effort */ }
+                finish('Cancelled \\u2014 nothing was changed', 'muted');
+            };
+
+            row.appendChild(run);
+            row.appendChild(stop);
+            row.appendChild(status);
+            box.appendChild(row);
+            return box;
         }
 
         // --- token accounting -------------------------------------------------
@@ -478,6 +604,34 @@ async def chat(request: dict):
             },
         )
         response.raise_for_status()
+        return response.json()
+
+
+@app.post("/api/confirm")
+async def confirm(request: dict):
+    """Execute a proposed write. The only UI route that changes production."""
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        response = await client.post(
+            f"{ORCHESTRATOR_URL}/confirm", json={"token": request.get("token")}
+        )
+        # Surface the orchestrator's refusal verbatim rather than a generic 500,
+        # so an expired token reads as an expired token.
+        if response.status_code >= 400:
+            raise HTTPException(status_code=response.status_code,
+                                detail=response.json().get("detail", response.text))
+        return response.json()
+
+
+@app.post("/api/cancel")
+async def cancel(request: dict):
+    """Discard a proposed write."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            f"{ORCHESTRATOR_URL}/cancel", json={"token": request.get("token")}
+        )
+        if response.status_code >= 400:
+            raise HTTPException(status_code=response.status_code,
+                                detail=response.json().get("detail", response.text))
         return response.json()
 
 

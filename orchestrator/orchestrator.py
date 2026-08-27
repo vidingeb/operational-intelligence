@@ -15,7 +15,10 @@ Environment:
     MCP_SERVER      API host base URL     (default http://10.0.0.140)
     DEFAULT_MODEL   Model to use          (default llama3.1:8b)
     OLLAMA_TIMEOUT  Seconds, overrides the per-model default
-    MAX_TOOL_ROUNDS Agentic tool-calling rounds  (default 5)
+    MAX_TOOL_ROUNDS Agentic tool-calling rounds  (default 8)
+    ENABLE_WRITE_TOOLS      Expose state-changing tools   (default false)
+    WRITE_REQUIRE_CONFIRM   Writes must be confirmed      (default true)
+    AUDIT_LOG               Path for the write audit trail
 """
 
 import os
@@ -23,6 +26,7 @@ import re
 import json
 import urllib.parse
 import time
+import secrets
 import httpx
 import asyncio
 from fastapi import FastAPI, HTTPException
@@ -51,8 +55,10 @@ LARGE_MODEL_HINTS = ("70b", "120b")
 
 # How many times the model may look at tool results and decide to call more.
 # 1 would reduce this to the old single-shot behaviour, which breaks any
-# question whose second lookup depends on the first one's answer.
-MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "5"))
+# question whose second lookup depends on the first one's answer. Diagnosis
+# needs more headroom than a lookup: gather, correlate, then check the thing
+# the correlation pointed at.
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
 
 # Per-tool-result budget fed back to the model, in characters.
 TOOL_RESULT_LIMIT = int(os.getenv("TOOL_RESULT_LIMIT", "12000"))
@@ -85,7 +91,7 @@ NETWORKS_BASE = f"{MCP_SERVER}:8082"
 Str, Int, Bool = "string", "integer", "boolean"
 
 
-def _t(name, method, url, description, params=None, write=False):
+def _t(name, method, url, description, params=None, write=False, local=None):
     return {
         "name": name,
         "method": method,
@@ -93,6 +99,7 @@ def _t(name, method, url, description, params=None, write=False):
         "description": description,
         "params": params or {},
         "write": write,
+        "local": local,
     }
 
 
@@ -326,6 +333,32 @@ REGISTRY = [
     _t("vcenter_host_maintenance_exit", "POST", f"{VCENTER_BASE}/host/maintenance/exit",
        "Take an ESXi host out of maintenance mode",
        {"name": (Str, True, "Host name")}, write=True),
+
+    # --- Triage ------------------------------------------------------------
+    # Composite, cross-system, executed in-process. A senior engineer does not
+    # answer "what is wrong with adc01" with one lookup; they gather state,
+    # alarms, snapshots, storage and traffic and then correlate. Expressed as
+    # single tools because doing it as eight separate calls exhausted the
+    # round budget before any correlation happened.
+    _t("triage_vm", "LOCAL", "local://triage/vm",
+       "START HERE for any question about a VM being slow, broken, degraded, "
+       "unreachable or 'having problems', and before proposing any change to a VM. "
+       "Gathers configuration, power state, VMware Tools, snapshots, storage, "
+       "matching vCenter alarms, VCF Operations alerts and recent network flows "
+       "in one call, across all three systems",
+       {"name": (Str, True, "Exact VM name")}, local="triage_vm"),
+    _t("triage_host", "LOCAL", "local://triage/host",
+       "START HERE for any question about an ESXi host being unhealthy, overloaded "
+       "or degraded, and ALWAYS before putting a host into maintenance mode. "
+       "Gathers host status and utilisation, its cluster, matching alarms, "
+       "VCF Operations alerts and low-free datastores in one call",
+       {"name": (Str, True, "Exact host name")}, local="triage_host"),
+    _t("triage_estate", "LOCAL", "local://triage/estate",
+       "Estate-wide health sweep across all three systems: critical vCenter alarms, "
+       "VCF Operations alerts, network alerts, low-free datastores, old snapshots, "
+       "and VMs with VMware Tools not running. Use for 'how is everything', "
+       "'any problems', morning-check and reporting questions",
+       {}, local="triage_estate"),
 ]
 
 # networks_flows and networks_path are constrained by what Network Insight
@@ -405,41 +438,81 @@ TOOLS_BY_SCOPE = {"all": TOOLS}
 for _key in SYSTEMS:
     TOOLS_BY_SCOPE[_key] = [_schema(t) for t in ACTIVE_TOOLS if t["system"] == _key]
 
-SYSTEM_PROMPT = """You are an on-premises VMware infrastructure assistant. You have access to three API systems:
+ENGINEER_RULES = """
+You are a senior VMware infrastructure engineer, not a search interface. Work
+the way an experienced engineer does.
 
-1. **vCenter API** — manages VMs, hosts, clusters, datastores, snapshots, alarms, and power operations
-2. **VCF Operations API** — monitors health, alerts, recommendations, symptoms, cost analysis, and performance metrics
-3. **VCF Networks API** — provides network topology, traffic flows, NSX segments, security policies, and connectivity
+**Evidence before conclusions**
+- Never guess, and never answer infrastructure questions from general VMware
+  knowledge. Check the APIs. If you did not read it from a tool result, you do
+  not know it.
+- If a tool returns an error, or a result marked "_truncated", or a section
+  containing "error", say so plainly. An unavailable check is not a passed check.
+- Absence of an alarm is not evidence of health; it is evidence that nothing
+  raised an alarm. Say which is which.
+- Quote the specific object names, values and thresholds you based a conclusion
+  on, so the operator can verify you.
 
-When a user asks a question:
-- Use the appropriate tool(s) to gather data before answering
-- Call multiple tools in parallel when the question spans multiple domains
-- You may call tools again after seeing results. If a question requires
-  correlating systems (e.g. find alerts, then look up the VMs or hosts they
-  name), make the first calls, read the output, then make the follow-up calls
-- Tool results are labelled with the tool name that produced them
-- If a result is marked "_truncated", say so rather than implying it is complete
-- Provide concise, actionable summaries
-- If something looks unhealthy, suggest next steps
-- Never guess — always check the APIs first
-- Always finish with a written answer, even if the data was incomplete"""
+**Diagnose, do not lookup**
+- For "X is slow / broken / degraded / having problems", start with triage_vm or
+  triage_host. One call gathers state, alarms, alerts, storage and traffic.
+- Then correlate. A VM problem is usually explained by its host, its datastore,
+  its snapshots or its network, not by the VM record alone. Follow the evidence
+  into a second call when the first one points somewhere.
+- Distinguish symptom from cause. "Datastore 8% free" is a cause; "VM is slow"
+  is a symptom. Report the causal chain, not a list of facts.
+- Rank findings by operational severity. Lead with what will page someone.
+
+**Changing state**
+- Every state-changing tool returns AWAITING_CONFIRMATION and changes nothing.
+  That is expected. Report the proposal and stop.
+- Never tell the operator an action is done, running, or scheduled unless you
+  have seen a result with "executed": true.
+- Before proposing a change, gather evidence justifying it, and say what it will
+  affect. Before maintenance mode, check the cluster can absorb the host's VMs.
+- Prefer the least destructive option that solves the problem: guest shutdown
+  over hard power off, vMotion over downtime. If the operator asks for something
+  destructive, propose it, but state the risk in the same breath.
+- Recommend one clear next action rather than listing every possibility.
+
+**Reporting**
+- Be concise and specific. An operator wants "esx03: 94% memory, 3 VMs
+  ballooning" not a paragraph of narration.
+- Say what you checked, so the boundaries of the answer are visible.
+- Always finish with a written answer, even when the data was incomplete."""
+
+SYSTEM_PROMPT = """You are an on-premises VMware infrastructure assistant with
+direct API access to a live production estate.
+
+Systems available to you:
+
+1. **vCenter** — VMs, hosts, clusters, datastores, snapshots, alarms, tasks,
+   events, and power/migration/maintenance operations
+2. **VCF Operations** — health, alerts, symptoms, recommendations, capacity,
+   cost and performance metrics
+3. **VCF Networks** — traffic flows, VM network placement, NSX segments,
+   firewall rules and connectivity
+4. **Triage tools** — cross-system evidence gathering; prefer these for any
+   question about something being wrong
+
+Tool results are labelled with the tool that produced them. You may call tools
+in parallel, and you may call more tools after reading results — use this to
+correlate across systems.
+""" + ENGINEER_RULES
 
 
-SCOPED_PROMPT = """You are an on-premises VMware infrastructure assistant.
+SCOPED_PROMPT = """You are an on-premises VMware infrastructure assistant with
+direct API access to a live production estate.
 
 For this conversation you are restricted to the **{label}** system only. Your
 tools cover {summary}.
 
-When a user asks a question:
-- Use the appropriate tool(s) to gather data before answering
-- If answering properly needs a system you do not have tools for, say which
-  system is needed and that the assistant is currently scoped to {label}.
-  Do not guess at the answer or describe what the other system would show
-- Tool results are labelled with the tool name that produced them
-- If a result is marked "_truncated", say so rather than implying it is complete
-- Provide concise, actionable summaries
-- Never guess — always check the API first
-- Always finish with a written answer, even if the data was incomplete"""
+If answering properly needs a system you do not have tools for, say which system
+is needed and that the assistant is currently scoped to {label}. Do not guess at
+the answer, and do not describe what the other system would have shown.
+
+Cross-system triage tools are not available in this scope.
+""" + ENGINEER_RULES
 
 
 def prompt_for(scope: str) -> str:
@@ -450,11 +523,175 @@ def prompt_for(scope: str) -> str:
     return SCOPED_PROMPT.format(label=meta["label"], summary=meta["summary"])
 
 
-async def call_api(tool_name: str, arguments: dict) -> dict:
-    """Execute an API call based on the tool name and arguments."""
+# --- Write safety ------------------------------------------------------------
+#
+# The write tools were finished long before anything was safe to run them: an
+# unconfirmed vcenter_vm_poweroff on a misparsed name hard-stops a production
+# VM, and snapshot_remove_all is irreversible. So a write tool call does not
+# execute. It reads the current state, returns a proposal describing what would
+# change, and waits for the operator to confirm the token.
+#
+# Every executed write is appended to an audit log, and the state is re-read
+# afterwards: an API reporting success is not evidence that anything happened.
+
+WRITE_REQUIRE_CONFIRM = os.getenv("WRITE_REQUIRE_CONFIRM", "true").lower() in ("1", "true", "yes")
+AUDIT_LOG = os.getenv("AUDIT_LOG", os.path.join(os.path.dirname(__file__), "audit.log"))
+PENDING_TTL = int(os.getenv("PENDING_TTL", "600"))
+
+# Operations with no undo. Called out separately in the proposal so the
+# operator is told which of these cannot be walked back.
+IRREVERSIBLE = {
+    "vcenter_vm_poweroff": "Pulls virtual power immediately. The guest is not asked to flush "
+                           "anything to disk, so in-flight writes can be lost.",
+    "vcenter_vm_snapshot_remove_all": "Deletes every snapshot. There is no undo and no recovery "
+                                      "point afterwards.",
+    "vcenter_vm_reset": "Equivalent to the reset button. Same data-loss risk as a hard power off.",
+    "vcenter_host_reboot": "Reboots the host. Any VM still running on it goes down with it.",
+    "vcenter_host_shutdown": "Powers the host off. It will need physical or out-of-band access "
+                             "to come back.",
+}
+
+# Read tool used to describe what a write would affect, and to verify the
+# result afterwards. The argument is passed straight through.
+IMPACT_PROBE = {
+    "vcenter_vm_poweron": "vcenter_vm_details",
+    "vcenter_vm_poweroff": "vcenter_vm_details",
+    "vcenter_vm_shutdown_guest": "vcenter_vm_details",
+    "vcenter_vm_reboot_guest": "vcenter_vm_details",
+    "vcenter_vm_suspend": "vcenter_vm_details",
+    "vcenter_vm_reset": "vcenter_vm_details",
+    "vcenter_vm_vmotion": "vcenter_vm_details",
+    "vcenter_vm_storage_vmotion": "vcenter_vm_storage",
+    "vcenter_vm_snapshot_create": "vcenter_vm_snapshots",
+    "vcenter_vm_snapshot_remove_all": "vcenter_vm_snapshots",
+    "vcenter_host_maintenance_enter": "vcenter_host_usage",
+    "vcenter_host_maintenance_exit": "vcenter_host_usage",
+}
+
+PENDING: dict = {}
+
+
+def _audit(event: dict) -> None:
+    """Append one line per write attempt. Best effort — never break the call."""
+    event["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        with open(AUDIT_LOG, "a") as handle:
+            handle.write(json.dumps(event, default=str) + "\n")
+    except OSError as exc:
+        print(f"audit log unwritable ({AUDIT_LOG}): {exc}")
+
+
+def _expire_pending() -> None:
+    cutoff = time.time() - PENDING_TTL
+    for token in [t for t, p in PENDING.items() if p["proposed_at"] < cutoff]:
+        PENDING.pop(token, None)
+
+
+async def _probe_state(tool_name: str, arguments: dict):
+    """Current state of whatever a write is about to change."""
+    probe = IMPACT_PROBE.get(tool_name)
+    if not probe or probe not in TOOL_SPECS:
+        return None
+    name = (arguments or {}).get("name")
+    try:
+        return await call_api(probe, {"name": name} if name else {})
+    except Exception as exc:
+        return {"error": f"could not read current state: {exc}"}
+
+
+async def propose_write(tool_name: str, arguments: dict) -> dict:
+    """Describe a state change and hand back a token instead of doing it."""
+    _expire_pending()
+    spec = TOOL_SPECS[tool_name]
+    state_before = await _probe_state(tool_name, arguments)
+
+    token = secrets.token_urlsafe(6)
+    PENDING[token] = {
+        "tool": tool_name,
+        "arguments": arguments,
+        "proposed_at": time.time(),
+        "state_before": state_before,
+    }
+
+    _audit({"event": "proposed", "token": token, "tool": tool_name, "arguments": arguments})
+
+    return {
+        "status": "AWAITING_CONFIRMATION",
+        "executed": False,
+        "confirmation_token": token,
+        "action": spec["description"].replace("[CHANGES STATE] ", ""),
+        "tool": tool_name,
+        "arguments": arguments,
+        "irreversible": tool_name in IRREVERSIBLE,
+        "warning": IRREVERSIBLE.get(tool_name),
+        "current_state": state_before,
+        "expires_in_seconds": PENDING_TTL,
+        "instruction": (
+            "NOTHING HAS BEEN CHANGED. Tell the operator exactly what this would do, "
+            "name the object it affects, quote anything in current_state that makes it "
+            "risky, and state that it needs confirmation. Do not say the action is done, "
+            "in progress, or scheduled. Do not call this tool again."
+        ),
+    }
+
+
+async def execute_pending(token: str) -> dict:
+    """Run a previously proposed write, then re-read the state it changed."""
+    _expire_pending()
+    pending = PENDING.pop(token, None)
+    if not pending:
+        raise HTTPException(
+            status_code=404,
+            detail="Unknown or expired confirmation token. Ask for the action again.",
+        )
+
+    tool_name, arguments = pending["tool"], pending["arguments"]
+    result = await call_api(tool_name, arguments, confirmed=True)
+    failed = isinstance(result, dict) and result.get("error")
+
+    # An API reporting success is not evidence the state changed, so look.
+    state_after = await _probe_state(tool_name, arguments)
+
+    _audit({
+        "event": "executed",
+        "token": token,
+        "tool": tool_name,
+        "arguments": arguments,
+        "error": result.get("error") if isinstance(result, dict) else None,
+        "state_before": pending["state_before"],
+        "state_after": state_after,
+    })
+
+    return {
+        "status": "FAILED" if failed else "EXECUTED",
+        "executed": not failed,
+        "tool": tool_name,
+        "arguments": arguments,
+        "result": result,
+        "state_before": pending["state_before"],
+        "state_after": state_after,
+    }
+
+
+
+async def call_api(tool_name: str, arguments: dict, confirmed: bool = False) -> dict:
+    """Execute an API call based on the tool name and arguments.
+
+    State-changing tools do not execute here by default. They return a
+    proposal for the operator to confirm — see propose_write.
+    """
     spec = TOOL_SPECS.get(tool_name)
     if not spec:
         return {"error": f"Unknown tool: {tool_name}"}
+
+    if spec.get("local"):
+        handler = LOCAL_HANDLERS.get(spec["local"])
+        if not handler:
+            return {"error": f"{tool_name} has no handler"}
+        return await handler(**(arguments or {}))
+
+    if spec["write"] and WRITE_REQUIRE_CONFIRM and not confirmed:
+        return await propose_write(tool_name, arguments or {})
 
     method, url = spec["method"], spec["url"]
     args = dict(arguments or {})
@@ -482,6 +719,145 @@ async def call_api(tool_name: str, arguments: dict) -> dict:
             return {"error": f"Cannot connect to {url} — is the MCP server running?"}
         except Exception as e:
             return {"error": str(e)}
+
+
+# --- Triage ------------------------------------------------------------------
+#
+# Cross-system evidence gathering. Each of these replaces a sequence a senior
+# engineer would run by hand, and would otherwise cost one tool round each —
+# more rounds than the loop allows, so the correlation never happened.
+#
+# Failures are reported per section rather than aborting: a triage that says
+# "VCF Operations unreachable" is useful, one that returns a single error is not.
+
+def _mentions(blob, needle: str) -> bool:
+    """Does this record refer to the named object anywhere in its fields?"""
+    return needle.lower() in json.dumps(blob, default=str).lower()
+
+
+def _filter_mentions(data, needle: str, keys=("alerts", "alarms", "results", "items")):
+    """Pull the list out of a payload and keep entries naming the object."""
+    if isinstance(data, dict) and data.get("error"):
+        return data
+    rows = data if isinstance(data, list) else None
+    if rows is None and isinstance(data, dict):
+        for key in keys:
+            if isinstance(data.get(key), list):
+                rows = data[key]
+                break
+    if rows is None:
+        return data
+    return [row for row in rows if _mentions(row, needle)]
+
+
+async def _gather(sections: dict) -> dict:
+    """Run named tool calls concurrently, keeping each one's failure local."""
+    names = list(sections)
+    results = await asyncio.gather(
+        *[call_api(tool, args) for tool, args in sections.values()],
+        return_exceptions=True,
+    )
+    out = {}
+    for name, result in zip(names, results):
+        out[name] = {"error": str(result)} if isinstance(result, Exception) else result
+    return out
+
+
+async def triage_vm(name: str) -> dict:
+    """Everything relevant to one VM, from all three systems, in one call."""
+    data = await _gather({
+        "vm": ("vcenter_vm_details", {"name": name}),
+        "snapshots": ("vcenter_vm_snapshots", {"name": name}),
+        "storage": ("vcenter_vm_storage", {"name": name}),
+        "vcenter_alarms": ("vcenter_alarms", {}),
+        "ops_alerts": ("ops_alerts", {"activeOnly": True, "pageSize": 200}),
+        "recent_flows": ("networks_flow_inventory", {"vm": name, "hours": 24, "limit": 200}),
+    })
+
+    data["vcenter_alarms"] = _filter_mentions(data["vcenter_alarms"], name)
+    data["ops_alerts"] = _filter_mentions(data["ops_alerts"], name)
+
+    flows = data.get("recent_flows")
+    if isinstance(flows, dict) and not flows.get("error"):
+        data["recent_flows"] = {
+            "flow_count": flows.get("flow_count"),
+            "traffic_type_breakdown": flows.get("traffic_type_breakdown"),
+            "flows": (flows.get("flows") or [])[:15],
+        }
+
+    return {
+        "triage_target": name,
+        "target_type": "VirtualMachine",
+        "systems_consulted": ["vCenter", "VCF Operations", "VCF Networks"],
+        "guidance": (
+            "Alarms and alerts were matched by name, so an empty list means none "
+            "mentioned this VM, not that the estate is healthy. Any section "
+            "containing 'error' was not collected — say so rather than treating "
+            "it as a clean result."
+        ),
+        **data,
+    }
+
+
+async def triage_host(name: str) -> dict:
+    """Everything relevant to one ESXi host, including what it would displace."""
+    data = await _gather({
+        "hosts": ("vcenter_list_hosts", {}),
+        "host_usage": ("vcenter_host_usage", {}),
+        "clusters": ("vcenter_clusters_summary", {}),
+        "vcenter_alarms": ("vcenter_alarms", {}),
+        "ops_alerts": ("ops_alerts", {"activeOnly": True, "pageSize": 200}),
+        "datastores_low": ("vcenter_datastores_lowfree", {"threshold_percent": 20}),
+        "network_alerts": ("networks_alerts", {}),
+    })
+
+    for section in ("hosts", "host_usage", "vcenter_alarms", "ops_alerts", "network_alerts"):
+        data[section] = _filter_mentions(data[section], name)
+
+    return {
+        "triage_target": name,
+        "target_type": "HostSystem",
+        "systems_consulted": ["vCenter", "VCF Operations", "VCF Networks"],
+        "guidance": (
+            "Before proposing maintenance mode, check cluster capacity in 'clusters': "
+            "the VMs on this host must fit elsewhere. Sections containing 'error' "
+            "were not collected."
+        ),
+        **data,
+    }
+
+
+async def triage_estate() -> dict:
+    """Estate-wide health sweep across all three systems."""
+    data = await _gather({
+        "vcenter_alarms": ("vcenter_alarms", {}),
+        "ops_critical_alerts": ("ops_critical_alerts", {}),
+        "network_alerts": ("networks_alerts", {}),
+        "datastores_low": ("vcenter_datastores_lowfree", {"threshold_percent": 20}),
+        "old_snapshots": ("vcenter_old_snapshots", {}),
+        "vmtools_notrunning": ("vcenter_vmtools_notrunning", {}),
+        "clusters": ("vcenter_clusters_summary", {}),
+        "hosts": ("vcenter_list_hosts", {}),
+    })
+    failed = [k for k, v in data.items() if isinstance(v, dict) and v.get("error")]
+    return {
+        "triage_target": "estate",
+        "systems_consulted": ["vCenter", "VCF Operations", "VCF Networks"],
+        "sections_failed": failed,
+        "guidance": (
+            "Report by severity, naming specific objects. If sections_failed is "
+            "non-empty, say which checks did not run — the estate has not been "
+            "fully checked and must not be described as healthy."
+        ),
+        **data,
+    }
+
+
+LOCAL_HANDLERS = {
+    "triage_vm": triage_vm,
+    "triage_host": triage_host,
+    "triage_estate": triage_estate,
+}
 
 
 def summarize_tool_result(data, limit: int = TOOL_RESULT_LIMIT) -> str:
@@ -616,6 +992,7 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
 
     usage = Usage()
     tools_called = []
+    pending_actions = []
 
     # Large models need a longer ceiling; OLLAMA_TIMEOUT overrides
     timeout = timeout_for(use_model)
@@ -648,6 +1025,7 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
                         "answer": content,
                         "usage": usage.as_dict(),
                         "tools_called": tools_called,
+                        "pending_actions": pending_actions,
                     }
                 break  # empty answer with no tool calls — force a synthesis pass
 
@@ -662,6 +1040,15 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
             # Label each result with its tool name. Without this, parallel calls
             # come back as anonymous blobs the model cannot tell apart.
             for tc, result_data in zip(tool_calls, results):
+                # A proposed write must reach the UI, not just the model: the
+                # operator is the one who has to confirm it.
+                if isinstance(result_data, dict) and result_data.get("confirmation_token"):
+                    pending_actions.append({
+                        k: result_data[k] for k in
+                        ("confirmation_token", "tool", "arguments", "action",
+                         "irreversible", "warning")
+                        if k in result_data
+                    })
                 conversation.append({
                     "role": "tool",
                     "name": tc["function"]["name"],
@@ -686,6 +1073,7 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
             "answer": answer,
             "usage": usage.as_dict(),
             "tools_called": tools_called,
+            "pending_actions": pending_actions,
         }
 
 
@@ -702,6 +1090,67 @@ class ChatResponse(BaseModel):
     usage: dict = {}
     tools_called: list = []
     telemetry: dict = {}
+    pending_actions: list = []
+
+
+class ConfirmRequest(BaseModel):
+    token: str
+
+
+@app.get("/pending")
+async def list_pending():
+    """Write operations proposed but not yet confirmed."""
+    _expire_pending()
+    return {
+        "write_tools_enabled": ENABLE_WRITE_TOOLS,
+        "confirmation_required": WRITE_REQUIRE_CONFIRM,
+        "pending": [
+            {
+                "confirmation_token": token,
+                "tool": item["tool"],
+                "arguments": item["arguments"],
+                "irreversible": item["tool"] in IRREVERSIBLE,
+                "age_seconds": int(time.time() - item["proposed_at"]),
+            }
+            for token, item in PENDING.items()
+        ],
+    }
+
+
+@app.post("/confirm")
+async def confirm_action(request: ConfirmRequest):
+    """Execute a proposed write, then re-read the state to prove it happened."""
+    if not ENABLE_WRITE_TOOLS:
+        raise HTTPException(status_code=403, detail="Write tools are disabled on this server.")
+    return await execute_pending(request.token)
+
+
+@app.post("/cancel")
+async def cancel_action(request: ConfirmRequest):
+    """Discard a proposed write without executing it."""
+    item = PENDING.pop(request.token, None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Unknown or expired confirmation token.")
+    _audit({"event": "cancelled", "token": request.token, "tool": item["tool"],
+            "arguments": item["arguments"]})
+    return {"status": "CANCELLED", "executed": False, "tool": item["tool"]}
+
+
+@app.get("/audit")
+async def read_audit(limit: int = 50):
+    """Recent write activity. The record of what this assistant actually did."""
+    try:
+        with open(AUDIT_LOG) as handle:
+            lines = handle.readlines()[-limit:]
+    except FileNotFoundError:
+        return {"audit_log": AUDIT_LOG, "entries": [], "note": "No writes recorded yet."}
+    entries = []
+    for line in lines:
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return {"audit_log": AUDIT_LOG, "entries": entries}
 
 
 @app.get("/scopes")
@@ -871,6 +1320,7 @@ async def chat(request: ChatRequest):
             model=use_model,
             usage=result["usage"],
             tools_called=result["tools_called"],
+            pending_actions=result.get("pending_actions", []),
             telemetry=await fetch_telemetry(),
         )
     except httpx.ConnectError:
