@@ -19,7 +19,9 @@ Environment:
 """
 
 import os
+import re
 import json
+import urllib.parse
 import time
 import httpx
 import asyncio
@@ -67,286 +69,261 @@ OPS_BASE = f"{MCP_SERVER}:8081"
 NETWORKS_BASE = f"{MCP_SERVER}:8082"
 
 # Tool definitions for Ollama (subset of most useful operations)
-TOOLS = [
-    # --- vCenter tools ---
-    {
-        "type": "function",
-        "function": {
-            "name": "vcenter_list_hosts",
-            "description": "List all ESXi hosts with their status and resource usage",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "vcenter_list_vms",
-            "description": "List all virtual machines with power state and basic info",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "vcenter_search_vms",
-            "description": "Search for virtual machines by name",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "VM name to search for"}
-                },
-                "required": ["name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "vcenter_vm_details",
-            "description": "Get detailed information about a specific VM including CPU, memory, disks, network",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Exact VM name"}
-                },
-                "required": ["name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "vcenter_host_usage",
-            "description": "Show ESXi host resource usage (CPU, memory utilization)",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "vcenter_datastores",
-            "description": "List all datastores with capacity and free space",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "vcenter_alarms",
-            "description": "List active vCenter alarms",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "vcenter_clusters",
-            "description": "List vSphere clusters with summary info",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "vcenter_recent_tasks",
-            "description": "Show recent vCenter tasks",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "Number of tasks (default 20)"}
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "vcenter_powered_off_vms",
-            "description": "List virtual machines that are powered off",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "vcenter_old_snapshots",
-            "description": "List old snapshots that may need cleanup",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "days": {"type": "integer", "description": "Age threshold in days (default 14)"}
-                },
-                "required": []
-            }
-        }
-    },
-    # --- VCF Operations tools ---
-    {
-        "type": "function",
-        "function": {
-            "name": "ops_summary",
-            "description": "Get VCF Operations environment summary (overall health, resource counts)",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ops_alerts",
-            "description": "List active VCF Operations alerts",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "activeOnly": {"type": "boolean", "description": "Only active alerts (default true)"}
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ops_critical_alerts",
-            "description": "List only critical severity alerts from VCF Operations",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ops_top_alerts",
-            "description": "List top active alerts sorted by severity",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "Number of alerts (default 10)"}
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ops_resources_search",
-            "description": "Search VCF Operations resources (VMs, hosts, clusters) by name",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Resource name or partial name"}
-                },
-                "required": ["name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ops_recommendations",
-            "description": "List VCF Operations recommendations for optimization",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ops_symptoms",
-            "description": "List active symptoms detected by VCF Operations",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    # --- VCF Networks tools ---
-    {
-        "type": "function",
-        "function": {
-            "name": "networks_search",
-            "description": "Search VCF Networks (Network Insight) for VMs, switches, routers by name or IP",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Name, IP, or filter expression"},
-                    "entity_type": {"type": "string", "description": "Entity type: VirtualMachine, NSXTLogicalSwitch, NSXTLogicalRouter"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "networks_alerts",
-            "description": "List active network alerts from VCF Networks",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "networks_vms",
-            "description": "List virtual machines from a network perspective (IPs, segments, flows)",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "networks_nsx_segments",
-            "description": "List NSX segments/logical switches",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Segment name filter"}
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "networks_hosts",
-            "description": "List hosts from a network perspective",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "networks_clusters",
-            "description": "List clusters from a network perspective",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
+# --- Tool registry -----------------------------------------------------------
+#
+# One table generates both the Ollama tool schemas and the endpoint map. They
+# were previously maintained by hand as two separate structures, which is how
+# the orchestrator ended up exposing 24 tools against ~85 available endpoints.
+#
+# Fields: (name, method, url_template, description, params, write)
+#   params: {arg: (json_type, required, description)}
+#   url_template may contain {placeholders}, filled from arguments and removed
+#   from the query string / body.
+#   write=True marks a state-changing operation — see ENABLE_WRITE_TOOLS.
+
+Str, Int, Bool = "string", "integer", "boolean"
+
+
+def _t(name, method, url, description, params=None, write=False):
+    return {
+        "name": name,
+        "method": method,
+        "url": url,
+        "description": description,
+        "params": params or {},
+        "write": write,
+    }
+
+
+REGISTRY = [
+    # --- vCenter: inventory -------------------------------------------------
+    _t("vcenter_list_hosts", "GET", f"{VCENTER_BASE}/hosts",
+       "List all ESXi hosts with status and resource usage"),
+    _t("vcenter_list_vms", "GET", f"{VCENTER_BASE}/vms",
+       "List all virtual machines with power state and basic info"),
+    _t("vcenter_search_vms", "GET", f"{VCENTER_BASE}/vms/search",
+       "Search for virtual machines by name",
+       {"name": (Str, True, "VM name or partial name")}),
+    _t("vcenter_vm_details", "GET", f"{VCENTER_BASE}/vm/details",
+       "Detailed info for one VM: CPU, memory, disks, network, host placement",
+       {"name": (Str, True, "Exact VM name")}),
+    _t("vcenter_powered_off_vms", "GET", f"{VCENTER_BASE}/vms/poweredoff",
+       "List virtual machines that are powered off"),
+    _t("vcenter_clusters", "GET", f"{VCENTER_BASE}/clusters",
+       "List vSphere clusters"),
+    _t("vcenter_clusters_summary", "GET", f"{VCENTER_BASE}/clusters/summary",
+       "Cluster summary including DRS/HA posture and aggregate capacity"),
+    _t("vcenter_host_usage", "GET", f"{VCENTER_BASE}/hosts/usage",
+       "ESXi host resource usage (CPU and memory utilization)"),
+
+    # --- vCenter: storage ---------------------------------------------------
+    _t("vcenter_datastores", "GET", f"{VCENTER_BASE}/datastores",
+       "List all datastores with capacity and free space"),
+    _t("vcenter_datastores_lowfree", "GET", f"{VCENTER_BASE}/datastores/lowfree",
+       "Datastores below a free-space threshold — use for capacity risk questions",
+       {"threshold_percent": (Int, False, "Free-space percentage threshold (default 20)")}),
+    _t("vcenter_vm_storage", "GET", f"{VCENTER_BASE}/vm/storage",
+       "Storage detail for one VM: disks, provisioned vs used, datastore placement",
+       {"name": (Str, True, "Exact VM name")}),
+
+    # --- vCenter: snapshots and hygiene -------------------------------------
+    _t("vcenter_old_snapshots", "GET", f"{VCENTER_BASE}/snapshots/old",
+       "Snapshots older than a given age that may need cleanup",
+       {"days": (Int, False, "Minimum age in days (default 14)")}),
+    _t("vcenter_vm_snapshots", "GET", f"{VCENTER_BASE}/vm/snapshots",
+       "Full snapshot tree for one VM",
+       {"name": (Str, True, "Exact VM name")}),
+    _t("vcenter_vmtools_outdated", "GET", f"{VCENTER_BASE}/vmtools/outdated",
+       "VMs whose VMware Tools are outdated"),
+    _t("vcenter_vmtools_notrunning", "GET", f"{VCENTER_BASE}/vmtools/notrunning",
+       "Powered-on VMs where VMware Tools is not running — blocks guest shutdown and backup quiescing"),
+
+    # --- vCenter: events ----------------------------------------------------
+    _t("vcenter_alarms", "GET", f"{VCENTER_BASE}/alarms",
+       "Active vCenter alarms"),
+    _t("vcenter_recent_tasks", "GET", f"{VCENTER_BASE}/tasks/recent",
+       "Recent vCenter tasks — use to see what changed recently",
+       {"limit": (Int, False, "Number of tasks (default 20)")}),
+    _t("vcenter_recent_events", "GET", f"{VCENTER_BASE}/events/recent",
+       "Recent vCenter events — use to investigate what happened around an incident",
+       {"limit": (Int, False, "Number of events (default 20)")}),
+
+    # --- VCF Operations: health --------------------------------------------
+    _t("ops_summary", "GET", f"{OPS_BASE}/ops/summary",
+       "VCF Operations environment summary: overall health, resource and alert counts"),
+    _t("ops_alerts", "GET", f"{OPS_BASE}/ops/alerts",
+       "Active VCF Operations alerts",
+       {"activeOnly": (Bool, False, "Only active alerts (default true)"),
+        "pageSize": (Int, False, "Max results")}),
+    _t("ops_critical_alerts", "GET", f"{OPS_BASE}/ops/critical-alerts",
+       "Critical-severity alerts only"),
+    _t("ops_top_alerts", "GET", f"{OPS_BASE}/ops/top-alerts",
+       "Top active alerts sorted by severity",
+       {"limit": (Int, False, "Number of alerts (default 10)")}),
+    _t("ops_symptoms", "GET", f"{OPS_BASE}/ops/symptoms",
+       "Active symptoms detected by VCF Operations — the evidence underlying alerts"),
+    _t("ops_recommendations", "GET", f"{OPS_BASE}/ops/recommendations",
+       "VCF Operations optimization recommendations"),
+
+    # --- VCF Operations: resources and metrics ------------------------------
+    _t("ops_resources_search", "GET", f"{OPS_BASE}/ops/resources/search",
+       "Search VCF Operations resources (VMs, hosts, clusters) by name. Returns resource IDs "
+       "needed by the ops_resource_* tools",
+       {"name": (Str, True, "Resource name or partial name")}),
+    _t("ops_resource_details", "GET", f"{OPS_BASE}/ops/resource/{{resource_id}}",
+       "Details for one VCF Operations resource by ID",
+       {"resource_id": (Str, True, "Resource ID from ops_resources_search or an alert")}),
+    _t("ops_resource_properties", "GET", f"{OPS_BASE}/ops/resource/{{resource_id}}/properties",
+       "Configuration properties of one resource",
+       {"resource_id": (Str, True, "Resource ID")}),
+    _t("ops_resource_statkeys", "GET", f"{OPS_BASE}/ops/resource/{{resource_id}}/statkeys",
+       "Available metric names for a resource — call before ops_resource_stats to find valid statKey values",
+       {"resource_id": (Str, True, "Resource ID")}),
+    _t("ops_resource_stats", "GET", f"{OPS_BASE}/ops/resource/{{resource_id}}/stats/latest",
+       "Latest metric values for a resource. Use this for actual CPU/memory/latency numbers",
+       {"resource_id": (Str, True, "Resource ID"),
+        "statKey": (Str, False, "Specific metric key; omit for all")}),
+
+    # --- VCF Operations: cost ----------------------------------------------
+    _t("ops_cost_drivers", "GET", f"{OPS_BASE}/ops/cost-drivers",
+       "Cost drivers breakdown — what is generating spend"),
+    _t("ops_cost_summary", "GET", f"{OPS_BASE}/ops/cost-drivers/summary",
+       "Summarized cost drivers"),
+    _t("ops_cost_currency", "GET", f"{OPS_BASE}/ops/cost/currency",
+       "Configured currency for cost figures"),
+    _t("ops_chargeback_reports", "GET", f"{OPS_BASE}/ops/chargeback/reports",
+       "Chargeback reports",
+       {"name": (Str, False, "Filter by report name"),
+        "status": (Str, False, "Filter by status")}),
+
+    # --- VCF Operations: governance ----------------------------------------
+    _t("ops_policies", "GET", f"{OPS_BASE}/ops/policies",
+       "VCF Operations policies — alert thresholds and analysis settings"),
+    _t("ops_reports", "GET", f"{OPS_BASE}/ops/reports",
+       "Generated VCF Operations reports"),
+    _t("ops_supermetrics", "GET", f"{OPS_BASE}/ops/supermetrics",
+       "Configured supermetrics (custom derived metrics)"),
+
+    # --- VCF Networks -------------------------------------------------------
+    _t("networks_search", "GET", f"{NETWORKS_BASE}/ni/search",
+       "Search VCF Networks (Network Insight) for VMs, switches, routers by name or IP",
+       {"query": (Str, True, "Name or IP text"),
+        "entity_type": (Str, False, "Entity type, e.g. VirtualMachine, Host, NSXSegment"),
+        "size": (Int, False, "Max results")}),
+    _t("networks_vms", "GET", f"{NETWORKS_BASE}/ni/vms",
+       "List VMs from a network perspective"),
+    _t("networks_vm_details", "GET", f"{NETWORKS_BASE}/ni/vms/{{vm_id}}",
+       "Network detail for one VM by entity ID: IPs, segments, attached networks. "
+       "Get the ID from networks_search first",
+       {"vm_id": (Str, True, "VCF Networks entity ID, e.g. 10000:1:4378167812621755938")}),
+    _t("networks_hosts", "GET", f"{NETWORKS_BASE}/ni/hosts",
+       "List hosts from a network perspective"),
+    _t("networks_host_details", "GET", f"{NETWORKS_BASE}/ni/hosts/{{host_id}}",
+       "Network detail for one host by entity ID",
+       {"host_id": (Str, True, "VCF Networks host entity ID")}),
+    _t("networks_clusters", "GET", f"{NETWORKS_BASE}/ni/clusters",
+       "List clusters from a network perspective"),
+    _t("networks_cluster_details", "GET", f"{NETWORKS_BASE}/ni/clusters/{{cluster_id}}",
+       "Network detail for one cluster by entity ID",
+       {"cluster_id": (Str, True, "VCF Networks cluster entity ID")}),
+    _t("networks_alerts", "GET", f"{NETWORKS_BASE}/ni/alerts",
+       "Active network alerts (problems) from VCF Networks"),
+    _t("networks_alert_details", "GET", f"{NETWORKS_BASE}/ni/alerts/{{problem_id}}",
+       "Detail for one network alert by problem ID",
+       {"problem_id": (Str, True, "Problem ID from networks_alerts")}),
+    _t("networks_nsx_segments", "GET", f"{NETWORKS_BASE}/ni/entities/nsx-segments",
+       "List NSX segments / logical switches",
+       {"query": (Str, False, "Segment name filter"), "size": (Int, False, "Max results")}),
+    _t("networks_nsx_t1", "GET", f"{NETWORKS_BASE}/ni/entities/nsx-t1",
+       "List NSX Tier-1 gateways",
+       {"query": (Str, False, "Tier-1 name filter"), "size": (Int, False, "Max results")}),
+    _t("networks_path", "POST", f"{NETWORKS_BASE}/ni/path",
+       "Trace the network path between two entities — shows hops, segments and firewall rules "
+       "along the way. Use for connectivity troubleshooting",
+       {"source": (Str, True, "Source VM name or IP"),
+        "destination": (Str, True, "Destination VM name or IP")}),
+    _t("networks_datasources", "GET", f"{NETWORKS_BASE}/ni/data-sources/vcenters",
+       "vCenter data sources registered in VCF Networks — use to confirm collection coverage"),
+    _t("networks_nodes", "GET", f"{NETWORKS_BASE}/ni/infra/nodes",
+       "VCF Networks infrastructure nodes (platform/collector health)"),
+
+    # --- Write operations ---------------------------------------------------
+    # Disabled unless ENABLE_WRITE_TOOLS=true. These change production state.
+    _t("vcenter_vm_poweron", "POST", f"{VCENTER_BASE}/vm/poweron",
+       "Power ON a virtual machine",
+       {"name": (Str, True, "Exact VM name")}, write=True),
+    _t("vcenter_vm_shutdown_guest", "POST", f"{VCENTER_BASE}/vm/shutdown_guest",
+       "Gracefully shut down the guest OS (requires VMware Tools)",
+       {"name": (Str, True, "Exact VM name")}, write=True),
+    _t("vcenter_vm_reboot_guest", "POST", f"{VCENTER_BASE}/vm/reboot_guest",
+       "Gracefully reboot the guest OS (requires VMware Tools)",
+       {"name": (Str, True, "Exact VM name")}, write=True),
+    _t("vcenter_vm_poweroff", "POST", f"{VCENTER_BASE}/vm/poweroff",
+       "Hard power OFF a VM — abrupt, may cause data loss. Prefer shutdown_guest",
+       {"name": (Str, True, "Exact VM name")}, write=True),
+    _t("vcenter_vm_suspend", "POST", f"{VCENTER_BASE}/vm/suspend",
+       "Suspend a virtual machine",
+       {"name": (Str, True, "Exact VM name")}, write=True),
+    _t("vcenter_vm_snapshot_create", "POST", f"{VCENTER_BASE}/vm/snapshot/create",
+       "Create a snapshot of a VM",
+       {"name": (Str, True, "Exact VM name"),
+        "snapshot_name": (Str, True, "Snapshot name"),
+        "description": (Str, False, "Snapshot description"),
+        "memory": (Bool, False, "Include memory state"),
+        "quiesce": (Bool, False, "Quiesce the guest filesystem")}, write=True),
+    _t("vcenter_vm_snapshot_remove_all", "POST", f"{VCENTER_BASE}/vm/snapshot/remove_all",
+       "Delete ALL snapshots for a VM — irreversible",
+       {"name": (Str, True, "Exact VM name")}, write=True),
+    _t("vcenter_vm_vmotion", "POST", f"{VCENTER_BASE}/vm/vmotion",
+       "Migrate a VM to another host (vMotion)",
+       {"name": (Str, True, "Exact VM name"),
+        "target_host": (Str, True, "Destination host name")}, write=True),
+    _t("vcenter_vm_storage_vmotion", "POST", f"{VCENTER_BASE}/vm/storage_vmotion",
+       "Migrate a VM to another datastore (Storage vMotion)",
+       {"name": (Str, True, "Exact VM name"),
+        "target_datastore": (Str, True, "Destination datastore name")}, write=True),
+    _t("vcenter_host_maintenance_enter", "POST", f"{VCENTER_BASE}/host/maintenance/enter",
+       "Put an ESXi host into maintenance mode",
+       {"name": (Str, True, "Host name")}, write=True),
+    _t("vcenter_host_maintenance_exit", "POST", f"{VCENTER_BASE}/host/maintenance/exit",
+       "Take an ESXi host out of maintenance mode",
+       {"name": (Str, True, "Host name")}, write=True),
 ]
 
-# Map tool names to actual API endpoints
-TOOL_ENDPOINTS = {
-    "vcenter_list_hosts": ("GET", f"{VCENTER_BASE}/hosts"),
-    "vcenter_list_vms": ("GET", f"{VCENTER_BASE}/vms"),
-    "vcenter_search_vms": ("GET", f"{VCENTER_BASE}/vms/search"),
-    "vcenter_vm_details": ("GET", f"{VCENTER_BASE}/vm/details"),
-    "vcenter_host_usage": ("GET", f"{VCENTER_BASE}/hosts/usage"),
-    "vcenter_datastores": ("GET", f"{VCENTER_BASE}/datastores"),
-    "vcenter_alarms": ("GET", f"{VCENTER_BASE}/alarms"),
-    "vcenter_clusters": ("GET", f"{VCENTER_BASE}/clusters/summary"),
-    "vcenter_recent_tasks": ("GET", f"{VCENTER_BASE}/tasks/recent"),
-    "vcenter_powered_off_vms": ("GET", f"{VCENTER_BASE}/vms/poweredoff"),
-    "vcenter_old_snapshots": ("GET", f"{VCENTER_BASE}/snapshots/old"),
-    "ops_summary": ("GET", f"{OPS_BASE}/ops/summary"),
-    "ops_alerts": ("GET", f"{OPS_BASE}/ops/alerts"),
-    "ops_critical_alerts": ("GET", f"{OPS_BASE}/ops/critical-alerts"),
-    "ops_top_alerts": ("GET", f"{OPS_BASE}/ops/top-alerts"),
-    "ops_resources_search": ("GET", f"{OPS_BASE}/ops/resources/search"),
-    "ops_recommendations": ("GET", f"{OPS_BASE}/ops/recommendations"),
-    "ops_symptoms": ("GET", f"{OPS_BASE}/ops/symptoms"),
-    "networks_search": ("GET", f"{NETWORKS_BASE}/ni/search"),
-    "networks_alerts": ("GET", f"{NETWORKS_BASE}/ni/alerts"),
-    "networks_vms": ("GET", f"{NETWORKS_BASE}/ni/vms"),
-    "networks_nsx_segments": ("GET", f"{NETWORKS_BASE}/ni/entities/nsx-segments"),
-    "networks_hosts": ("GET", f"{NETWORKS_BASE}/ni/hosts"),
-    "networks_clusters": ("GET", f"{NETWORKS_BASE}/ni/clusters"),
-}
+# NOTE: /ni/flows is deliberately NOT registered. The upstream handler in
+# vcfNetworks/vcf_networks_api.py returns {"status": "not_mapped"} — it echoes
+# the query back without contacting Network Insight. Exposing it as a tool
+# would let the model present a stub as though it were flow data. Wire it once
+# the real Network Insight flow API is mapped.
+
+# Write tools change production state, so they are opt-in.
+ENABLE_WRITE_TOOLS = os.getenv("ENABLE_WRITE_TOOLS", "false").lower() in ("1", "true", "yes")
+
+ACTIVE_TOOLS = [t for t in REGISTRY if ENABLE_WRITE_TOOLS or not t["write"]]
+
+
+def _schema(spec: dict) -> dict:
+    """Build an Ollama function schema from a registry entry."""
+    props, required = {}, []
+    for arg, (jtype, is_required, desc) in spec["params"].items():
+        props[arg] = {"type": jtype, "description": desc}
+        if is_required:
+            required.append(arg)
+    description = spec["description"]
+    if spec["write"]:
+        description = f"[CHANGES STATE] {description}"
+    return {
+        "type": "function",
+        "function": {
+            "name": spec["name"],
+            "description": description,
+            "parameters": {"type": "object", "properties": props, "required": required},
+        },
+    }
+
+
+TOOLS = [_schema(t) for t in ACTIVE_TOOLS]
+TOOL_SPECS = {t["name"]: t for t in ACTIVE_TOOLS}
 
 SYSTEM_PROMPT = """You are an on-premises VMware infrastructure assistant. You have access to three API systems:
 
@@ -370,21 +347,32 @@ When a user asks a question:
 
 async def call_api(tool_name: str, arguments: dict) -> dict:
     """Execute an API call based on the tool name and arguments."""
-    if tool_name not in TOOL_ENDPOINTS:
+    spec = TOOL_SPECS.get(tool_name)
+    if not spec:
         return {"error": f"Unknown tool: {tool_name}"}
 
-    method, url = TOOL_ENDPOINTS[tool_name]
+    method, url = spec["method"], spec["url"]
+    args = dict(arguments or {})
+
+    # Fill {placeholders} from arguments; anything consumed here must not also
+    # be sent as a query parameter or body field.
+    for placeholder in re.findall(r"\{(\w+)\}", url):
+        if placeholder not in args:
+            return {"error": f"{tool_name} requires '{placeholder}'"}
+        url = url.replace(
+            "{" + placeholder + "}", urllib.parse.quote(str(args.pop(placeholder)), safe="")
+        )
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             if method == "GET":
-                response = await client.get(url, params=arguments or None)
+                response = await client.get(url, params=args or None)
             else:
-                response = await client.post(url, json=arguments or None)
+                response = await client.post(url, json=args or None)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            return {"error": f"API returned {e.response.status_code}: {e.response.text}"}
+            return {"error": f"API returned {e.response.status_code}: {e.response.text[:500]}"}
         except httpx.ConnectError:
             return {"error": f"Cannot connect to {url} — is the MCP server running?"}
         except Exception as e:
@@ -535,6 +523,7 @@ async def config():
         "default_model": DEFAULT_MODEL,
         "max_tool_rounds": MAX_TOOL_ROUNDS,
         "tool_count": len(TOOLS),
+        "write_tools_enabled": ENABLE_WRITE_TOOLS,
     }
 
 
@@ -633,8 +622,13 @@ async def list_models():
 async def list_tools():
     """List all available tools the LLM can use."""
     return [
-        {"name": t["function"]["name"], "description": t["function"]["description"]}
-        for t in TOOLS
+        {
+            "name": t["name"],
+            "description": t["description"],
+            "method": t["method"],
+            "write": t["write"],
+        }
+        for t in ACTIVE_TOOLS
     ]
 
 
