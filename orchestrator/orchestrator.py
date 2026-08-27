@@ -654,16 +654,31 @@ async def _probe_ollama() -> dict:
     return info
 
 
-async def _probe_api(name: str, base: str) -> dict:
-    """Check one backing API is answering."""
+async def _probe_api(name: str, base: str, health_path: str) -> dict:
+    """Check one backing API can actually serve data.
+
+    Probing /docs only proved uvicorn was listening: the orchestrator once
+    reported "ok" while every vCenter call returned 500. Ask the API's own
+    health route and carry its verdict through.
+    """
     info = {"name": name, "url": base, "reachable": False}
     started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{base}/docs")
-            info["reachable"] = resp.status_code < 500
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{base}{health_path}")
             info["status_code"] = resp.status_code
             info["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            body = {}
+            try:
+                body = resp.json()
+            except Exception:
+                pass
+            reported = body.get("status") if isinstance(body, dict) else None
+            info["reachable"] = resp.status_code < 500 and reported != "unavailable"
+            if reported:
+                info["backend_status"] = reported
+            if isinstance(body, dict) and body.get("error"):
+                info["error"] = body["error"]
     except Exception as exc:
         info["error"] = f"{type(exc).__name__}: {exc}"
     return info
@@ -693,9 +708,9 @@ async def health():
     """
     ollama, vcenter, ops, networks = await asyncio.gather(
         _probe_ollama(),
-        _probe_api("vcenter", VCENTER_BASE),
-        _probe_api("vcf_ops", OPS_BASE),
-        _probe_api("vcf_networks", NETWORKS_BASE),
+        _probe_api("vcenter", VCENTER_BASE, "/health"),
+        _probe_api("vcf_ops", OPS_BASE, "/ops/health"),
+        _probe_api("vcf_networks", NETWORKS_BASE, "/ni/health"),
     )
 
     apis = [vcenter, ops, networks]

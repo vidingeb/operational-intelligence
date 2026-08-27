@@ -1,9 +1,10 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim
 import ssl
 import os
 import atexit
+import threading
 from datetime import datetime, timezone, timedelta
 
 app = FastAPI(
@@ -13,12 +14,12 @@ app = FastAPI(
     openapi_version="3.0.3"
 )
 
-VCENTER = "vc01.vcf.local"
+VCENTER = os.getenv("VCENTER_HOST", "vc01.vcf.local")
 VC_USER = os.getenv("VCENTER_USER")
 VC_PASS = os.getenv("VCENTER_PASSWORD")
 
 
-def get_si():
+def _connect():
     context = ssl._create_unverified_context()
     si = SmartConnect(
         host=VCENTER,
@@ -26,8 +27,59 @@ def get_si():
         pwd=VC_PASS,
         sslContext=context
     )
-    atexit.register(Disconnect, si)
     return si
+
+
+_si = None
+_si_lock = threading.Lock()
+
+
+def get_si():
+    """Return a live ServiceInstance, reconnecting only when the session died.
+
+    This used to open a new connection per request and register an atexit
+    handler each time. vCenter caps concurrent sessions, so a busy day
+    exhausted them and every endpoint began returning 500 with no clue why.
+
+    CurrentTime() is the cheapest call that proves a session is still valid.
+    """
+    global _si
+    with _si_lock:
+        if _si is not None:
+            try:
+                _si.CurrentTime()
+                return _si
+            except Exception:
+                _si = None  # stale session; fall through and reconnect
+
+        if not VC_USER or not VC_PASS:
+            raise HTTPException(
+                status_code=503,
+                detail="VCENTER_USER/VCENTER_PASSWORD are not set on this host",
+            )
+        try:
+            _si = _connect()
+        except vim.fault.InvalidLogin:
+            raise HTTPException(
+                status_code=502,
+                detail=f"vCenter rejected the credentials for {VC_USER}",
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Cannot reach {VCENTER}: {type(exc).__name__}: {exc}",
+            )
+        return _si
+
+
+@atexit.register
+def _disconnect_si():
+    if _si is not None:
+        try:
+            Disconnect(_si)
+        except Exception:
+            pass
+
 
 
 def get_view(content, vim_type):
@@ -40,10 +92,24 @@ def get_view(content, vim_type):
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "vcenter": VCENTER
-    }
+    """Report whether vCenter is genuinely reachable.
+
+    This previously returned "ok" without contacting vCenter, so every health
+    probe passed while every real endpoint returned 500. Returns 200 either way
+    so a probe can read the detail; check `status`, not the HTTP code.
+    """
+    info = {"vcenter": VCENTER, "user_configured": bool(VC_USER and VC_PASS)}
+    try:
+        si = get_si()
+        info["status"] = "ok"
+        info["server_time"] = si.CurrentTime().isoformat()
+    except HTTPException as exc:
+        info["status"] = "unavailable"
+        info["error"] = exc.detail
+    except Exception as exc:
+        info["status"] = "unavailable"
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
 
 
 @app.get("/hosts")
