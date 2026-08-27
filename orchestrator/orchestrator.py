@@ -351,6 +351,49 @@ def _schema(spec: dict) -> dict:
 TOOLS = [_schema(t) for t in ACTIVE_TOOLS]
 TOOL_SPECS = {t["name"]: t for t in ACTIVE_TOOLS}
 
+# --- Scopes ------------------------------------------------------------------
+#
+# Every tool is offered to the model on every request, and it chooses by
+# matching the question against tool descriptions. With 53 tools that is both
+# ~18k prompt tokens and a lot of near-neighbours to choose between.
+#
+# Restricting to one system makes selection sharper and the answer cheaper, at
+# the cost of questions that span systems. Membership is derived from the URL
+# each tool calls, so a tool cannot end up in the wrong scope by being renamed.
+
+SYSTEMS = {
+    "vcenter": {
+        "label": "vCenter",
+        "base": VCENTER_BASE,
+        "summary": "VMs, hosts, clusters, datastores, snapshots, alarms and power operations",
+    },
+    "vcf_ops": {
+        "label": "VCF Operations",
+        "base": OPS_BASE,
+        "summary": "health, alerts, symptoms, recommendations, capacity, cost and performance metrics",
+    },
+    "vcf_networks": {
+        "label": "VCF Networks",
+        "base": NETWORKS_BASE,
+        "summary": "traffic flows, VM network placement, NSX segments, firewall rules and connectivity",
+    },
+}
+
+
+def _system_for(spec: dict) -> str:
+    for key, meta in SYSTEMS.items():
+        if spec["url"].startswith(meta["base"]):
+            return key
+    return "other"
+
+
+for _spec in ACTIVE_TOOLS:
+    _spec["system"] = _system_for(_spec)
+
+TOOLS_BY_SCOPE = {"all": TOOLS}
+for _key in SYSTEMS:
+    TOOLS_BY_SCOPE[_key] = [_schema(t) for t in ACTIVE_TOOLS if t["system"] == _key]
+
 SYSTEM_PROMPT = """You are an on-premises VMware infrastructure assistant. You have access to three API systems:
 
 1. **vCenter API** — manages VMs, hosts, clusters, datastores, snapshots, alarms, and power operations
@@ -369,6 +412,31 @@ When a user asks a question:
 - If something looks unhealthy, suggest next steps
 - Never guess — always check the APIs first
 - Always finish with a written answer, even if the data was incomplete"""
+
+
+SCOPED_PROMPT = """You are an on-premises VMware infrastructure assistant.
+
+For this conversation you are restricted to the **{label}** system only. Your
+tools cover {summary}.
+
+When a user asks a question:
+- Use the appropriate tool(s) to gather data before answering
+- If answering properly needs a system you do not have tools for, say which
+  system is needed and that the assistant is currently scoped to {label}.
+  Do not guess at the answer or describe what the other system would show
+- Tool results are labelled with the tool name that produced them
+- If a result is marked "_truncated", say so rather than implying it is complete
+- Provide concise, actionable summaries
+- Never guess — always check the API first
+- Always finish with a written answer, even if the data was incomplete"""
+
+
+def prompt_for(scope: str) -> str:
+    """System prompt matching the tools the model will actually be given."""
+    meta = SYSTEMS.get(scope)
+    if not meta:
+        return SYSTEM_PROMPT
+    return SCOPED_PROMPT.format(label=meta["label"], summary=meta["summary"])
 
 
 async def call_api(tool_name: str, arguments: dict) -> dict:
@@ -517,7 +585,8 @@ class Usage:
         }
 
 
-async def chat_with_tools(user_message: str, model: str = None, conversation: list = None) -> dict:
+async def chat_with_tools(user_message: str, model: str = None, conversation: list = None,
+                          scope: str = "all") -> dict:
     """Send a message to Ollama with tool-calling, execute tools, return the answer.
 
     Returns {"answer", "usage", "tools_called"}.
@@ -528,8 +597,9 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
     the second lookup depends on the first one's output.
     """
     use_model = model or DEFAULT_MODEL
+    tools = TOOLS_BY_SCOPE.get(scope, TOOLS)
     if conversation is None:
-        conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
+        conversation = [{"role": "system", "content": prompt_for(scope)}]
 
     conversation.append({"role": "user", "content": user_message})
 
@@ -548,7 +618,7 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
                 "stream": False,
             }
             if include_tools:
-                body["tools"] = TOOLS
+                body["tools"] = tools
             response = await client.post(f"{OLLAMA_URL}/api/chat", json=body)
             response.raise_for_status()
             payload = response.json()
@@ -613,6 +683,7 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
 class ChatRequest(BaseModel):
     message: str
     model: str = None  # Optional model override
+    scope: str = "all"  # "all", or one of SYSTEMS: vcenter / vcf_ops / vcf_networks
 
 class ChatResponse(BaseModel):
     answer: str
@@ -620,6 +691,25 @@ class ChatResponse(BaseModel):
     usage: dict = {}
     tools_called: list = []
     telemetry: dict = {}
+
+
+@app.get("/scopes")
+async def list_scopes():
+    """Tool scopes the UI can offer, with how many tools each covers."""
+    out = [{
+        "id": "all",
+        "label": "All systems",
+        "summary": "every tool; needed for questions that correlate across systems",
+        "tool_count": len(TOOLS),
+    }]
+    for key, meta in SYSTEMS.items():
+        out.append({
+            "id": key,
+            "label": meta["label"],
+            "summary": meta["summary"],
+            "tool_count": len(TOOLS_BY_SCOPE.get(key, [])),
+        })
+    return out
 
 
 @app.get("/config")
@@ -754,8 +844,15 @@ async def chat(request: ChatRequest):
             detail=f"Model {use_model} is not installed on {OLLAMA_URL}. "
                    f"Installed: {sorted(installed)}",
         )
+    # Fall back silently and a typo'd scope quietly gets all 53 tools, which
+    # looks like it worked.
+    if request.scope not in TOOLS_BY_SCOPE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown scope: {request.scope}. Valid: {sorted(TOOLS_BY_SCOPE)}",
+        )
     try:
-        result = await chat_with_tools(request.message, model=use_model)
+        result = await chat_with_tools(request.message, model=use_model, scope=request.scope)
         # Telemetry is best-effort decoration; a dead exporter must not fail a
         # question that was answered successfully.
         return ChatResponse(

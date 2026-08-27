@@ -103,7 +103,7 @@ HTML_PAGE = """<!DOCTYPE html>
             gap: 0.8rem;
             align-items: center;
         }
-        #model-select {
+        #model-select, #scope-select {
             padding: 0.6rem 0.8rem;
             border: 1px solid #0f3460;
             border-radius: 8px;
@@ -113,7 +113,8 @@ HTML_PAGE = """<!DOCTYPE html>
             outline: none;
             cursor: pointer;
         }
-        #model-select:focus { border-color: #4fc3f7; }
+        #model-select:focus, #scope-select:focus { border-color: #4fc3f7; }
+        #scope-select { color: #b0bec5; }
         #user-input {
             flex: 1;
             padding: 0.8rem 1rem;
@@ -210,15 +211,8 @@ Try asking me:
 💡 Tip: Use the model selector below — 8B is fast (~30-60s), 70B is smarter but slower (~3-5min).</div>
     </div>
     <div id="input-area">
-        <select id="model-select">
-            <option value="llama3.1:8b">⚡ 8B (Fast)</option>
-            <option value="hermes3">🎯 Hermes 3 (Tool Expert)</option>
-            <option value="nemotron-3-nano:4b">🟢 Nemotron Nano (NVIDIA)</option>
-            <option value="qwen2.5:7b">🐉 Qwen 2.5 7B (Alibaba)</option>
-            <option value="llama3.1:70b">🧠 70B (Smart)</option>
-            <option value="gpt-oss:120b">🚀 120B (GB10)</option>
-            <option value="llama3.2">🚀 3B (Fastest)</option>
-        </select>
+        <select id="model-select"><option value="">Loading models...</option></select>
+        <select id="scope-select" title="Which systems the assistant may query"></select>
         <input type="text" id="user-input" placeholder="Ask about your VMware infrastructure..." autofocus>
         <button id="send-btn" onclick="sendMessage()">Send</button>
     </div>
@@ -228,6 +222,7 @@ Try asking me:
         const userInput = document.getElementById('user-input');
         const sendBtn = document.getElementById('send-btn');
         const modelSelect = document.getElementById('model-select');
+        const scopeSelect = document.getElementById('scope-select');
         const timerEl = document.getElementById('timer');
         let timerInterval = null;
 
@@ -272,7 +267,7 @@ Try asking me:
                 const response = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message, model }),
+                    body: JSON.stringify({ message, model, scope: scopeSelect.value || 'all' }),
                 });
 
                 stopTimer();
@@ -401,6 +396,48 @@ Try asking me:
         }
 
         refreshTelemetry();
+        // Both dropdowns are filled from the orchestrator rather than hardcoded.
+        // The model list used to live in this file, which is why a model
+        // installed on the host never showed up here.
+        async function loadOptions() {
+            try {
+                const [models, scopes, config] = await Promise.all([
+                    fetch('/api/models').then(r => r.json()),
+                    fetch('/api/scopes').then(r => r.json()),
+                    fetch('/api/config').then(r => r.json()).catch(() => ({}))
+                ]);
+
+                modelSelect.innerHTML = '';
+                const entries = Object.entries(models)
+                    .filter(([, m]) => m.installed !== false);
+                if (!entries.length) {
+                    modelSelect.innerHTML = '<option value="">No models installed</option>';
+                } else {
+                    for (const [id, meta] of entries) {
+                        const opt = document.createElement('option');
+                        opt.value = id;
+                        opt.textContent = meta.name || id;
+                        opt.title = meta.description || '';
+                        if (id === config.default_model) opt.selected = true;
+                        modelSelect.appendChild(opt);
+                    }
+                }
+
+                scopeSelect.innerHTML = '';
+                for (const s of scopes) {
+                    const opt = document.createElement('option');
+                    opt.value = s.id;
+                    opt.textContent = s.label + ' (' + s.tool_count + ')';
+                    opt.title = s.summary;
+                    scopeSelect.appendChild(opt);
+                }
+            } catch (e) {
+                modelSelect.innerHTML = '<option value="">Could not load models</option>';
+                scopeSelect.innerHTML = '<option value="all">All systems</option>';
+            }
+        }
+        loadOptions();
+
         setInterval(refreshTelemetry, 5000);
     </script>
 </body>
@@ -434,10 +471,44 @@ async def chat(request: dict):
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             f"{ORCHESTRATOR_URL}/chat",
-            json={"message": request["message"], "model": request.get("model")},
+            json={
+                "message": request["message"],
+                "model": request.get("model"),
+                "scope": request.get("scope", "all"),
+            },
         )
         response.raise_for_status()
         return response.json()
+
+
+@app.get("/api/models")
+async def models():
+    """Models the inference host actually has, for the model dropdown."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(f"{ORCHESTRATOR_URL}/models")
+        response.raise_for_status()
+        return response.json()
+
+
+@app.get("/api/scopes")
+async def scopes():
+    """Tool scopes, for the system dropdown."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(f"{ORCHESTRATOR_URL}/scopes")
+        response.raise_for_status()
+        return response.json()
+
+
+@app.get("/api/config")
+async def config():
+    """Backend configuration, used to preselect the default model."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{ORCHESTRATOR_URL}/config")
+            response.raise_for_status()
+            return response.json()
+    except Exception:
+        return {}
 
 
 @app.get("/api/telemetry")
