@@ -415,6 +415,19 @@ def vm_versions(limit: int = Query(500, ge=1, le=5000)):
     tools_running = {}
     rows = []
     inaccessible = []
+    no_tools_powered_on = []
+
+    def _tools_version(value):
+        """Clean VMware Tools build numbers.
+
+        A powered-off or unreported guest can return 2147483647 — int32 max,
+        used as "not reported". Passing that through invites an answer stating
+        the tools version is two billion.
+        """
+        text = str(value) if value not in (None, "") else None
+        if text in (None, "0", "2147483647"):
+            return None
+        return text
 
     for vm in view.view:
         config = vm.config
@@ -430,6 +443,10 @@ def vm_versions(limit: int = Query(500, ge=1, le=5000)):
         status = str(getattr(guest, "toolsVersionStatus2", None) or
                      getattr(guest, "toolsVersionStatus", None) or "unknown")
         running = str(getattr(guest, "toolsRunningStatus", None) or "unknown")
+        powered_on = str(vm.runtime.powerState) == "poweredOn"
+
+        if powered_on and not is_template and "NotInstalled" in status:
+            no_tools_powered_on.append(vm.name)
 
         bucket = hardware.setdefault(hw, {"total": 0, "templates": 0, "vms": []})
         bucket["total"] += 1
@@ -447,7 +464,7 @@ def vm_versions(limit: int = Query(500, ge=1, le=5000)):
                 "hardware_version": hw,
                 "template": is_template,
                 "power_state": str(vm.runtime.powerState),
-                "tools_version": getattr(guest, "toolsVersion", None),
+                "tools_version": _tools_version(getattr(guest, "toolsVersion", None)),
                 "tools_version_status": status,
                 "tools_running": running,
                 "guest_os": getattr(guest, "guestFullName", None) or config.guestFullName,
@@ -483,13 +500,35 @@ def vm_versions(limit: int = Query(500, ge=1, le=5000)):
         },
         "tools_version_status": tools_version_status,
         "tools_running_status": tools_running,
+        "powered_on_without_tools": {
+            "count": len(no_tools_powered_on),
+            "vms": sorted(no_tools_powered_on)[:25],
+            "why_it_matters": (
+                "No VMware Tools on a running VM means no guest quiescing, so "
+                "backups of it are crash-consistent at best, and no graceful "
+                "guest shutdown."
+            ),
+        },
+        "status_meanings": {
+            "guestToolsUnmanaged": (
+                "open-vm-tools installed and managed by the guest OS, normal "
+                "for Photon and most Linux appliances. NOT a fault and not an "
+                "upgrade candidate."
+            ),
+            "guestToolsSupportedOld": "Older than the host offers, still supported. Upgrade candidate.",
+            "guestToolsNotInstalled": "No tools present.",
+            "guestToolsCurrent": "Up to date.",
+        },
         "notes": [
             "Hardware versions are compared with the newest version present in "
             "this estate, not with a fixed maximum — being behind the newest is "
             "not automatically a fault.",
-            "toolsVersion is a build number, not a product version.",
+            "toolsVersion is a build number, not a product version. A value of "
+            "2147483647 means 'not reported' and is returned as null.",
             "Powered-off VMs report tools as not running; that is expected and "
             "is not evidence of a problem.",
+            "Read tools_version_status with status_meanings — unmanaged is the "
+            "normal state for appliances, not a problem to report.",
         ],
         "vms": rows,
         "vms_truncated": len(rows) < sum(b["total"] for b in hardware.values()),
