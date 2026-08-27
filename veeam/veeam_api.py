@@ -411,10 +411,20 @@ def version():
         "build_version": data.get("buildVersion"),
         "patch_level": data.get("patchLevel"),
         "database_vendor": data.get("databaseVendor"),
+        "platform": data.get("platform"),
     }
+    # Surfaced rather than left in raw: an unregistered or unpatched backup
+    # server is worth saying out loud when someone asks what is running.
+    patches = data.get("patches")
+    if isinstance(patches, list):
+        known["patches_applied"] = len(patches)
+    registration = data.get("veeamRegistration")
+    if isinstance(registration, dict) and "isRegistered" in registration:
+        known["registered"] = registration["isRegistered"]
+
     return {
         "product": "Veeam Backup & Replication",
-        **{k: v for k, v in known.items() if v is not None},
+        **{k: v for k, v in known.items() if v is not None and v != ""},
         "rest_api_version": _session["api_version"],
         "api_version_confirmed": "version_unconfirmed" not in _session,
         "fields_returned_by_server": sorted(data),

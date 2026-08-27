@@ -350,12 +350,21 @@ def version():
         "release_name": data.get("releaseName"),
         "build": data.get("build") or data.get("buildNumber"),
     }
-    return {
+    out = {
         "product": "VMware VCF Operations for Logs (Aria Operations for Logs)",
         **{k: v for k, v in known.items() if v is not None},
         "fields_returned_by_server": sorted(data),
         "raw": data,
     }
+    # This appliance reports releaseName "Nightly". A pre-GA build collecting
+    # the estate's logs is worth stating, not burying in the version string.
+    release = (known.get("release_name") or "").strip().lower()
+    if release and release not in ("ga", "release", "general availability"):
+        out["build_type_note"] = (
+            f"Release name is '{known['release_name']}', not a GA release. "
+            "Worth noting if these logs are relied on for audit or support."
+        )
+    return out
 
 
 @app.get("/logs/raw")

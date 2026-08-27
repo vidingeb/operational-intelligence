@@ -113,3 +113,44 @@ def test_truncation_is_flagged_when_the_limit_is_hit(monkeypatch):
     result = m._events(hours=1, limit=5)
     assert result["truncated"] is True
     assert result["hint"]
+
+
+# --- Version reporting -------------------------------------------------------
+#
+# The payload below is verbatim from log01. The appliance reports releaseName
+# "Nightly", which the endpoint is expected to call out rather than pass along
+# as an unremarkable string.
+
+LIVE_VERSION = {"releaseName": "Nightly", "version": "9.0.2.0.25137850"}
+
+
+def test_version_parses_the_live_payload(monkeypatch):
+    monkeypatch.setattr(m, "request", lambda method, path, **kw: LIVE_VERSION)
+    out = m.version()
+
+    assert out["version"] == "9.0.2.0.25137850"
+    assert out["release_name"] == "Nightly"
+    assert out["fields_returned_by_server"] == ["releaseName", "version"]
+    assert out["raw"] == LIVE_VERSION
+
+
+def test_nightly_build_is_flagged(monkeypatch):
+    monkeypatch.setattr(m, "request", lambda method, path, **kw: LIVE_VERSION)
+    assert "not a GA release" in m.version()["build_type_note"]
+
+
+def test_ga_release_is_not_flagged(monkeypatch):
+    monkeypatch.setattr(
+        m, "request", lambda method, path, **kw: {"releaseName": "GA", "version": "9.0.2"})
+    assert "build_type_note" not in m.version()
+
+
+def test_absent_build_field_is_omitted_not_null(monkeypatch):
+    """The server sends no build field; reporting build: null invites invention."""
+    monkeypatch.setattr(m, "request", lambda method, path, **kw: LIVE_VERSION)
+    assert "build" not in m.version()
+
+
+def test_unexpected_shape_is_reported(monkeypatch):
+    monkeypatch.setattr(m, "request", lambda method, path, **kw: ["not", "a", "dict"])
+    assert m.version()["unexpected_shape"] is True
