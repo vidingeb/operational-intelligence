@@ -136,25 +136,94 @@ def request(method: str, path: str, **kwargs) -> Any:
 
 # --- Query construction ------------------------------------------------------
 #
-# The v2 API takes constraints as path segments, "field OPERATOR value", joined
-# by "/". Constructing that inline made failures unreadable, so it is built in
-# one place and echoed on every response.
+# The constraint grammar was established against log01 rather than from
+# documentation, because four plausible-looking forms were rejected first:
+#
+#   timestamp>VALUE          -> 400 missing_argument
+#   timestamp/>/VALUE        -> 400 missing_argument (value read as a field)
+#   timestamp>=VALUE         -> 400 missing_argument
+#   timestamp/GT/VALUE       -> 400 missing_argument
+#   timestamp/>VALUE         -> 200
+#
+# So a constraint is "field" / "OPERATORVALUE" — the field is its own path
+# segment, and the operator is glued to the front of the value. Multiple
+# constraints chain with further "/" pairs, which was confirmed rather than
+# assumed: timestamp/>X/text/CONTAINS error returns 200.
+#
+# The operator and value are percent-encoded; the separating "/" is not.
+#
+# Operators are not interchangeable across types. "=" was rejected on every
+# string field tried — text, source, facility and priority all returned
+# invalid_constraints — so string matching is CONTAINS only, and ">" is for
+# the numeric timestamp. This is why priority is matched with CONTAINS below
+# even though equality would express the intent better.
+
+FIELD_TEXT = "text"
+FIELD_HOSTNAME = "hostname"
+FIELD_PRIORITY = "priority"
+
+
+def _segment(field: str, operator: str, value: Any) -> str:
+    return f"{field}/" + requests.utils.quote(f"{operator}{value}", safe="")
+
 
 def _constraints(hours: int, contains: Optional[str] = None,
-                 field: str = "text") -> str:
+                 field: str = FIELD_TEXT,
+                 priority: Optional[str] = None) -> str:
+    """Build the constraint path. Echoed on every response so a wrong query is
+    visible in the answer rather than looking like an absence of logs."""
     start_ms = int((time.time() - max(hours, 1) * 3600) * 1000)
-    parts = [f"timestamp>{start_ms}"]
+    parts = [_segment("timestamp", ">", start_ms)]
     if contains:
-        parts.append(f"{field}/CONTAINS {contains}")
+        parts.append(_segment(field, "CONTAINS ", contains))
+    if priority:
+        parts.append(_segment(FIELD_PRIORITY, "CONTAINS ", priority))
     return "/".join(parts)
 
 
+def _resolve_fields(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten an event's "fields" list into a plain mapping.
+
+    Two shapes appear in the same list, which is the part worth knowing:
+    some fields carry their value in "content" (source, priority, facility),
+    while others are positional and give "startPosition"/"length" as offsets
+    into "text" (hostname, appname, procid). Reading only "content" would
+    silently lose the hostname, which is the field most worth having.
+    """
+    text = event.get("text") or ""
+    resolved: Dict[str, Any] = {}
+    for entry in event.get("fields") or []:
+        name = entry.get("name")
+        if not name:
+            continue
+        if "content" in entry:
+            resolved[name] = entry["content"]
+        elif "startPosition" in entry and "length" in entry:
+            start = entry["startPosition"]
+            resolved[name] = text[start:start + entry["length"]]
+    return resolved
+
+
+def _shape(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Present one event with the fields an engineer actually reads."""
+    fields = _resolve_fields(event)
+    return {
+        "time": event.get("timestampString"),
+        "timestamp": event.get("timestamp"),
+        "host": fields.get("hostname") or fields.get("source"),
+        "app": fields.get("appname"),
+        "priority": fields.get("priority"),
+        "facility": fields.get("facility"),
+        "text": event.get("text"),
+    }
+
+
 def _events(hours: int, limit: int, contains: Optional[str] = None,
-            field: str = "text") -> Dict[str, Any]:
+            field: str = FIELD_TEXT,
+            priority: Optional[str] = None) -> Dict[str, Any]:
     limit = min(max(limit, 1), MAX_LIMIT)
-    constraints = _constraints(hours, contains, field)
-    path = f"/api/v2/events/{requests.utils.quote(constraints, safe='/><=')}"
-    data = request("GET", path, params={"limit": limit})
+    constraints = _constraints(hours, contains, field, priority)
+    data = request("GET", f"/api/v2/events/{constraints}", params={"limit": limit})
 
     events = data.get("events") if isinstance(data, dict) else None
     if events is None:
@@ -174,11 +243,12 @@ def _events(hours: int, limit: int, contains: Optional[str] = None,
         "hours": hours,
         "limit": limit,
         "event_count": len(events),
+        "search_complete": data.get("complete"),
         "truncated": len(events) >= limit,
         "hint": (f"Returned the first {limit} matching events; there may be more. "
                  "Say so rather than presenting this as every occurrence.")
                 if len(events) >= limit else None,
-        "events": events,
+        "events": [_shape(e) for e in events],
     }
 
 
@@ -212,9 +282,26 @@ def search(
 def errors(
     hours: int = Query(1, ge=1, le=168),
     limit: int = Query(100, ge=1, le=MAX_LIMIT),
+    priority: str = Query("err", description="Syslog priority, e.g. err, crit, alert, emerg."),
 ):
-    """Recent error-level log activity."""
-    return _events(hours, limit, "error")
+    """Recent error-level log activity, filtered by syslog priority.
+
+    Filtering on priority rather than searching the text for "error" matters:
+    the priority is what the sending daemon declared, whereas the word "error"
+    appears in plenty of informational messages and is missing from plenty of
+    real failures.
+
+    The value is a syslog priority, so it is "err" and not "error". Matching
+    is CONTAINS rather than equality because log01 rejects "=" on string
+    fields; in practice the priority values are distinct enough that a
+    substring of one does not match another.
+
+    Note this returns only the one priority. It is not "everything bad" —
+    warning, crit and alert are separate values, so ask for them explicitly.
+    """
+    result = _events(hours, limit, priority=priority)
+    result["filtered_by"] = f"priority={priority}"
+    return result
 
 
 @app.get("/logs/for/{name}")
