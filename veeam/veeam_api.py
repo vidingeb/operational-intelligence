@@ -235,10 +235,21 @@ def _age_hours(timestamp: Optional[str]) -> Optional[float]:
 
 
 @app.get("/veeam/health")
-def health():
-    """Authenticate for real, and report the negotiated API version."""
+def health(deep: bool = Query(False, description="Force a fresh login instead of reusing the cached token.")):
+    """Authenticate for real, and report the negotiated API version.
+
+    Reuses the cached token by default and only logs in when it has expired.
+    The UI polls health every 30 seconds per open tab, and forcing a login
+    each time would mean thousands of daily authentications by a backup
+    server administrator account — noise that looks like an attack in an
+    audit log, and a lockout risk if the password is ever rotated.
+
+    An expired or rejected token still re-authenticates here and fails
+    loudly, so "ok" continues to mean a usable session exists rather than
+    merely that the port is open.
+    """
     try:
-        session = authenticate(force=True)
+        session = authenticate(force=deep)
     except HTTPException as exc:
         return {"status": "error", "veeam_url": VEEAM_URL, "detail": exc.detail}
     return {
@@ -250,6 +261,7 @@ def health():
         "version_confirmed": "version_unconfirmed" not in session,
         "version_attempts": session.get("version_unconfirmed"),
         "authenticated": True,
+        "checked": "fresh login" if deep else "cached token",
     }
 
 

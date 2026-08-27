@@ -253,10 +253,21 @@ def _events(hours: int, limit: int, contains: Optional[str] = None,
 
 
 @app.get("/logs/health")
-def health():
-    """Authenticate for real, so 'ok' means the credentials work."""
+def health(deep: bool = Query(False, description="Force a fresh login instead of reusing the cached session.")):
+    """Authenticate for real, so 'ok' means the credentials work.
+
+    By default this reuses the cached session and only logs in when it has
+    expired. That still proves a usable session exists, because an expired or
+    rejected one re-authenticates here and fails loudly.
+
+    It deliberately does not force a login every time. The UI polls health
+    every 30 seconds per open tab, and log01 issues a new 1800-second session
+    per login with no logout, so forcing would leave thousands of sessions
+    accumulating daily. Pass deep=true when you want the credentials
+    themselves re-checked.
+    """
     try:
-        get_token(force=True)
+        get_token(force=deep)
     except HTTPException as exc:
         return {"status": "error", "logs_url": LOGS_URL, "detail": exc.detail}
     return {
@@ -265,6 +276,7 @@ def health():
         "user": LOGS_USER,
         "provider": LOGS_PROVIDER,
         "authenticated": True,
+        "checked": "fresh login" if deep else "cached session",
     }
 
 
