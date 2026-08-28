@@ -151,6 +151,29 @@ def test_prompt_asks_for_tables_and_forbids_pattern_claims():
     assert "Markdown table" in o.ENGINEER_RULES
     assert "follow the same pattern" in o.ENGINEER_RULES, \
         "the model claimed 30 unlisted VMs followed the same pattern"
+    # A later report wrote "(Shows every VM)" above a table that omitted 44 of
+    # them, and said the rest were "omitted for brevity - available in the raw
+    # API output", which the operator cannot see.
+    assert "omitted for brevity" in o.ENGINEER_RULES
+    assert "raw output" in o.ENGINEER_RULES
+
+
+def test_prompt_requires_checking_the_population_behind_a_clean_result():
+    """A pass computed over the wrong population is not a pass.
+
+    Veeam reported "0 objects without restore points" over the 11 objects it
+    knows about, in an estate of 63 VMs. The number is true and the conclusion
+    it invites is false: the finding is the 52 VMs no backup system has heard
+    of. This is the same failure as every hardcoded "ok" in this project - a
+    component reporting success for something it never checked.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "orchestrator"))
+    import orchestrator as o
+
+    rules = o.ENGINEER_RULES
+    assert "population" in rules
+    assert "restore points" in rules
+    assert "Lead with the gap" in rules
 
 
 # --- Executing the real JavaScript -------------------------------------------
