@@ -172,6 +172,22 @@ cmd_status() {
 
 cmd_up() {
   local avail waited
+
+  # The compose file cannot enforce this itself: Compose interpolates the
+  # whole file before filtering by profile, so a ${NGC_API_KEY:?...} guard
+  # there would break the default profile too. Check it here instead, before
+  # a pull that would otherwise fail on auth minutes later.
+  if [ -z "${NGC_API_KEY:-}" ]; then
+    warn "NGC_API_KEY is not set — the pull from nvcr.io will fail."
+    warn "Get a key at https://ngc.nvidia.com, then:"
+    warn "  echo \"\$NGC_API_KEY\" | docker login nvcr.io -u '\$oauthtoken' --password-stdin"
+    # An already-cached image, or a prior `docker login`, can make this work
+    # without the variable set — so allow the same override used elsewhere.
+    [ "${FORCE:-0}" = "1" ] ||
+      die "refusing to start NIM without a key. Re-run with FORCE=1 if you have already run 'docker login nvcr.io'."
+    warn "FORCE=1 set — continuing without NGC_API_KEY."
+  fi
+
   avail="$(free_gb)"
 
   # Not enough room? The assistant model is almost certainly the reason.

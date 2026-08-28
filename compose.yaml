@@ -145,9 +145,12 @@ services:
     profiles: ["nim"]
     image: nvcr.io/nim/${NIM_ORG:-meta}/${NIM_MODEL:-llama-3.1-8b-instruct}:${NIM_TAG:-latest}
     environment:
-      # Fail fast with a readable message rather than pulling, starting and
-      # then dying on an authentication error minutes later.
-      - NGC_API_KEY=${NGC_API_KEY:?set NGC_API_KEY in the project environment}
+      # NOTE: deliberately NOT ${NGC_API_KEY:?...}. Compose interpolates the
+      # whole file before filtering by profile, so a required-variable guard
+      # here breaks `docker compose up` for the DEFAULT profile too, on a
+      # service that was never going to start. scripts/spark-nim checks the
+      # key before launching instead.
+      - NGC_API_KEY=${NGC_API_KEY:-}
       - NIM_MODEL_PROFILE=${NIM_MODEL_PROFILE:-}
       - NIM_MAX_MODEL_LEN=${NIM_MAX_MODEL_LEN:-16384}
     ports:
