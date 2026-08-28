@@ -1,0 +1,158 @@
+# NVIDIA AI Workbench compose file for the on-prem AI orchestrator.
+# Docs: https://docs.docker.com/reference/compose-file/
+#
+# Profiles:
+#   (none)     -> ollama + orchestrator + web-ui          [default stack]
+#   nim        -> swap Ollama for an NVIDIA NIM microservice (OpenAI-compatible)
+#   ui         -> Open WebUI as an extra chat front-end
+#   bench      -> one-shot GPU/driver sanity check (nvidia-smi)
+#
+# Enable with: profiles selected in Workbench, or `docker compose --profile nim up`
+
+services:
+
+  # ---------------------------------------------------------------
+  # Default stack: Ollama as the local inference server
+  # ---------------------------------------------------------------
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      # Keep a model resident so tool-calling round-trips stay fast
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-30m}
+      # Allow more than one model in VRAM (GB10 has 128 GB unified memory)
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
+      - OLLAMA_FLASH_ATTENTION=1
+    volumes:
+      - ollama-models:/root/.ollama
+      - /nvwb-shared-volume:/nvwb-shared-volume
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # Pulls the models the orchestrator exposes, then exits.
+  model-pull:
+    image: docker.io/ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for m in ${OLLAMA_MODELS:-llama3.1:8b qwen2.5:7b nemotron-3-nano:4b hermes3}; do
+          echo "==> pulling $$m"
+          ollama pull "$$m"
+        done
+        echo "==> done"
+    restart: "no"
+
+  orchestrator:
+    build: ./orchestrator
+    stop_signal: SIGINT
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      # Route through the Workbench proxy and strip the prefix
+      - NVWB_TRIM_PREFIX=true
+      # Point the app at the compose service instead of localhost
+      - OLLAMA_URL=http://ollama:11434
+      - MCP_SERVER=${MCP_SERVER:-http://10.0.0.140}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-llama3.1:8b}
+    ports:
+      - "${ORCHESTRATOR_PORT:-8090}:8090"
+    volumes:
+      - /nvwb-shared-volume:/nvwb-shared-volume
+
+  web-ui:
+    build: ./orchestrator
+    command: ["python3", "web_ui.py"]
+    stop_signal: SIGINT
+    depends_on:
+      - orchestrator
+    environment:
+      - NVWB_TRIM_PREFIX=true
+      - ORCHESTRATOR_URL=http://orchestrator:8090
+    ports:
+      - "${WEB_UI_PORT:-8091}:8091"
+
+  # ---------------------------------------------------------------
+  # profile: nim — the "NVIDIA way" of serving a model
+  # Requires NGC_API_KEY in Environment > Project Container (Secrets).
+  # ---------------------------------------------------------------
+  nim:
+    profiles: ["nim"]
+    image: nvcr.io/nim/${NIM_ORG:-meta}/${NIM_MODEL:-llama-3.1-8b-instruct}:${NIM_TAG:-latest}
+    environment:
+      - NGC_API_KEY=${NGC_API_KEY}
+      - NIM_MODEL_PROFILE=${NIM_MODEL_PROFILE:-}
+    ports:
+      - "${NIM_PORT:-8000}:8000"
+    volumes:
+      - nim-cache:/opt/nim/.cache
+    shm_size: "16gb"
+    user: "1000:1000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/health/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+
+  # ---------------------------------------------------------------
+  # profile: ui — Open WebUI, handy for comparing models side by side
+  # ---------------------------------------------------------------
+  open-webui:
+    profiles: ["ui"]
+    image: ghcr.io/open-webui/open-webui:main
+    environment:
+      - NVWB_TRIM_PREFIX=false
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_AUTH=${WEBUI_AUTH:-False}
+    ports:
+      - "${OPEN_WEBUI_PORT:-8080}:8080"
+    volumes:
+      - open-webui:/app/backend/data
+
+  # ---------------------------------------------------------------
+  # profile: bench — verify driver/CUDA visibility inside compose
+  # ---------------------------------------------------------------
+  gpu-check:
+    profiles: ["bench"]
+    image: docker.io/nvidia/cuda:12.6.2-base-ubuntu24.04
+    command: ["nvidia-smi"]
+    restart: "no"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: ["gpu"]
+
+volumes:
+  ollama-models:
+  nim-cache:
+  open-webui:

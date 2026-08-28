@@ -5,6 +5,7 @@ VCF Operations, and VCF Networks APIs via a local Ollama LLM.
 Runs on the LLM VM (10.0.0.141) and calls APIs on the MCP server (10.0.0.140).
 """
 
+import os
 import json
 import httpx
 import asyncio
@@ -14,9 +15,9 @@ from pydantic import BaseModel
 app = FastAPI(title="On-Prem AI Orchestrator", version="1.0")
 
 # Configuration
-OLLAMA_URL = "http://localhost:11434"
-MCP_SERVER = "http://10.0.0.140"
-DEFAULT_MODEL = "llama3.1:8b"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+MCP_SERVER = os.getenv("MCP_SERVER", "http://10.0.0.140")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3.1:8b")
 
 AVAILABLE_MODELS = {
     "llama3.1:8b": {"name": "Llama 3.1 8B", "description": "Fast (~30-60s) — good for daily use"},

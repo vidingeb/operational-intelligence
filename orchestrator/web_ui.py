@@ -3,13 +3,14 @@ Simple chat web UI for the On-Prem AI Orchestrator.
 Serves a single-page chat interface on port 8091.
 """
 
+import os
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import httpx
 
 app = FastAPI(title="On-Prem AI Chat")
 
-ORCHESTRATOR_URL = "http://localhost:8090"
+ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8090")
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
