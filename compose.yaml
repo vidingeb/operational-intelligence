@@ -94,6 +94,13 @@ services:
   # ---------------------------------------------------------------
   # profile: nim — the "NVIDIA way" of serving a model
   # Requires NGC_API_KEY in Environment > Project Container (Secrets).
+  #
+  # ARM64 / GB10 note: this MUST run on the DGX Spark, not on a Mac —
+  # NIM is CUDA/Linux-only and Docker Desktop has no GPU passthrough.
+  # Not every NIM has an arm64 build. LLM NIMs (Llama, Qwen, Nemotron)
+  # have DGX Spark variants; many vision/speech ones are x86_64-only.
+  # Confirm a `-dgx-spark` or arm64 tag exists on NGC before pulling,
+  # and pin NIM_TAG explicitly rather than trusting `latest`.
   # ---------------------------------------------------------------
   nim:
     profiles: ["nim"]
