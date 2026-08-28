@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+#
+# spark-nim — bring a NIM microservice up/down on the DGX Spark (GB10)
+# without starving the always-on Ollama assistant.
+#
+# The GB10 has ~128 GB of unified LPDDR5x shared by CPU and GPU, and no MIG,
+# so nothing enforces isolation for us. This script is that enforcement:
+# it refuses to start NIM unless there is enough free memory left over
+# after the resident gpt-oss:120b (~65 GB, pinned with KEEP_ALIVE=-1).
+#
+# Usage:
+#   ./scripts/spark-nim status     # what is running and what is free
+#   ./scripts/spark-nim up         # preflight, then start the nim profile
+#   ./scripts/spark-nim down       # stop the nim profile only
+#   ./scripts/spark-nim logs       # follow NIM logs
+#
+# Env:
+#   REQUIRED_FREE_GB   headroom demanded before starting   (default 24)
+#   NIM_PORT           host port for the NIM               (default 8000)
+#   READY_TIMEOUT      seconds to wait for readiness       (default 900)
+#   FORCE=1            skip the memory preflight
+
+set -euo pipefail
+
+REQUIRED_FREE_GB="${REQUIRED_FREE_GB:-24}"
+NIM_PORT="${NIM_PORT:-8000}"
+READY_TIMEOUT="${READY_TIMEOUT:-900}"
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+
+cd "$(dirname "$0")/.."
+
+log()  { printf '\033[0;36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[0;33m[!]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[0;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+
+compose() {
+  if docker compose version >/dev/null 2>&1; then
+    docker compose "$@"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    docker-compose "$@"
+  else
+    die "neither 'docker compose' nor 'docker-compose' is available"
+  fi
+}
+
+# Free memory in GB. Prefer nvidia-smi; fall back to /proc/meminfo, which on
+# GB10 describes the same unified pool.
+free_gb() {
+  local line used total
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    line="$(nvidia-smi --query-gpu=memory.used,memory.total \
+              --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true)"
+    used="${line%%,*}"
+    total="${line##*,}"
+    if [ -n "$total" ] && [ "$total" -gt 0 ] 2>/dev/null; then
+      echo $(( (total - used) / 1024 ))
+      return
+    fi
+  fi
+  if [ -r /proc/meminfo ]; then
+    awk '/MemAvailable/ {printf "%d", $2/1048576; exit}' /proc/meminfo
+    return
+  fi
+  echo "-1"
+}
+
+resident_models() {
+  curl -sf --max-time 5 "${OLLAMA_URL}/api/ps" 2>/dev/null |
+    grep -o '"name":"[^"]*"' | cut -d'"' -f4 || true
+}
+
+cmd_status() {
+  local avail models
+  avail="$(free_gb)"
+  log "Memory available: ${avail} GB (threshold ${REQUIRED_FREE_GB} GB)"
+
+  models="$(resident_models)"
+  if [ -n "$models" ]; then
+    log "Ollama resident models:"
+    printf '      %s\n' $models
+  else
+    warn "Ollama not reachable at ${OLLAMA_URL} (or no model loaded)"
+  fi
+
+  if curl -sf --max-time 5 "http://localhost:${NIM_PORT}/v1/health/ready" >/dev/null 2>&1; then
+    log "NIM: ready on port ${NIM_PORT}"
+  else
+    log "NIM: not running"
+  fi
+}
+
+cmd_up() {
+  local avail waited
+  avail="$(free_gb)"
+
+  if [ "$avail" -lt 0 ]; then
+    warn "could not determine free memory; proceeding blind"
+  elif [ "$avail" -lt "$REQUIRED_FREE_GB" ]; then
+    warn "only ${avail} GB free, need ${REQUIRED_FREE_GB} GB."
+    warn "The pinned assistant model is likely holding it (KEEP_ALIVE=-1)."
+    warn "Free it with:  curl ${OLLAMA_URL}/api/generate -d '{\"model\":\"gpt-oss:120b\",\"keep_alive\":0}'"
+    [ "${FORCE:-0}" = "1" ] || die "refusing to start NIM. Re-run with FORCE=1 to override."
+    warn "FORCE=1 set — starting anyway. Expect contention."
+  else
+    log "Memory OK: ${avail} GB free"
+  fi
+
+  log "Starting NIM profile..."
+  compose --profile nim up -d nim
+
+  log "Waiting for readiness (up to ${READY_TIMEOUT}s; first run builds a TRT engine)..."
+  waited=0
+  while [ "$waited" -lt "$READY_TIMEOUT" ]; do
+    if curl -sf --max-time 5 "http://localhost:${NIM_PORT}/v1/health/ready" >/dev/null 2>&1; then
+      log "NIM ready -> http://localhost:${NIM_PORT}/v1"
+      curl -sf --max-time 5 "http://localhost:${NIM_PORT}/v1/models" 2>/dev/null |
+        grep -o '"id":"[^"]*"' | cut -d'"' -f4 | sed 's/^/      model: /' || true
+      cmd_status
+      return 0
+    fi
+    if [ -z "$(compose --profile nim ps -q nim 2>/dev/null)" ]; then
+      die "NIM container exited. Check: ./scripts/spark-nim logs"
+    fi
+    sleep 10
+    waited=$((waited + 10))
+    if [ $((waited % 60)) -eq 0 ]; then
+      log "  still waiting... ${waited}s"
+    fi
+  done
+
+  die "NIM did not become ready in ${READY_TIMEOUT}s. Check: ./scripts/spark-nim logs"
+}
+
+cmd_down() {
+  log "Stopping NIM profile (assistant untouched)..."
+  compose --profile nim stop nim || true
+  compose --profile nim rm -f nim || true
+  log "Done. Memory released."
+  cmd_status
+}
+
+cmd_logs() { compose --profile nim logs -f nim; }
+
+case "${1:-status}" in
+  up)     cmd_up ;;
+  down)   cmd_down ;;
+  status) cmd_status ;;
+  logs)   cmd_logs ;;
+  *)      die "usage: $0 {up|down|status|logs}" ;;
+esac

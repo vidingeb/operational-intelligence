@@ -24,6 +24,8 @@
 #   bench         -> one-shot GPU/driver sanity check (nvidia-smi)
 #
 # Enable with: profiles selected in Workbench, or `docker compose --profile nim up`
+# Prefer `./scripts/spark-nim up` for the nim profile — it refuses to start
+# if there is not enough free memory beside the pinned assistant model.
 #
 # MEMORY BUDGET (GB10 = 128 GB unified, ~121 GB usable, shared CPU+GPU):
 #   gpt-oss:120b pinned      ~65 GB   <- never released, KEEP_ALIVE=-1
