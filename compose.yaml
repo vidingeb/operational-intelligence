@@ -1,0 +1,274 @@
+# NVIDIA AI Workbench compose file for the on-prem AI orchestrator.
+# Docs: https://docs.docker.com/reference/compose-file/
+#
+# PURPOSE
+# A lab rig for learning the NVIDIA stack — Workbench profiles, GPU
+# reservations, and serving a model the "NVIDIA way" with NIM — WITHOUT
+# disturbing the production assistant.
+#
+# WHERE THIS RUNS
+# On the DGX Spark (GB10), not on a Mac: NIM is CUDA/Linux-only and Docker
+# Desktop has no GPU passthrough.
+#
+# WHAT IS ALREADY RUNNING (do not fight it)
+#   * The Spark runs Ollama natively via systemd, holding gpt-oss:120b
+#     resident (~60.7 GB of ~121 GB usable) with OLLAMA_KEEP_ALIVE=-1.
+#   * The production assistant runs on a SEPARATE host (photon-machine) as
+#     the systemd units orchestrator.service / orchestrator-ui.service, and
+#     reaches this Spark's Ollama over Tailscale.
+#
+# So by default this file starts NO second Ollama — the containers use the
+# host's. A second one would collide on port 11434 and re-pull ~60 GB that
+# is already on disk. The native Ollama already accepts connections from
+# containers; no `systemctl edit` is needed.
+#
+# ---------------------------------------------------------------------
+# !! PORT CLASH WARNING !!
+# The production assistant also uses 8090/8091. If you run this stack on a
+# host where those services are active, override the ports:
+#     ORCHESTRATOR_PORT=18090 WEB_UI_PORT=18091 docker compose up -d
+# Two orchestrators reading the same Ollama is fine; two UIs on one port
+# is not.
+# ---------------------------------------------------------------------
+#
+# PROFILES
+#   (none)      -> orchestrator + web-ui against the HOST Ollama  [safe default]
+#   nim         -> NVIDIA NIM microservice (OpenAI-compatible)
+#   own-ollama  -> a containerised Ollama, ONLY for a host with none
+#   ui          -> Open WebUI, a second front-end for comparing models
+#   bench       -> one-shot GPU/driver sanity check
+#
+#     docker compose --profile nim up -d
+#
+# Prefer `./scripts/spark-nim up` for the nim profile: it refuses to start
+# when there is not enough memory free beside the resident assistant model.
+#
+# MEMORY BUDGET (GB10 = 128 GB unified, ~121 GB usable, shared CPU+GPU)
+#   gpt-oss:120b resident    ~60.7 GB
+#   NIM Llama 3.1 8B FP16      ~18 GB  + KV cache
+#   headroom                   ~40 GB
+# An 8B NIM fits alongside the 120B. For a 70B-class NIM, free the big
+# model first — the Unpin button in the assistant UI, or `spark-nim up`,
+# which does it for you.
+#
+# The contended resource is MEMORY BANDWIDTH (~273 GB/s), not capacity.
+# There is no MIG on GB10, so the GPU is time-sliced: concurrent inference
+# makes both sides slower. That is expected, not a misconfiguration.
+
+x-host-ollama: &host-ollama
+  # Reach the native Ollama running on the Spark host itself.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+
+  orchestrator:
+    <<: *host-ollama
+    build: ./orchestrator
+    # uvicorn shuts down cleanly on SIGINT; on SIGTERM it waits to be killed.
+    stop_signal: SIGINT
+    environment:
+      # Setting NVWB_TRIM_PREFIX routes the service through the Workbench
+      # proxy; `true` strips the prefix before forwarding. Workbench injects
+      # PROXY_PREFIX into the container in return.
+      - NVWB_TRIM_PREFIX=true
+
+      # Defaults to the HOST's native Ollama, not a compose service.
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      # Reuse the model already resident on the Spark — no extra memory cost.
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-gpt-oss:120b}
+      # Which model Pin/Unpin acts on. Empty falls back to DEFAULT_MODEL.
+      - ASSISTANT_MODEL=${ASSISTANT_MODEL:-}
+      # A 120B answering a tool-heavy question can run for minutes.
+      - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-900}
+
+      - MCP_SERVER=${MCP_SERVER:-}
+      - GB10_TELEMETRY_URL=${GB10_TELEMETRY_URL:-}
+      - HISTORY_TURNS=${HISTORY_TURNS:-6}
+
+      # Persist outside the image so `compose down` does not discard
+      # conversations, schedules and stored reports.
+      - STATE_DB=/data/state.db
+
+      # Deliberately conservative for a lab stack: no writes to vCenter or
+      # Veeam, and no scheduler firing questions on a timer. A second
+      # scheduler running against production credentials is not a surprise
+      # anyone wants. Opt in explicitly.
+      - ENABLE_WRITE_TOOLS=${ENABLE_WRITE_TOOLS:-false}
+      - WRITE_REQUIRE_CONFIRM=${WRITE_REQUIRE_CONFIRM:-true}
+      - SCHEDULER_ENABLED=${SCHEDULER_ENABLED:-false}
+    ports:
+      - "${ORCHESTRATOR_PORT:-8090}:8090"
+    volumes:
+      - orchestrator-state:/data
+      # Workbench mounts this in every container in the project.
+      - /nvwb-shared-volume:/nvwb-shared-volume
+    healthcheck:
+      # The image is python:slim — no curl, so use the interpreter.
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8090/health',timeout=3)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  web-ui:
+    build: ./orchestrator
+    command: ["python3", "web_ui.py"]
+    stop_signal: SIGINT
+    depends_on:
+      orchestrator:
+        # Wait for readiness, not merely for the container to exist, so the
+        # first page load does not race the API.
+        condition: service_healthy
+    environment:
+      - NVWB_TRIM_PREFIX=true
+      - ORCHESTRATOR_URL=http://orchestrator:8090
+    ports:
+      - "${WEB_UI_PORT:-8091}:8091"
+    volumes:
+      - /nvwb-shared-volume:/nvwb-shared-volume
+
+  # ---------------------------------------------------------------
+  # profile: nim — the "NVIDIA way" of serving a model.
+  # Needs NGC_API_KEY (Environment > Project Container > Secrets) and
+  # `docker login nvcr.io` on the Spark.
+  #
+  # ARM64 NOTE: not every NIM has an arm64 build. LLM NIMs generally have
+  # DGX Spark variants; many vision/speech ones are x86_64-only. Confirm
+  # the tag exists on NGC before pulling — a wrong guess costs a multi-GB
+  # download — and pin NIM_TAG rather than trusting `latest`.
+  #
+  # NIM_MAX_MODEL_LEN caps KV cache growth, which is what actually blows
+  # the memory budget under load; the weights are the predictable part.
+  # ---------------------------------------------------------------
+  nim:
+    profiles: ["nim"]
+    image: nvcr.io/nim/${NIM_ORG:-meta}/${NIM_MODEL:-llama-3.1-8b-instruct}:${NIM_TAG:-latest}
+    environment:
+      # Fail fast with a readable message rather than pulling, starting and
+      # then dying on an authentication error minutes later.
+      - NGC_API_KEY=${NGC_API_KEY:?set NGC_API_KEY in the project environment}
+      - NIM_MODEL_PROFILE=${NIM_MODEL_PROFILE:-}
+      - NIM_MAX_MODEL_LEN=${NIM_MAX_MODEL_LEN:-16384}
+    ports:
+      - "${NIM_PORT:-8000}:8000"
+    volumes:
+      # Cache the weights, or every recreate re-downloads them.
+      - nim-cache:/opt/nim/.cache
+    # NIM uses shared memory for tensor traffic; the 64 MB default is too
+    # small and surfaces as an obscure crash rather than a clear error.
+    shm_size: "16gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/health/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      # First start builds an engine profile for the GPU, which is slow.
+      retries: 60
+      start_period: 180s
+
+  # ---------------------------------------------------------------
+  # profile: own-ollama — ONLY for a host with no native Ollama.
+  # Leave this off on the Spark; it will fight the systemd service.
+  # The default host port is 11435, not 11434, to avoid the clash.
+  # ---------------------------------------------------------------
+  ollama:
+    profiles: ["own-ollama"]
+    image: docker.io/ollama/ollama:latest
+    ports:
+      - "${OLLAMA_PORT:-11435}:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-30m}
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
+      - OLLAMA_FLASH_ATTENTION=1
+    volumes:
+      - ollama-models:/root/.ollama
+      - /nvwb-shared-volume:/nvwb-shared-volume
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # Pulls models into the containerised Ollama, then exits.
+  model-pull:
+    profiles: ["own-ollama"]
+    image: docker.io/ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      # $$m escapes the $ so Compose passes it to the shell instead of
+      # interpolating it away.
+      - |
+        set -e
+        for m in ${OLLAMA_MODELS:-llama3.1:8b qwen2.5:7b}; do
+          echo "==> pulling $$m"
+          ollama pull "$$m"
+        done
+        echo "==> done"
+    restart: "no"
+
+  # ---------------------------------------------------------------
+  # profile: ui — Open WebUI, handy for comparing models side by side
+  # ---------------------------------------------------------------
+  open-webui:
+    profiles: ["ui"]
+    image: ghcr.io/open-webui/open-webui:main
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - NVWB_TRIM_PREFIX=false
+      - OLLAMA_BASE_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      # Auth off is convenient on a private tailnet and wrong anywhere else.
+      - WEBUI_AUTH=${WEBUI_AUTH:-False}
+    ports:
+      - "${OPEN_WEBUI_PORT:-8080}:8080"
+    volumes:
+      - open-webui:/app/backend/data
+
+  # ---------------------------------------------------------------
+  # profile: bench — verify driver/CUDA visibility inside compose.
+  # Reserving by device_ids (rather than count) is what lets services
+  # share a GPU explicitly.
+  #
+  # On GB10 the memory columns read [N/A]: unified memory is not a
+  # discrete VRAM pool. Use /proc/meminfo instead — which is what
+  # scripts/spark-nim and gb10-telemetry/telemetry.py do.
+  # ---------------------------------------------------------------
+  gpu-check:
+    profiles: ["bench"]
+    image: docker.io/nvidia/cuda:12.6.2-base-ubuntu24.04
+    command: ["nvidia-smi"]
+    restart: "no"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: ["gpu"]
+
+volumes:
+  orchestrator-state:
+  ollama-models:
+  nim-cache:
+  open-webui:

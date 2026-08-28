@@ -1,0 +1,11 @@
+# state.db holds real conversations, schedules and stored reports. `COPY . .`
+# would bake a snapshot of it into the image — shipping data into an artefact
+# and masking the volume mount at /data. Keep it out.
+state.db
+state.db.bak-*
+state.db-wal
+state.db-shm
+
+__pycache__/
+*.pyc
+.pytest_cache/
