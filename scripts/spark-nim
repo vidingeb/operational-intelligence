@@ -48,26 +48,42 @@ compose() {
   fi
 }
 
-# Free memory in GB. Prefer nvidia-smi; fall back to /proc/meminfo, which on
-# GB10 describes the same unified pool.
-free_gb() {
+# Free memory in GB, plus the source we got it from.
+#
+# On GB10, `nvidia-smi --query-gpu=memory.used,memory.total` returns
+# "[N/A], [N/A]" — the unified LPDDR5x pool is not exposed as discrete VRAM.
+# So /proc/meminfo is the real signal here, not a fallback. Be aware that
+# MemAvailable counts reclaimable page cache, so it can read optimistically:
+# treat it as an upper bound, not a guarantee.
+# Emits "<gb> <source>" on one line. Callers split it — assigning inside a
+# command substitution would strand any variable set here in the subshell.
+free_gb_raw() {
   local line used total
   if command -v nvidia-smi >/dev/null 2>&1; then
     line="$(nvidia-smi --query-gpu=memory.used,memory.total \
               --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true)"
     used="${line%%,*}"
     total="${line##*,}"
-    if [ -n "$total" ] && [ "$total" -gt 0 ] 2>/dev/null; then
-      echo $(( (total - used) / 1024 ))
-      return
-    fi
+    # Guard explicitly: GB10 answers "[N/A]", which is not a number.
+    case "${used}${total}" in
+      *[!0-9]*|"") ;;
+      *)
+        if [ "$total" -gt 0 ]; then
+          echo "$(( (total - used) / 1024 )) nvidia-smi"
+          return
+        fi
+        ;;
+    esac
   fi
   if [ -r /proc/meminfo ]; then
-    awk '/MemAvailable/ {printf "%d", $2/1048576; exit}' /proc/meminfo
+    echo "$(awk '/MemAvailable/ {printf "%d", $2/1048576; exit}' /proc/meminfo) MemAvailable(incl-reclaimable-cache)"
     return
   fi
-  echo "-1"
+  echo "-1 unavailable"
 }
+
+free_gb()     { free_gb_raw | cut -d' ' -f1; }
+free_source() { free_gb_raw | cut -d' ' -f2; }
 
 have_python() { command -v python3 >/dev/null 2>&1; }
 
@@ -137,6 +153,7 @@ cmd_status() {
   local avail models
   avail="$(free_gb)"
   log "Memory available: ${avail} GB (threshold ${REQUIRED_FREE_GB} GB)"
+  log "  source: $(free_source)"
 
   models="$(resident_models)"
   if [ -n "$models" ]; then
