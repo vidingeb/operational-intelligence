@@ -1,28 +1,55 @@
 # NVIDIA AI Workbench compose file for the on-prem AI orchestrator.
 # Docs: https://docs.docker.com/reference/compose-file/
 #
+# IMPORTANT — this project targets a DGX Spark (GB10) that ALREADY runs
+# Ollama natively as a systemd service, hosting gpt-oss:120b pinned in
+# memory with OLLAMA_KEEP_ALIVE=-1 (~65 GB of ~121 GB usable).
+#
+# So by default we do NOT start a second Ollama: the containers talk to the
+# host's existing one. Starting another would collide on port 11434 and
+# re-download models that are already on disk.
+#
+# Prerequisite: the native Ollama must listen on more than loopback, or
+# containers cannot reach it. On the Spark:
+#   sudo systemctl edit ollama
+#     [Service]
+#     Environment="OLLAMA_HOST=0.0.0.0:11434"
+#   sudo systemctl restart ollama
+#
 # Profiles:
-#   (none)     -> ollama + orchestrator + web-ui          [default stack]
-#   nim        -> swap Ollama for an NVIDIA NIM microservice (OpenAI-compatible)
-#   ui         -> Open WebUI as an extra chat front-end
-#   bench      -> one-shot GPU/driver sanity check (nvidia-smi)
+#   (none)        -> orchestrator + web-ui, using the HOST Ollama   [safe default]
+#   own-ollama    -> a second, containerised Ollama (only if the host has none)
+#   nim           -> NVIDIA NIM microservice (OpenAI-compatible)
+#   ui            -> Open WebUI as an extra chat front-end
+#   bench         -> one-shot GPU/driver sanity check (nvidia-smi)
 #
 # Enable with: profiles selected in Workbench, or `docker compose --profile nim up`
+#
+# MEMORY BUDGET (GB10 = 128 GB unified, ~121 GB usable, shared CPU+GPU):
+#   gpt-oss:120b pinned      ~65 GB   <- never released, KEEP_ALIVE=-1
+#   NIM Llama 3.1 8B FP16    ~18 GB   + KV cache
+#   headroom                 ~35 GB
+# Capacity is fine. MEMORY BANDWIDTH is the contended resource — see README.
+
+x-host-ollama: &host-ollama
+  # Reach the native Ollama running on the Spark host itself.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
 
 services:
 
   # ---------------------------------------------------------------
-  # Default stack: Ollama as the local inference server
+  # profile: own-ollama — ONLY for a host with no native Ollama.
+  # Leave this off on the Spark; it will fight the systemd service.
   # ---------------------------------------------------------------
   ollama:
+    profiles: ["own-ollama"]
     image: docker.io/ollama/ollama:latest
     ports:
-      - "${OLLAMA_PORT:-11434}:11434"
+      - "${OLLAMA_PORT:-11435}:11434"
     environment:
       - OLLAMA_HOST=0.0.0.0:11434
-      # Keep a model resident so tool-calling round-trips stay fast
       - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-30m}
-      # Allow more than one model in VRAM (GB10 has 128 GB unified memory)
       - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
       - OLLAMA_FLASH_ATTENTION=1
     volumes:
@@ -42,8 +69,9 @@ services:
       retries: 12
       start_period: 30s
 
-  # Pulls the models the orchestrator exposes, then exits.
+  # Pulls models into the containerised Ollama, then exits.
   model-pull:
+    profiles: ["own-ollama"]
     image: docker.io/ollama/ollama:latest
     depends_on:
       ollama:
@@ -62,18 +90,17 @@ services:
     restart: "no"
 
   orchestrator:
+    <<: *host-ollama
     build: ./orchestrator
     stop_signal: SIGINT
-    depends_on:
-      ollama:
-        condition: service_healthy
     environment:
       # Route through the Workbench proxy and strip the prefix
       - NVWB_TRIM_PREFIX=true
-      # Point the app at the compose service instead of localhost
-      - OLLAMA_URL=http://ollama:11434
+      # Defaults to the HOST's native Ollama, not a compose service.
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
       - MCP_SERVER=${MCP_SERVER:-http://10.0.0.140}
-      - DEFAULT_MODEL=${DEFAULT_MODEL:-llama3.1:8b}
+      # Reuse the model already pinned on the Spark — no extra memory cost.
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-gpt-oss:120b}
     ports:
       - "${ORCHESTRATOR_PORT:-8090}:8090"
     volumes:
@@ -101,6 +128,13 @@ services:
   # have DGX Spark variants; many vision/speech ones are x86_64-only.
   # Confirm a `-dgx-spark` or arm64 tag exists on NGC before pulling,
   # and pin NIM_TAG explicitly rather than trusting `latest`.
+  #
+  # COEXISTENCE: this shares the single GB10 GPU with the native Ollama.
+  # There is no MIG on GB10, so the GPU is time-sliced, not partitioned —
+  # concurrent inference means both sides slow down. Keep the NIM small
+  # (8B class) so it fits beside the pinned 65 GB gpt-oss:120b.
+  # NIM_MAX_MODEL_LEN caps KV cache growth, which is what actually
+  # blows the memory budget under load.
   # ---------------------------------------------------------------
   nim:
     profiles: ["nim"]
@@ -108,6 +142,8 @@ services:
     environment:
       - NGC_API_KEY=${NGC_API_KEY}
       - NIM_MODEL_PROFILE=${NIM_MODEL_PROFILE:-}
+      # Bound the KV cache so NIM cannot starve the resident 120B model.
+      - NIM_MAX_MODEL_LEN=${NIM_MAX_MODEL_LEN:-16384}
     ports:
       - "${NIM_PORT:-8000}:8000"
     volumes:
@@ -134,9 +170,11 @@ services:
   open-webui:
     profiles: ["ui"]
     image: ghcr.io/open-webui/open-webui:main
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - NVWB_TRIM_PREFIX=false
-      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_BASE_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
       - WEBUI_AUTH=${WEBUI_AUTH:-False}
     ports:
       - "${OPEN_WEBUI_PORT:-8080}:8080"
