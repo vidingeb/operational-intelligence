@@ -1917,7 +1917,9 @@ async def telemetry():
 # can be released and restored without touching systemd on the inference
 # host. A request carrying no prompt loads or evicts without generating.
 
-ASSISTANT_MODEL = os.getenv("ASSISTANT_MODEL", DEFAULT_MODEL)
+# A set-but-empty value (compose writes ASSISTANT_MODEL= when unset) must
+# fall through to DEFAULT_MODEL — os.getenv's default only covers "absent".
+ASSISTANT_MODEL = os.getenv("ASSISTANT_MODEL") or DEFAULT_MODEL
 
 
 async def _set_keep_alive(model: str, keep_alive) -> None:
