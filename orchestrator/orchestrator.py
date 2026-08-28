@@ -18,15 +18,22 @@ app = FastAPI(title="On-Prem AI Orchestrator", version="1.0")
 # Configuration
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MCP_SERVER = os.getenv("MCP_SERVER", "http://10.0.0.140")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3.1:8b")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-oss:120b")
 
-AVAILABLE_MODELS = {
-    "llama3.1:8b": {"name": "Llama 3.1 8B", "description": "Fast (~30-60s) — good for daily use"},
-    "hermes3": {"name": "Hermes 3", "description": "Fast (~30-60s) — optimized for tool calling"},
-    "nemotron-3-nano:4b": {"name": "Nemotron 3 Nano 4B", "description": "Fast (~20-40s) — NVIDIA agent-optimized"},
-    "qwen2.5:7b": {"name": "Qwen 2.5 7B", "description": "Fast (~20-40s) — excellent tool calling for its size"},
-    "llama3.1:70b": {"name": "Llama 3.1 70B", "description": "Slow (~3-5min) — best accuracy"},
-    "llama3.2": {"name": "Llama 3.2 3B", "description": "Fastest (~15-30s) — basic queries"},
+# Descriptions for models we know about. This is annotation only — the
+# authoritative list is whatever Ollama actually has installed, fetched at
+# runtime. Hardcoding a menu of models that aren't on the box just produces
+# a dropdown where every option fails.
+MODEL_NOTES = {
+    "gpt-oss:120b": "Largest — best reasoning, stays resident",
+    "gpt-oss:20b": "Mid-size, good balance",
+    "qwen3:8b": "Fast — good for daily use",
+    "llama3.1:8b": "Fast (~30-60s) — good for daily use",
+    "hermes3": "Optimized for tool calling",
+    "nemotron-3-nano:4b": "NVIDIA agent-optimized",
+    "qwen2.5:7b": "Excellent tool calling for its size",
+    "llama3.1:70b": "Slow — best accuracy",
+    "llama3.2": "Fastest — basic queries",
 }
 
 VCENTER_BASE = f"{MCP_SERVER}:8080"
@@ -422,15 +429,25 @@ class ChatResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "default_model": DEFAULT_MODEL, "available_models": list(AVAILABLE_MODELS.keys()), "mcp_server": MCP_SERVER}
+    return {
+        "status": "ok",
+        "default_model": DEFAULT_MODEL,
+        "installed_models": await installed_models(),
+        "mcp_server": MCP_SERVER,
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Ask a question about your VMware infrastructure."""
     use_model = request.model or DEFAULT_MODEL
-    if use_model not in AVAILABLE_MODELS:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {use_model}. Available: {list(AVAILABLE_MODELS.keys())}")
+    available = await installed_models()
+    if available and use_model not in available:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{use_model}' is not installed on this host. "
+                   f"Installed: {available}. Pull it with: ollama pull {use_model}",
+        )
     try:
         answer = await chat_with_tools(request.message, model=use_model)
         return ChatResponse(answer=answer, model=use_model)
@@ -440,10 +457,38 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def installed_models():
+    """Ask Ollama what it actually has. Empty list if it cannot be reached."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{OLLAMA_URL}/api/tags")
+            response.raise_for_status()
+            return [m["name"] for m in response.json().get("models") or []]
+    except httpx.HTTPError:
+        return []
+
+
 @app.get("/models")
 async def list_models():
-    """List available models."""
-    return AVAILABLE_MODELS
+    """List the models this host can actually serve, largest first."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{OLLAMA_URL}/api/tags")
+            response.raise_for_status()
+            models = response.json().get("models") or []
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=503, detail=f"Cannot reach Ollama: {e}")
+
+    models.sort(key=lambda m: m.get("size") or 0, reverse=True)
+    return [
+        {
+            "id": m["name"],
+            "size_gb": round((m.get("size") or 0) / 1024**3, 1),
+            "description": MODEL_NOTES.get(m["name"], ""),
+            "default": m["name"] == DEFAULT_MODEL,
+        }
+        for m in models
+    ]
 
 
 @app.get("/tools")

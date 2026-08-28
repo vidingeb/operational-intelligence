@@ -206,12 +206,7 @@ Try asking me:
     </div>
     <div id="input-area">
         <select id="model-select">
-            <option value="llama3.1:8b">⚡ 8B (Fast)</option>
-            <option value="hermes3">🎯 Hermes 3 (Tool Expert)</option>
-            <option value="nemotron-3-nano:4b">🟢 Nemotron Nano (NVIDIA)</option>
-            <option value="qwen2.5:7b">🐉 Qwen 2.5 7B (Alibaba)</option>
-            <option value="llama3.1:70b">🧠 70B (Smart)</option>
-            <option value="llama3.2">🚀 3B (Fastest)</option>
+            <option value="">loading models…</option>
         </select>
         <input type="text" id="user-input" placeholder="Ask about your VMware infrastructure..." autofocus>
         <button id="send-btn" onclick="sendMessage()">Send</button>
@@ -227,6 +222,29 @@ Try asking me:
         const pinBtn = document.getElementById('pin-btn');
         const unpinBtn = document.getElementById('unpin-btn');
         let timerInterval = null;
+
+        // Populate from what Ollama actually has installed. A hardcoded menu
+        // drifts out of sync with the host and every option silently fails.
+        async function loadModels() {
+            try {
+                const r = await fetch('/api/models');
+                if (!r.ok) throw new Error('unavailable');
+                const models = await r.json();
+                if (!models.length) throw new Error('none installed');
+                modelSelect.innerHTML = '';
+                for (const m of models) {
+                    const o = document.createElement('option');
+                    o.value = m.id;
+                    o.textContent = `${m.id} · ${m.size_gb} GB`
+                                  + (m.description ? ` — ${m.description}` : '');
+                    if (m.default) o.selected = true;
+                    modelSelect.appendChild(o);
+                }
+            } catch (e) {
+                modelSelect.innerHTML =
+                    `<option value="">no models (${e.message})</option>`;
+            }
+        }
 
         async function refreshMemory() {
             try {
@@ -271,6 +289,7 @@ Try asking me:
 
         refreshMemory();
         setInterval(refreshMemory, 15000);
+        loadModels();
 
         userInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
@@ -365,12 +384,24 @@ async def index():
 @app.post("/api/chat")
 async def chat(request: dict):
     """Proxy to the orchestrator."""
-    timeout = 600.0 if "70b" in request.get("model", "") else 300.0
+    model = request.get("model") or ""
+    # A 120B doing multi-round tool calls needs far more than the old 300s.
+    large = any(tag in model.lower() for tag in ("120b", "70b"))
+    timeout = 900.0 if large else 300.0
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             f"{ORCHESTRATOR_URL}/chat",
             json={"message": request["message"], "model": request.get("model")},
         )
+        response.raise_for_status()
+        return response.json()
+
+
+@app.get("/api/models")
+async def models():
+    """Proxy the installed-model list."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(f"{ORCHESTRATOR_URL}/models")
         response.raise_for_status()
         return response.json()
 

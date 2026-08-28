@@ -142,7 +142,7 @@ services:
     profiles: ["nim"]
     image: nvcr.io/nim/${NIM_ORG:-meta}/${NIM_MODEL:-llama-3.1-8b-instruct}:${NIM_TAG:-latest}
     environment:
-      - NGC_API_KEY=${NGC_API_KEY}
+      - NGC_API_KEY=${NGC_API_KEY:-}
       - NIM_MODEL_PROFILE=${NIM_MODEL_PROFILE:-}
       # Bound the KV cache so NIM cannot starve the resident 120B model.
       - NIM_MAX_MODEL_LEN=${NIM_MAX_MODEL_LEN:-16384}
