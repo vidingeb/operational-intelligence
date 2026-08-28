@@ -114,6 +114,26 @@ HTML_PAGE = """<!DOCTYPE html>
             cursor: pointer;
         }
         #model-select:focus { border-color: #4fc3f7; }
+        .mem-group {
+            margin-left: auto;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        #mem-status { font-variant-numeric: tabular-nums; }
+        #mem-status.pinned { color: #ffb74d; }
+        #mem-status.free { color: #81c784; }
+        .mem-btn {
+            padding: 0.25rem 0.6rem;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            background: #1a1a2e;
+            color: #4fc3f7;
+            font-size: 0.75rem;
+            cursor: pointer;
+        }
+        .mem-btn:hover:not(:disabled) { border-color: #4fc3f7; }
+        .mem-btn:disabled { opacity: 0.35; cursor: not-allowed; }
         #user-input {
             flex: 1;
             padding: 0.8rem 1rem;
@@ -167,6 +187,11 @@ HTML_PAGE = """<!DOCTYPE html>
         <span>LLM: 10.0.0.141 (Ollama)</span>
         <span>APIs: 10.0.0.140 (MCP Server)</span>
         <span id="timer"></span>
+        <span class="mem-group">
+            <span id="mem-status" title="Resident model memory on the GB10">memory: …</span>
+            <button id="pin-btn" class="mem-btn" onclick="setPin(true)">Pin</button>
+            <button id="unpin-btn" class="mem-btn" onclick="setPin(false)">Unpin</button>
+        </span>
     </div>
     <div id="chat-container">
         <div class="message assistant">Hello! I'm your on-premises VMware infrastructure assistant. I can query vCenter, VCF Operations, and VCF Networks — all running locally with no cloud dependency.
@@ -198,7 +223,54 @@ Try asking me:
         const sendBtn = document.getElementById('send-btn');
         const modelSelect = document.getElementById('model-select');
         const timerEl = document.getElementById('timer');
+        const memStatus = document.getElementById('mem-status');
+        const pinBtn = document.getElementById('pin-btn');
+        const unpinBtn = document.getElementById('unpin-btn');
         let timerInterval = null;
+
+        async function refreshMemory() {
+            try {
+                const r = await fetch('/api/memory');
+                if (!r.ok) throw new Error('unreachable');
+                const d = await r.json();
+                if (d.pinned) {
+                    memStatus.textContent = `memory: ${d.total_gb} GB resident`;
+                    memStatus.className = 'pinned';
+                } else if (d.models.length) {
+                    memStatus.textContent = `memory: ${d.total_gb} GB (not pinned)`;
+                    memStatus.className = '';
+                } else {
+                    memStatus.textContent = 'memory: free';
+                    memStatus.className = 'free';
+                }
+                pinBtn.disabled = d.pinned;
+                unpinBtn.disabled = !d.models.length;
+            } catch (e) {
+                memStatus.textContent = 'memory: unknown';
+                memStatus.className = '';
+                pinBtn.disabled = unpinBtn.disabled = true;
+            }
+        }
+
+        async function setPin(pin) {
+            pinBtn.disabled = unpinBtn.disabled = true;
+            memStatus.className = '';
+            // Pinning reloads ~65 GB from disk, so this is not instant.
+            memStatus.textContent = pin ? 'memory: loading…' : 'memory: evicting…';
+            try {
+                const r = await fetch(pin ? '/api/memory/pin' : '/api/memory/unpin',
+                                      { method: 'POST' });
+                const d = await r.json();
+                if (!r.ok) throw new Error(d.detail || 'failed');
+                memStatus.textContent = `memory: ${pin ? 'pinned' : 'freed'} in ${d.seconds}s`;
+            } catch (e) {
+                memStatus.textContent = `memory: ${e.message}`;
+            }
+            setTimeout(refreshMemory, 1500);
+        }
+
+        refreshMemory();
+        setInterval(refreshMemory, 15000);
 
         userInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
@@ -299,6 +371,32 @@ async def chat(request: dict):
             f"{ORCHESTRATOR_URL}/chat",
             json={"message": request["message"], "model": request.get("model")},
         )
+        response.raise_for_status()
+        return response.json()
+
+
+@app.get("/api/memory")
+async def memory():
+    """Proxy the resident-model status."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(f"{ORCHESTRATOR_URL}/memory")
+        response.raise_for_status()
+        return response.json()
+
+
+@app.post("/api/memory/pin")
+async def memory_pin():
+    """Reloading the model can take a while — allow for it."""
+    async with httpx.AsyncClient(timeout=900.0) as client:
+        response = await client.post(f"{ORCHESTRATOR_URL}/memory/pin")
+        response.raise_for_status()
+        return response.json()
+
+
+@app.post("/api/memory/unpin")
+async def memory_unpin():
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(f"{ORCHESTRATOR_URL}/memory/unpin")
         response.raise_for_status()
         return response.json()
 
