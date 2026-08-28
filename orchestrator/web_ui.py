@@ -73,6 +73,85 @@ HTML_PAGE = """<!DOCTYPE html>
             border-radius: 12px;
             font-size: 0.75rem;
         }
+        #workspace {
+            flex: 1;
+            display: flex;
+            /* Without min-height the flex children refuse to shrink and the
+               chat pane scrolls the whole page instead of itself. */
+            min-height: 0;
+        }
+        #main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            min-height: 0;
+        }
+        #sidebar {
+            width: 250px;
+            flex-shrink: 0;
+            background: #16213e;
+            border-right: 1px solid #0f3460;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+        #sidebar.hidden { display: none; }
+        .sidebar-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.8rem 1rem;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: #7f8fa6;
+            border-bottom: 1px solid #0f3460;
+        }
+        .sidebar-icon {
+            background: none;
+            border: 1px solid #0f3460;
+            color: #9fb3c8;
+            border-radius: 6px;
+            width: 24px;
+            height: 24px;
+            font-size: 1rem;
+            line-height: 1;
+            cursor: pointer;
+        }
+        .sidebar-icon:hover { background: #0f3460; color: #eee; }
+        .conv-list { overflow-y: auto; padding: 0.4rem; }
+        .conv-item {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.5rem 0.6rem;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            color: #cfd8e3;
+        }
+        .conv-item:hover { background: #1a2c50; }
+        .conv-item.active { background: #0f3460; color: #fff; }
+        .conv-title {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .conv-meta { font-size: 0.7rem; color: #7f8fa6; }
+        .conv-delete {
+            background: none;
+            border: none;
+            color: #7f8fa6;
+            cursor: pointer;
+            font-size: 0.9rem;
+            padding: 0 0.2rem;
+            visibility: hidden;
+        }
+        .conv-item:hover .conv-delete { visibility: visible; }
+        .conv-delete:hover { color: #e57373; }
+        .conv-empty { padding: 0.8rem; color: #7f8fa6; font-size: 0.8rem; }
         #chat-container {
             flex: 1;
             overflow-y: auto;
@@ -447,14 +526,25 @@ HTML_PAGE = """<!DOCTYPE html>
             <div id="runs-list" class="panel-list"></div>
         </div>
     </div>
-    <div id="chat-container">
-        <div class="message assistant">{{WELCOME}}</div>
-    </div>
-    <div id="input-area">
-        <select id="model-select"><option value="">Loading models...</option></select>
-        <select id="scope-select" title="Which systems the assistant may query"></select>
-        <input type="text" id="user-input" placeholder="Ask about your VMware infrastructure..." autofocus>
-        <button id="send-btn" onclick="sendMessage()">Send</button>
+    <div id="workspace">
+        <aside id="sidebar">
+            <div class="sidebar-head">
+                <span>Conversations</span>
+                <button id="sidebar-new" class="sidebar-icon" title="Start a new conversation">+</button>
+            </div>
+            <div id="conv-list" class="conv-list"></div>
+        </aside>
+        <div id="main">
+            <div id="chat-container">
+                <div class="message assistant">{{WELCOME}}</div>
+            </div>
+            <div id="input-area">
+                <select id="model-select"><option value="">Loading models...</option></select>
+                <select id="scope-select" title="Which systems the assistant may query"></select>
+                <input type="text" id="user-input" placeholder="Ask about your VMware infrastructure..." autofocus>
+                <button id="send-btn" onclick="sendMessage()">Send</button>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -497,11 +587,37 @@ HTML_PAGE = """<!DOCTYPE html>
 
         // --- conversation memory ---------------------------------------------
         //
-        // The id is the whole of the client's state. History lives in the
-        // orchestrator's database, so a reload picks the thread back up rather
-        // than losing it with the tab.
+        // History lives in the orchestrator's database, but the id that reaches
+        // it was previously a bare JS variable, so any reload started a new
+        // thread while the page still looked like the same session. The comment
+        // here used to claim a reload picked the thread back up; it did not.
+        // The id now survives in localStorage and the sidebar lists what the
+        // server actually holds, so the two can no longer disagree.
 
+        const CONV_KEY = 'oi.conversationId';
         let conversationId = null;
+
+        function setConversationId(id) {
+            conversationId = id || null;
+            try {
+                if (conversationId) {
+                    localStorage.setItem(CONV_KEY, conversationId);
+                } else {
+                    localStorage.removeItem(CONV_KEY);
+                }
+            } catch (e) {
+                // Private browsing denies localStorage. Memory then lasts only
+                // as long as the tab, which is the old behaviour, not a crash.
+            }
+        }
+
+        function storedConversationId() {
+            try {
+                return localStorage.getItem(CONV_KEY);
+            } catch (e) {
+                return null;
+            }
+        }
 
         function setMemoryState(turns) {
             if (!conversationId) {
@@ -517,13 +633,135 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         function newConversation() {
-            conversationId = null;
+            setConversationId(null);
             setMemoryState(0);
             addMessage('Started a new conversation. Earlier questions are no '
                        + 'longer used as context.', 'thinking');
+            renderConversations();
+        }
+
+        // --- conversation sidebar --------------------------------------------
+
+        const convList = document.getElementById('conv-list');
+        let conversations = [];
+
+        function relativeTime(iso) {
+            const then = Date.parse(iso && iso.endsWith('Z') ? iso : iso + 'Z');
+            if (isNaN(then)) { return ''; }
+            const mins = Math.round((Date.now() - then) / 60000);
+            if (mins < 1) { return 'now'; }
+            if (mins < 60) { return mins + 'm'; }
+            if (mins < 1440) { return Math.round(mins / 60) + 'h'; }
+            return Math.round(mins / 1440) + 'd';
+        }
+
+        function renderConversations() {
+            convList.textContent = '';
+            if (!conversations.length) {
+                const empty = document.createElement('div');
+                empty.className = 'conv-empty';
+                empty.textContent = 'No earlier conversations.';
+                convList.appendChild(empty);
+                return;
+            }
+            conversations.forEach(conv => {
+                const item = document.createElement('div');
+                item.className = 'conv-item' + (conv.id === conversationId ? ' active' : '');
+
+                const title = document.createElement('span');
+                title.className = 'conv-title';
+                // An untitled thread is one where the first question never
+                // landed; show the id rather than an empty clickable strip.
+                title.textContent = conv.title || conv.id;
+                title.title = conv.title || conv.id;
+                item.appendChild(title);
+
+                const meta = document.createElement('span');
+                meta.className = 'conv-meta';
+                meta.textContent = relativeTime(conv.updated_at);
+                item.appendChild(meta);
+
+                const del = document.createElement('button');
+                del.className = 'conv-delete';
+                del.textContent = '×';
+                del.title = 'Delete this conversation';
+                del.addEventListener('click', event => {
+                    event.stopPropagation();
+                    deleteConversation(conv.id);
+                });
+                item.appendChild(del);
+
+                item.addEventListener('click', () => openConversation(conv.id));
+                convList.appendChild(item);
+            });
+        }
+
+        async function loadConversations() {
+            try {
+                const response = await fetch('/api/conversations?limit=50');
+                if (!response.ok) { return; }
+                const data = await response.json();
+                conversations = data.conversations || [];
+            } catch (e) {
+                // The list is navigation, not the product. Losing it must not
+                // stop someone asking a question.
+                conversations = [];
+            }
+            renderConversations();
+        }
+
+        async function openConversation(id) {
+            let data;
+            try {
+                const response = await fetch('/api/conversations/' + encodeURIComponent(id));
+                if (response.status === 404) {
+                    // Deleted server-side. Drop it rather than leaving a dead
+                    // row that silently sends questions into nothing.
+                    if (id === conversationId) { setConversationId(null); }
+                    await loadConversations();
+                    return;
+                }
+                if (!response.ok) { return; }
+                data = await response.json();
+            } catch (e) {
+                addMessage('Could not load that conversation: ' + e.message, 'error');
+                return;
+            }
+            setConversationId(id);
+            chatContainer.textContent = '';
+            const messages = data.messages || [];
+            messages.forEach(m => {
+                if (m.role === 'user') { lastQuestion = m.content; }
+                addMessage(m.content, m.role === 'user' ? 'user' : 'assistant');
+            });
+            setMemoryState(Math.floor(messages.length / 2));
+            renderConversations();
+        }
+
+        async function deleteConversation(id) {
+            try {
+                await fetch('/api/conversations/' + encodeURIComponent(id),
+                            { method: 'DELETE' });
+            } catch (e) {
+                addMessage('Could not delete that conversation: ' + e.message, 'error');
+                return;
+            }
+            if (id === conversationId) {
+                setConversationId(null);
+                setMemoryState(0);
+            }
+            await loadConversations();
+        }
+
+        async function restoreConversation() {
+            const saved = storedConversationId();
+            await loadConversations();
+            if (saved) { await openConversation(saved); }
         }
 
         document.getElementById('new-chat-btn')
+            .addEventListener('click', newConversation);
+        document.getElementById('sidebar-new')
             .addEventListener('click', newConversation);
 
         // --- schedules and stored reports -------------------------------------
@@ -746,10 +984,13 @@ HTML_PAGE = """<!DOCTYPE html>
 
                 if (response.ok) {
                     const data = await response.json();
-                    conversationId = data.conversation_id || conversationId;
+                    setConversationId(data.conversation_id || conversationId);
                     setMemoryState(data.history_turns || 0);
                     addMessage(data.answer, 'assistant', data.model, data);
                     refreshTelemetry();
+                    // A new thread needs a row in the sidebar; an existing one
+                    // needs its position refreshed.
+                    loadConversations();
                 } else {
                     let err = {};
                     try { err = await response.json(); } catch (e) { /* not JSON */ }
@@ -1349,6 +1590,7 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
         loadOptions();
+        restoreConversation();
         updateVendors();
         setInterval(updateVendors, 30000);
 
@@ -1503,6 +1745,37 @@ async def get_run(run_id: str):
         response = await client.get(f"{ORCHESTRATOR_URL}/runs/{run_id}")
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail="No such report")
+        response.raise_for_status()
+        return response.json()
+
+
+@app.get("/api/conversations")
+async def list_conversations(limit: int = 50):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(f"{ORCHESTRATOR_URL}/conversations",
+                                    params={"limit": limit})
+        response.raise_for_status()
+        return response.json()
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"{ORCHESTRATOR_URL}/conversations/{conversation_id}")
+        # A conversation the browser remembers may have been deleted. Say so
+        # plainly so the page can drop the stale id instead of retrying it.
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="No such conversation")
+        response.raise_for_status()
+        return response.json()
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.delete(
+            f"{ORCHESTRATOR_URL}/conversations/{conversation_id}")
         response.raise_for_status()
         return response.json()
 
