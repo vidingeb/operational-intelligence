@@ -413,6 +413,10 @@ REGISTRY = [
        "Objects known to Veeam that have no restore points. Note this cannot prove the "
        "estate is fully protected — a VM never added to a job does not appear at all",
        {"limit": (Int, False, "Max objects (default 200)")}),
+    _t("veeam_protected", "GET", f"{VEEAM_BASE}/veeam/protected",
+       "Every object Veeam knows about and its newest restore point. This is "
+       "Veeam's roster, not the estate — prefer backup_coverage, which compares "
+       "it against the vCenter inventory"),
     _t("veeam_jobs", "GET", f"{VEEAM_BASE}/veeam/jobs",
        "Configured Veeam backup jobs",
        {"limit": (Int, False, "Max jobs (default 100)")}),
@@ -449,6 +453,16 @@ REGISTRY = [
        {"full": ("boolean", False,
                  "Return every record instead of a sample per section.")},
        local="triage_estate"),
+    _t("backup_coverage", "LOCAL", "local://triage/backup-coverage",
+       "Which VMs have no restore point, by comparing the full vCenter inventory "
+       "against everything Veeam protects. Use for 'are we backed up', 'which VMs "
+       "are unprotected', 'do we have a restore point for X' and any backup "
+       "coverage question. Veeam alone cannot answer this: a VM never added to a "
+       "job is absent from its records entirely, so 'no unprotected objects' only "
+       "ever describes the objects already in a job",
+       {"stale_after_hours": (Int, False,
+                              "Age at which a restore point counts as stale (default 48)")},
+       local="backup_coverage"),
     _t("estate_versions", "LOCAL", "local://versions/estate",
        "Software versions across the whole estate in one call: vCenter, every "
        "ESXi host, VCF Operations for Logs, VCF Operations for Networks and "
@@ -624,7 +638,8 @@ the way an experienced engineer does.
   compare it against the full inventory. "0 objects without restore points" out
   of 11 objects, in an estate of 63 VMs, is not a backup pass — the finding is
   the 52 that no backup system has ever heard of. Lead with the gap, not with
-  the zero.
+  the zero. For backup questions this join is done for you: use backup_coverage,
+  never veeam_unprotected alone.
 - Never offer to run a query you have no tool for. Saying "let me know and I
   can run a targeted query" when no such tool exists sounds helpful and is
   untrue. State the limit and stop: "NSX is not integrated, so I cannot read
@@ -1039,6 +1054,97 @@ def _condense(section: Any, keep: int = 5) -> Any:
     return section
 
 
+async def backup_coverage(stale_after_hours: int = 48) -> dict:
+    """Which VMs in vCenter no backup system has ever heard of.
+
+    Veeam can only report on its own roster, so "0 objects without restore
+    points" is a statement about the objects already in a job, not about the
+    estate. The gap between the two lists is the finding, and it is a join
+    across two systems rather than a lookup — done here because a model
+    matching 63 names against 11 by hand will quietly get it wrong.
+    """
+    data = await _gather({
+        "vms": ("vcenter_list_vms", {}),
+        "veeam": ("veeam_protected", {}),
+    })
+    vms, veeam = data["vms"], data["veeam"]
+    failed = [k for k, v in data.items() if isinstance(v, dict) and v.get("error")]
+    if failed:
+        return {
+            "triage_target": "backup coverage",
+            "sections_failed": failed,
+            "guidance": ("Coverage could not be determined because "
+                         + ", ".join(failed) + " failed. An unavailable check is "
+                         "not a passed check — say the estate's backup coverage "
+                         "is unknown, not that it is fine."),
+            **data,
+        }
+
+    vm_rows = vms if isinstance(vms, list) else (vms or {}).get("vms", [])
+    objects = (veeam or {}).get("objects", [])
+
+    def key(name):
+        # Veeam records a VM under its vCenter display name, but case and the
+        # DNS suffix drift between the two inventories.
+        text = (name or "").strip().lower()
+        return text.split(".")[0] or text
+
+    by_key = {}
+    for obj in objects:
+        by_key.setdefault(key(obj.get("name")), obj)
+
+    unprotected, stale, protected_rows = [], [], []
+    for vm in vm_rows:
+        if not isinstance(vm, dict):
+            continue
+        match = by_key.get(key(vm.get("name")))
+        row = {
+            "vm": vm.get("name"),
+            "power_state": vm.get("power_state"),
+            "guest_os": vm.get("guest_os"),
+        }
+        if match is None:
+            row["reason"] = "not present in Veeam at all"
+            unprotected.append(row)
+        elif not match.get("restore_points"):
+            row["reason"] = "known to Veeam but has no restore point"
+            unprotected.append(row)
+        else:
+            age = match.get("newest_restore_point_age_hours")
+            row["newest_restore_point"] = match.get("newest_restore_point")
+            row["age_hours"] = age
+            protected_rows.append(row)
+            if age is not None and age > stale_after_hours:
+                stale.append(row)
+
+    matched = len(protected_rows)
+    return {
+        "triage_target": "backup coverage",
+        "systems_consulted": ["vCenter", "Veeam"],
+        "vms_in_vcenter": len(vm_rows),
+        "objects_known_to_veeam": (veeam or {}).get("objects_known_to_veeam"),
+        "veeam_roster_complete": (veeam or {}).get("complete"),
+        "vms_with_a_restore_point": matched,
+        "vms_without_a_restore_point": len(unprotected),
+        "vms_with_a_stale_restore_point": len(stale),
+        "stale_after_hours": stale_after_hours,
+        "unprotected": unprotected,
+        "stale": stale,
+        "guidance": (
+            "vms_without_a_restore_point is the finding, and it outranks every "
+            "alarm, licence and hygiene item — it means the data is not "
+            "recoverable. Report the count against vms_in_vcenter, list the "
+            "affected VMs by name in a table, and distinguish the two reasons: "
+            "a VM absent from Veeam was never protected at all, whereas one "
+            "present with no restore point means a job is failing. Templates "
+            "and powered-off VMs may be excluded deliberately; say which are "
+            "which rather than treating every row as an incident. If "
+            "veeam_roster_complete is false, Veeam returned only part of its "
+            "roster and the gap may be overstated — say so."
+        ),
+    }
+
+
 async def triage_estate(full: bool = False) -> dict:
     """Estate-wide health sweep across all five systems.
 
@@ -1249,6 +1355,7 @@ LOCAL_HANDLERS = {
     "triage_vm": triage_vm,
     "triage_host": triage_host,
     "triage_estate": triage_estate,
+    "backup_coverage": backup_coverage,
     "estate_versions": estate_versions,
 }
 

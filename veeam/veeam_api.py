@@ -392,6 +392,73 @@ def unprotected(limit: int = Query(200, ge=1, le=500)):
     }
 
 
+def _all_pages(path: str, page_size: int = 200, cap: int = 5000) -> tuple:
+    """Every row from a paged Veeam collection, plus what the server claims.
+
+    Fetching one page and treating it as the whole set is how a coverage check
+    quietly becomes a sample. The reported total is returned alongside the rows
+    so a caller can tell a complete answer from a partial one instead of
+    assuming.
+    """
+    rows, skip, total = [], 0, None
+    while len(rows) < cap:
+        data = request("GET", path, params={"skip": skip, "limit": page_size})
+        if not isinstance(data, dict):
+            page = data if isinstance(data, list) else []
+        else:
+            page = data.get("data", [])
+            pagination = data.get("pagination") or {}
+            if isinstance(pagination, dict) and pagination.get("total") is not None:
+                total = pagination["total"]
+        if not isinstance(page, list) or not page:
+            break
+        rows.extend(page)
+        skip += len(page)
+        if total is not None and len(rows) >= total:
+            break
+        if len(page) < page_size:
+            break
+    return rows, total
+
+
+@app.get("/veeam/protected")
+def protected():
+    """Every object Veeam knows about, with its restore point count.
+
+    /veeam/unprotected answers "which of these have no restore point", which
+    can only ever describe objects already in a job. Answering "is the estate
+    protected" needs the roster itself, so it can be compared against the
+    vCenter inventory.
+    """
+    rows, reported_total = _all_pages("/api/v1/backupObjects")
+    objects = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        newest = r.get("lastRestorePointDate") or r.get("latestRestorePointDate")
+        objects.append({
+            "name": r.get("name"),
+            "type": r.get("type"),
+            "platform": r.get("platformName"),
+            "restore_points": r.get("restorePointsCount") or 0,
+            "newest_restore_point": newest,
+            "newest_restore_point_age_hours": _age_hours(newest),
+        })
+    complete = reported_total is None or len(objects) >= reported_total
+    return {
+        "objects_known_to_veeam": len(objects),
+        "reported_total": reported_total,
+        "complete": complete,
+        "with_restore_points": sum(1 for o in objects if o["restore_points"]),
+        "without_restore_points": sum(1 for o in objects if not o["restore_points"]),
+        "caveat": ("This is Veeam's roster, not the estate. A VM that was never "
+                   "added to a job is absent here, so this list must be compared "
+                   "against the vCenter inventory before calling anything protected."),
+        "api_version": _session["api_version"],
+        "objects": objects,
+    }
+
+
 @app.get("/veeam/version")
 def version():
     """What Veeam build this actually is.
