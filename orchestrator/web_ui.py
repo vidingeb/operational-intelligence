@@ -463,6 +463,9 @@ HTML_PAGE = """<!DOCTYPE html>
         }
         .gpu-dot.busy { animation: pulse 1s ease-in-out infinite; }
         .gpu-dot.stale { background: #888; }
+        .pin-btn { margin-left: 10px; }
+        .pin-btn.is-pinned { border-color: #ffb74d; color: #ffb74d; }
+        .pin-btn.is-busy { opacity: 0.5; cursor: progress; }
         @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
         .usage-bar {
             margin-top: 10px;
@@ -498,6 +501,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <button id="new-chat-btn" class="bar-button" title="Forget the current thread and start fresh">New chat</button>
         <button id="panel-btn" class="bar-button" title="Scheduled questions and stored reports">Schedules &amp; reports</button>
         <span id="gpu-strip" class="gpu-strip"></span>
+        <button id="pin-btn" class="bar-button pin-btn" hidden></button>
     </div>
     <div id="panel" class="panel" hidden>
         <div class="panel-section">
@@ -1549,6 +1553,61 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         refreshTelemetry();
+
+        // --- resident model: pin / unpin --------------------------------------
+        // The inference host has one pool of unified memory and no MIG, so the
+        // pinned assistant model blocks anything else that wants the GPU — an
+        // NVIDIA NIM, say. This releases it without an SSH session to the box.
+
+        const pinBtn = document.getElementById('pin-btn');
+        let pinBusy = false;
+
+        async function refreshPin() {
+            if (pinBusy) return;
+            try {
+                const r = await fetch('/api/memory');
+                if (!r.ok) throw new Error('http ' + r.status);
+                const d = await r.json();
+                pinBtn.hidden = false;
+                pinBtn.classList.toggle('is-pinned', d.pinned);
+                pinBtn.textContent = d.pinned ? 'Unpin' : 'Pin';
+                pinBtn.title = d.pinned
+                    ? d.assistant_model + ' is held in memory (' + d.total_gb +
+                      ' GB). Unpin to free it for other GPU work.'
+                    : d.assistant_model + ' is not resident. Pin to preload it ' +
+                      'and avoid a slow first question.';
+                pinBtn.dataset.pinned = d.pinned ? '1' : '';
+            } catch (e) {
+                pinBtn.hidden = true;   // optional feature; fail quietly
+            }
+        }
+
+        pinBtn.addEventListener('click', async () => {
+            const wasPinned = pinBtn.dataset.pinned === '1';
+            pinBusy = true;
+            pinBtn.classList.add('is-busy');
+            pinBtn.disabled = true;
+            // Pinning reloads the whole model from disk, so this is not instant.
+            pinBtn.textContent = wasPinned ? 'Freeing\u2026' : 'Loading\u2026';
+            try {
+                const r = await fetch(wasPinned ? '/api/memory/unpin' : '/api/memory/pin',
+                                      { method: 'POST' });
+                const d = await r.json();
+                if (!r.ok) throw new Error(d.detail || 'failed');
+                pinBtn.title = (wasPinned ? 'Freed' : 'Pinned') + ' in ' + d.seconds + 's';
+            } catch (e) {
+                pinBtn.title = 'Failed: ' + e.message;
+            }
+            pinBusy = false;
+            pinBtn.classList.remove('is-busy');
+            pinBtn.disabled = false;
+            refreshPin();
+            refreshTelemetry();
+        });
+
+        refreshPin();
+        setInterval(refreshPin, 15000);
+
         // Both dropdowns are filled from the orchestrator rather than hardcoded.
         // The model list used to live in this file, which is why a model
         // installed on the host never showed up here.
@@ -1864,6 +1923,42 @@ async def telemetry():
             return response.json()
     except Exception as exc:
         return {"enabled": False, "error": str(exc)}
+
+
+@app.get("/api/memory")
+async def memory_status():
+    """Which models are resident on the inference host."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{ORCHESTRATOR_URL}/memory")
+            if response.status_code >= 400:
+                detail = response.json().get("detail", response.text)
+                raise HTTPException(status_code=response.status_code, detail=detail)
+            return response.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@app.post("/api/memory/{action}")
+async def memory_action(action: str):
+    """Pin or unpin the assistant model on the inference host."""
+    if action not in ("pin", "unpin"):
+        raise HTTPException(status_code=404, detail="expected pin or unpin")
+    try:
+        # Pinning reloads the model from disk, so allow the same generous
+        # window the orchestrator uses rather than timing out mid-load.
+        async with httpx.AsyncClient(timeout=900.0) as client:
+            response = await client.post(f"{ORCHESTRATOR_URL}/memory/{action}")
+            if response.status_code >= 400:
+                detail = response.json().get("detail", response.text)
+                raise HTTPException(status_code=response.status_code, detail=detail)
+            return response.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 if __name__ == "__main__":

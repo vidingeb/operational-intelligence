@@ -1910,6 +1910,85 @@ async def telemetry():
     return {"enabled": True, **await fetch_telemetry()}
 
 
+# --- Resident model memory ---------------------------------------------
+# The GB10 has one pool of unified memory and no MIG, so a pinned model
+# blocks anything else wanting the GPU — an NVIDIA NIM, say. Ollama takes a
+# per-request keep_alive that overrides its service default, so the model
+# can be released and restored without touching systemd on the inference
+# host. A request carrying no prompt loads or evicts without generating.
+
+ASSISTANT_MODEL = os.getenv("ASSISTANT_MODEL", DEFAULT_MODEL)
+
+
+async def _set_keep_alive(model: str, keep_alive) -> None:
+    # Pinning reloads the whole model from disk; on a 120B that is tens of
+    # seconds, so this timeout is deliberately generous.
+    async with httpx.AsyncClient(timeout=900.0) as client:
+        response = await client.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": model, "keep_alive": keep_alive},
+        )
+        response.raise_for_status()
+
+
+@app.get("/memory")
+async def memory_status():
+    """Which models are resident on the inference host, and how large."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{OLLAMA_URL}/api/ps")
+            response.raise_for_status()
+            models = response.json().get("models") or []
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot reach Ollama at {OLLAMA_URL}: {exc}",
+        )
+
+    return {
+        "assistant_model": ASSISTANT_MODEL,
+        "pinned": any(m.get("name") == ASSISTANT_MODEL for m in models),
+        "total_gb": round(sum(m.get("size") or 0 for m in models) / 1024**3, 1),
+        "models": [
+            {
+                "name": m.get("name"),
+                "size_gb": round((m.get("size") or 0) / 1024**3, 1),
+                "expires_at": m.get("expires_at"),
+            }
+            for m in models
+        ],
+    }
+
+
+@app.post("/memory/pin")
+async def memory_pin():
+    """Load the assistant model and hold it resident indefinitely."""
+    started = time.monotonic()
+    try:
+        await _set_keep_alive(ASSISTANT_MODEL, -1)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not pin {ASSISTANT_MODEL} — is something else "
+                   f"holding the memory? ({exc})",
+        )
+    return {"pinned": ASSISTANT_MODEL, "seconds": round(time.monotonic() - started, 1)}
+
+
+@app.post("/memory/unpin")
+async def memory_unpin():
+    """Evict the assistant model now, freeing its memory for other work."""
+    started = time.monotonic()
+    try:
+        await _set_keep_alive(ASSISTANT_MODEL, 0)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not unpin {ASSISTANT_MODEL}: {exc}",
+        )
+    return {"unpinned": ASSISTANT_MODEL, "seconds": round(time.monotonic() - started, 1)}
+
+
 @app.get("/models")
 async def list_models():
     """List models, marking which are installed on the configured host."""
