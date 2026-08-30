@@ -163,8 +163,8 @@ HTML_PAGE = """<!DOCTYPE html>
         <span class="badge">100% On-Premises</span>
     </header>
     <div class="info-bar">
-        <span>LLM: 10.0.0.141 (Ollama)</span>
-        <span>APIs: 10.0.0.140 (MCP Server)</span>
+        <span>LLM: 192.0.2.141 (Ollama)</span>
+        <span>APIs: 192.0.2.140 (MCP Server)</span>
         <span id="timer"></span>
     </div>
     <div id="chat-container">

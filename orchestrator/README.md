@@ -6,10 +6,20 @@ A local LLM-powered orchestrator that routes natural-language questions to your 
 
 ```
 User → Orchestrator (port 8090) → Ollama (local LLM, port 11434)
-                                 → vCenter API (10.0.0.140:8080)
-                                 → VCF Operations API (10.0.0.140:8081)
-                                 → VCF Networks API (10.0.0.140:8082)
+                                 → vCenter API (192.0.2.140:8080)
+                                 → VCF Operations API (192.0.2.140:8081)
+                                 → VCF Networks API (192.0.2.140:8082)
 ```
+
+Addresses in this repo use the [RFC 5737](https://datatracker.ietf.org/doc/html/rfc5737)
+documentation range (`192.0.2.0/24`). They are placeholders, not a real deployment —
+point `MCP_SERVER` at your own host.
+
+## Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MCP_SERVER` | `http://192.0.2.140` | Base URL of the MCP server exposing the vCenter, VCF Operations and VCF Networks APIs on ports 8080-8082. |
 
 ## Setup
 
@@ -20,7 +30,8 @@ tdnf install -y python3 python3-pip
 # Install dependencies
 pip3 install -r requirements.txt
 
-# Run the orchestrator
+# Run the orchestrator (point it at your MCP server)
+export MCP_SERVER="http://your-mcp-host"
 python3 orchestrator.py
 ```
 

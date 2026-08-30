@@ -2,9 +2,13 @@
 On-prem AI Orchestrator — routes natural-language questions to vCenter,
 VCF Operations, and VCF Networks APIs via a local Ollama LLM.
 
-Runs on the LLM VM (10.0.0.141) and calls APIs on the MCP server (10.0.0.140).
+Runs on the LLM VM and calls APIs on the MCP server.
+
+Addresses below use the RFC 5737 documentation range (192.0.2.0/24). Set the
+MCP_SERVER environment variable to point at your own host.
 """
 
+import os
 import json
 import httpx
 import asyncio
@@ -15,7 +19,7 @@ app = FastAPI(title="On-Prem AI Orchestrator", version="1.0")
 
 # Configuration
 OLLAMA_URL = "http://localhost:11434"
-MCP_SERVER = "http://10.0.0.140"
+MCP_SERVER = os.environ.get("MCP_SERVER", "http://192.0.2.140")
 DEFAULT_MODEL = "llama3.1:8b"
 
 AVAILABLE_MODELS = {
