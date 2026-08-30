@@ -32,7 +32,7 @@ environment set behaves exactly as before.
 | Variable | Default | Purpose |
 |---|---|---|
 | `OLLAMA_URL` | `http://localhost:11434` | Inference endpoint |
-| `MCP_SERVER` | `http://10.0.0.140` | Base URL of the three APIs |
+| `MCP_SERVER` | `http://10.0.0.140` | Base URL of the five APIs |
 | `DEFAULT_MODEL` | `llama3.1:8b` | Model used when the request omits one |
 | `OLLAMA_TIMEOUT` | per-model | Seconds; overrides the built-in ceiling |
 | `ORCHESTRATOR_URL` | `http://localhost:8090` | Used by `web_ui.py` only |
@@ -40,6 +40,74 @@ environment set behaves exactly as before.
 | `HISTORY_TURNS` | `6` | Prior exchanges replayed into a follow-up question |
 | `SCHEDULER_ENABLED` | `true` | Set false to run without the schedule runner |
 | `SCHEDULER_TICK` | `30` | Seconds between checks for a due schedule |
+| `UI_BIND` | `127.0.0.1` | Interface `web_ui.py` listens on |
+| `UI_AUTH` | `tailscale` | `tailscale` or `none`; any other value refuses to start |
+| `UI_ALLOWED_LOGINS` | *(empty)* | Comma-separated logins; empty means any tailnet user |
+| `ORCHESTRATOR_BIND` | `127.0.0.1` | Interface `orchestrator.py` listens on |
+
+## Access control
+
+The tailnet limits *which machines* can connect. It says nothing about *who*
+is at the keyboard, and until recently neither did the application: anything
+that could open a socket to :8091 got a chat box wired to five production
+systems, and :8090 answered all 72 tools with no check at all.
+
+`tailscale serve` terminates TLS and injects the caller's identity:
+
+```
+Tailscale-User-Login: someone@example.com
+Tailscale-User-Name:  Some One
+```
+
+Two properties make this usable, both verified against a running `serve`
+rather than taken from the documentation:
+
+- A client that sets `Tailscale-User-Login` itself has it **overwritten** on
+  the way through the proxy.
+- The same forged header sent **directly** to :8091 arrives untouched.
+
+So the header is only trustworthy on the proxied path. That is why identity
+alone is not enough, and why the peer address must also be loopback:
+
+| Layer | Question answered | Guarantee |
+|---|---|---|
+| Loopback bind | *Did this arrive via the local proxy?* | Network — check it with `ss -lntp` |
+| Identity header | *Who sent it?* | Tailscale — only meaningful given the above |
+
+Startup **refuses** `UI_AUTH=tailscale` with a non-loopback `UI_BIND`, because
+that combination looks protected and is not: anyone who can reach the port can
+supply their own header. The check is enforced as middleware over every route,
+so a new endpoint cannot forget it.
+
+`serve` must therefore target loopback. Confirm before restarting:
+
+```bash
+tailscale serve status     # expect: |-- / proxy http://127.0.0.1:8091
+```
+
+To restrict further, name the accounts:
+
+```
+Environment=UI_ALLOWED_LOGINS=you@example.com,colleague@example.com
+```
+
+Falling back to the previous behaviour is `UI_AUTH=none UI_BIND=0.0.0.0`.
+
+### If you launch it with the uvicorn CLI
+
+`web_ui.py` must run as `python3 web_ui.py`. Its `__main__` sets
+`proxy_headers=False` deliberately. Under uvicorn's defaults, `X-Forwarded-For`
+rewrites `request.client.host`, so behind a real proxy the peer becomes the
+*caller's* tailnet address rather than `127.0.0.1` — and every legitimate
+request is refused. Unit tests do not catch this, because Starlette's
+`TestClient` never runs that middleware. Launching via the CLI instead needs:
+
+```bash
+uvicorn web_ui:app --host 127.0.0.1 --port 8091 --no-proxy-headers
+```
+
+A request whose peer address has been rewritten this way returns a 403 that
+names the cause, rather than a bare refusal.
 
 ## Split-site deployment (remote inference)
 
@@ -124,6 +192,15 @@ code actually deployed, ask the page for something the new version serves:
 
 ```bash
 curl -s http://localhost:8090/schedules | head -c 200
+```
+
+Auth is worth confirming from the outside as well as the inside, because the
+two paths are supposed to behave differently:
+
+```bash
+curl -s https://<host>.ts.net/api/whoami        # 200, and your own login
+curl -s http://localhost:8091/api/whoami        # 403 — no identity on this path
+ss -lntp | grep -E '809[01]'                    # both should show 127.0.0.1, not *
 ```
 
 ## Memory and scheduled reports
