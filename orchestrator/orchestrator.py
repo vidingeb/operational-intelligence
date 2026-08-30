@@ -2197,4 +2197,9 @@ async def get_single_run(run_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8090)
+    # Loopback by default. This API has no authentication of its own and every
+    # tool on it reaches a production system, so the UI in front of it enforcing
+    # identity is worth nothing if this port is open on the LAN beside it.
+    bind = os.getenv("ORCHESTRATOR_BIND", "127.0.0.1")
+    print(f"[orchestrator] bind={bind}:8090 tools={len(TOOLS)}")
+    uvicorn.run(app, host=bind, port=8090)

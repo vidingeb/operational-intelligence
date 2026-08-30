@@ -116,7 +116,14 @@ def test_a_deleted_conversation_is_dropped_rather_than_retried():
 @pytest.fixture
 def client(monkeypatch):
     from fastapi.testclient import TestClient
-    return TestClient(web_ui.app)
+    # Present the identity the Tailscale proxy would inject, so these tests
+    # exercise the real stack including the auth middleware rather than
+    # routing around it.
+    return TestClient(
+        web_ui.app,
+        client=("127.0.0.1", 51000),
+        headers={"Tailscale-User-Login": "vidingeb@github"},
+    )
 
 
 class _Response:

@@ -3,14 +3,110 @@ Simple chat web UI for the On-Prem AI Orchestrator.
 Serves a single-page chat interface on port 8091.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 import os
 import httpx
 
 app = FastAPI(title="On-Prem AI Chat")
 
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8090").rstrip("/")
+
+# --- Authentication -----------------------------------------------------------
+#
+# The tailnet is a network control, not an identity one: it says which machines
+# can open a socket, not who is driving. This adds the identity half using the
+# headers `tailscale serve` injects on every proxied request.
+#
+# Two facts make that safe, both verified rather than assumed:
+#   1. Tailscale *overwrites* these headers. A client that sends its own
+#      Tailscale-User-Login through the proxy gets the real one instead.
+#   2. The proxy connects over loopback, so a request arriving from anywhere
+#      else did not pass through it and its headers are attacker-controlled.
+#
+# Hence the two rules below. The loopback check is what stops the whole scheme
+# from being bypassed by binding the app to 0.0.0.0 and setting the header by
+# hand -- which is exactly how header-based auth is usually broken.
+UI_BIND = os.getenv("UI_BIND", "127.0.0.1")
+UI_AUTH = os.getenv("UI_AUTH", "tailscale").strip().lower()
+LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# Empty means "any user on the tailnet". Set it to lock the UI to named logins.
+UI_ALLOWED_LOGINS = frozenset(
+    entry.strip().lower()
+    for entry in os.getenv("UI_ALLOWED_LOGINS", "").split(",")
+    if entry.strip()
+)
+
+IDENTITY_HEADER = "tailscale-user-login"
+NAME_HEADER = "tailscale-user-name"
+
+
+def _denied(reason: str) -> JSONResponse:
+    """Say which check failed, without leaking who is allowed."""
+    return JSONResponse(status_code=403, content={"detail": reason})
+
+
+def _peer_problem(client_host, forwarded) -> str | None:
+    """Why this peer cannot be trusted, or None if it can.
+
+    Uvicorn rewrites the peer address from X-Forwarded-For by default, which
+    turns a loopback proxy connection into a tailnet address and would refuse
+    every legitimate request. That failure is safe but baffling, so name it.
+    """
+    if client_host in LOOPBACK:
+        return None
+    if forwarded:
+        return (
+            f"Refusing a request whose peer address ({client_host}) came from "
+            "a forwarded header. Run this service with proxy headers disabled "
+            "(python web_ui.py, or uvicorn --no-proxy-headers) so the real "
+            "peer is visible."
+        )
+    return (
+        "This service is only reachable through Tailscale. "
+        f"Direct connections are refused (saw {client_host})."
+    )
+
+
+@app.middleware("http")
+async def require_identity(request: Request, call_next):
+    """Reject anything that did not arrive through the Tailscale proxy."""
+    if UI_AUTH == "none":
+        request.state.user = "anonymous"
+        return await call_next(request)
+
+    problem = _peer_problem(
+        request.client.host if request.client else None,
+        request.headers.get("x-forwarded-for"),
+    )
+    if problem:
+        # Not via the local proxy, so any identity header on it is forged.
+        return _denied(problem)
+
+    login = (request.headers.get(IDENTITY_HEADER) or "").strip().lower()
+    if not login:
+        return _denied(
+            "No Tailscale identity on this request. Reach the UI through its "
+            "tailnet URL rather than localhost."
+        )
+    if UI_ALLOWED_LOGINS and login not in UI_ALLOWED_LOGINS:
+        return _denied(f"{login} is not permitted to use this service.")
+
+    request.state.user = login
+    return await call_next(request)
+
+
+@app.get("/api/whoami")
+async def whoami(request: Request):
+    """Who the proxy says is driving, for the header bar."""
+    return {
+        "login": getattr(request.state, "user", "anonymous"),
+        "name": request.headers.get(NAME_HEADER) or "",
+        "auth": UI_AUTH,
+        "restricted": bool(UI_ALLOWED_LOGINS),
+    }
+
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -284,6 +380,7 @@ HTML_PAGE = """<!DOCTYPE html>
         .bar-button:hover { background: #17518f; }
         .bar-button:disabled { opacity: 0.5; cursor: default; }
         .memory-state { color: #9fb3c8; font-style: italic; }
+        .whoami { color: #7fd4a0; font-size: 0.75rem; margin-left: 0.4rem; }
         .panel {
             background: #16213e;
             border-bottom: 1px solid #0f3460;
@@ -501,6 +598,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <button id="new-chat-btn" class="bar-button" title="Forget the current thread and start fresh">New chat</button>
         <button id="panel-btn" class="bar-button" title="Scheduled questions and stored reports">Schedules &amp; reports</button>
         <span id="gpu-strip" class="gpu-strip"></span>
+        <span id="whoami" class="whoami" title="Identity supplied by Tailscale"></span>
         <button id="pin-btn" class="bar-button pin-btn" hidden></button>
     </div>
     <div id="panel" class="panel" hidden>
@@ -1648,7 +1746,29 @@ HTML_PAGE = """<!DOCTYPE html>
                 scopeSelect.innerHTML = '<option value="all">All systems</option>';
             }
         }
+        async function loadWhoami() {
+            // Identity comes from the proxy, never from the page, so this is a
+            // display of who the server decided you are - not a claim by the
+            // browser about who it would like to be.
+            const el = document.getElementById('whoami');
+            try {
+                const res = await fetch('/api/whoami');
+                if (!res.ok) return;
+                const who = await res.json();
+                if (who.auth === 'none') {
+                    el.textContent = 'unauthenticated';
+                    el.style.color = '#e0894a';
+                    el.title = 'UI_AUTH=none - anyone who can reach this port can use it';
+                    return;
+                }
+                el.textContent = who.name || who.login;
+                el.title = 'Signed in as ' + who.login + ' (verified by Tailscale)';
+            } catch (e) {
+                /* the header bar must never be the reason the page fails */
+            }
+        }
         loadOptions();
+        loadWhoami();
         restoreConversation();
         updateVendors();
         setInterval(updateVendors, 30000);
@@ -1963,4 +2083,18 @@ async def memory_action(action: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8091)
+    # Loopback by default. The Tailscale proxy reaches it over loopback, and
+    # anything that cannot is not supposed to be talking to this service.
+    if UI_AUTH != "none" and UI_BIND not in LOOPBACK:
+        raise SystemExit(
+            f"Refusing to start: UI_AUTH={UI_AUTH} trusts the identity headers "
+            f"the local proxy injects, but UI_BIND={UI_BIND} accepts direct "
+            "connections that can set those headers themselves. Bind to "
+            "127.0.0.1, or set UI_AUTH=none and accept an open UI."
+        )
+    print(f"[web_ui] auth={UI_AUTH} bind={UI_BIND}:8091 "
+          f"allowed={sorted(UI_ALLOWED_LOGINS) or 'any tailnet user'}")
+    # proxy_headers=False on purpose: with it on, uvicorn rewrites the peer
+    # address from X-Forwarded-For, and the peer address is the one thing here
+    # that must not be attacker-supplied.
+    uvicorn.run(app, host=UI_BIND, port=8091, proxy_headers=False)
