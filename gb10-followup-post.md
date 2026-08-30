@@ -12,6 +12,8 @@ The short version: I pointed the warm model at my VMware datacenter through a re
 
 Nobody had been careless. The backup tool had been reporting *zero unprotected objects* for months, and it was telling the truth.
 
+One thing to state plainly up front, because it changes how you should read the rest: **this is a lab.** A full VCF stack — vCenter, NSX, Operations, Log Insight, Veeam — built to mirror a real datacenter, but nothing on it is a workload anyone would miss. That's deliberate; it's what makes it safe to point an LLM at. So the interesting finding here isn't *"52 machines are one failure away from gone"*. It's that four monitoring systems reported everything fine, and a plainly-worded question found otherwise in about ninety seconds — and that method transfers to somewhere the answer would actually hurt.
+
 ![The assistant answering against the live datacenter — five APIs in the header, conversation history down the left, GPU telemetry and the model pin control on the right](assets/assistant-ui.png)
 
 ---
@@ -132,9 +134,9 @@ The first article ended promising more scheduled jobs. This is that, plus the un
 **Answers leave the browser.** Nobody's decision-maker is going to read a chat transcript.
 
 - Every table the model produces gets a **Download CSV** button — UTF-8 with a BOM so Excel doesn't mangle it, markdown emphasis stripped so a cell reads `Low (degradation)` rather than `**Low** (degradation)`.
-- **Export PDF** opens a clean print view and calls the browser's own PDF writer. No PDF library, deliberately: a box that talks to five production systems should not be pulling a vendored megabyte off a CDN to print a report. The print stylesheet hides the UI chrome, repeats table headers across pages, avoids splitting rows, and stamps the output with the question asked, the model, the timestamp, and *source: live datacenter APIs, read-only* — because a table in a PDF with no provenance is just a claim.
+- **Export PDF** opens a clean print view and calls the browser's own PDF writer. No PDF library, deliberately: a box that talks to five live systems should not be pulling a vendored megabyte off a CDN to print a report. The print stylesheet hides the UI chrome, repeats table headers across pages, avoids splitting rows, and stamps the output with the question asked, the model, the timestamp, and *source: live datacenter APIs, read-only* — because a table in a PDF with no provenance is just a claim.
 
-**And it runs without me.** Schedules are hourly, daily or weekly, all in UTC — a report that shifts by an hour twice a year is a bug nobody notices until the reports have been wrong for months. Runs are stored with their answer, the tools called, and the token usage, and due jobs fire strictly one at a time — three tool-calling runs hitting five production APIs at once is a self-inflicted load test.
+**And it runs without me.** Schedules are hourly, daily or weekly, all in UTC — a report that shifts by an hour twice a year is a bug nobody notices until the reports have been wrong for months. Runs are stored with their answer, the tools called, and the token usage, and due jobs fire strictly one at a time — three tool-calling runs hitting five APIs at once is a self-inflicted load test.
 
 Four decisions in there are worth more than the feature itself:
 
@@ -208,7 +210,7 @@ The demo was not backing itself up.
 
 Everything above runs behind a tailnet, and for a while I treated that as the security story. It isn't. A tailnet answers *which machines can connect*. It says nothing about *who is at the keyboard* — and those are different questions the moment a device is shared, borrowed, or left unlocked.
 
-What was actually sitting there was a chat box wired to five production systems, answering anyone who could open a socket to it, with an API beside it on another port that would run all 72 tools without so much as asking a name.
+What was actually sitting there was a chat box wired to five infrastructure systems, answering anyone who could open a socket to it, with an API beside it on another port that would run all 72 tools without so much as asking a name.
 
 The fix turns out to be almost free, because `tailscale serve` already knows who you are. It terminates TLS and adds the caller's identity to every request it forwards:
 
@@ -243,7 +245,7 @@ I wrote thirteen tests. All thirteen passed. The implementation would have locke
 
 Uvicorn, by default, honours `X-Forwarded-For` from a local proxy and rewrites the recorded peer address to the *original* caller. Perfectly sensible — it's how you get real client IPs in your logs. But it means that behind `tailscale serve`, the peer my code inspected wasn't `127.0.0.1`. It was the tailnet address of whoever was asking. My loopback check would have rejected **every legitimate request**, including mine, on a service reachable only remotely.
 
-The tests didn't catch it because the test client doesn't run that middleware. They were exercising a stack that doesn't exist in production, and reporting green on it.
+The tests didn't catch it because the test client doesn't run that middleware. They were exercising a stack that doesn't exist in the deployed service, and reporting green on it.
 
 I only found it by running the real thing behind a real proxy before shipping. The bind now disables that rewrite deliberately, and a request whose peer address has been rewritten returns a 403 that names the cause — because the next person to hit this deserves better than a blank refusal.
 
@@ -258,7 +260,7 @@ Every serious problem in this project has been the same problem wearing differen
 - The chat pane said memory was working. The server's memory *was* working perfectly — the browser was starting a new conversation on every reload, because the id lived in a JavaScript variable that a refresh threw away. The comment above that variable claimed a reload picked the thread back up. It never had.
 - My own web UI returned a blank `500`. The orchestrator had sent a precise explanation; `raise_for_status()` in the proxy threw it away and substituted nothing. The one fact needed to diagnose the fault was being destroyed at the last hop.
 - Tailscale showed my laptop **online, healthy, key valid, zero warnings** — and zero peers, because I'd tagged the machine. Tagging transfers ownership from the user to the tag, so every policy rule keyed to "me" stopped matching. A node in perfect health that could see nothing.
-- And then my own test suite did it to me. Thirteen tests, all green, on authentication that would have refused every real request. They were testing a stack that doesn't exist in production.
+- And then my own test suite did it to me. Thirteen tests, all green, on authentication that would have refused every real request. They were testing a stack that doesn't exist outside the test suite.
 
 None of these were subtle once seen. All of them presented as a green light.
 
@@ -288,11 +290,11 @@ The habit that catches them isn't cleverness, it's refusing to accept a status a
 
 Being honest about the ragged edges, since the interesting part of a homelab writeup is usually the part still on fire:
 
-- **26 production VMs still have no backup.** Finding it was the easy half.
+- **26 real workloads still have no backup.** Lab workloads, so nothing is at stake here — but the fix is as unglamorous as the finding was easy, and it still isn't done.
 - **The datacenter's own alerting is louder than its worst problem.** VCF Operations is carrying 99 active alerts. A red "Backup job status" alarm has been showing since April. When everything is red, nothing is.
-- **No authorisation, only authentication.** The UI now knows who you are and can be restricted to named accounts, but everyone who gets in gets the same 72 tools. There's no reason a read-only viewer should be able to trigger a scheduled report.
+- **No authorisation, only authentication.** The UI now knows who you are and can be restricted to named accounts, but everyone who gets in gets the same 72 tools. Fine for a proof of concept in a lab; not fine anywhere real, where a read-only viewer has no business triggering a scheduled report against live infrastructure. Roles are the obvious next step, and the tools are already grouped by scope, so the seam is there.
 - **The Veeam service account is an administrator.** It should be a read-only account, and the fact that everything it does is read-only by convention is not the same as by permission.
-- **The access path needs sign-off.** A personal tailnet terminating on a work VM that reaches five production systems is a conversation to have with your employer *before* you build it, not after. I'm having it.
+- **The access path needs sign-off.** A personal tailnet terminating on a work VM that reaches five infrastructure systems is a conversation to have with your employer *before* you build it, not after. I'm having it.
 
 ---
 
