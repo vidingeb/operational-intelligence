@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "orchestrator"))
 import web_ui  # noqa: E402
 
 PROXY = ("127.0.0.1", 51000)          # how tailscale serve appears
-LAN = ("10.0.0.55", 51000)            # a machine on the datacenter LAN
+LAN = ("192.0.2.55", 51000)           # a machine on the datacenter LAN (TEST-NET-1)
 IDENT = {"Tailscale-User-Login": "vidingeb@github",
          "Tailscale-User-Name": "vidingeb"}
 
@@ -58,7 +58,7 @@ def test_forged_header_from_off_box_is_refused():
     """The whole point: a LAN peer setting the header itself gets nothing."""
     res = client(peer=LAN).get("/api/whoami", headers=IDENT)
     assert res.status_code == 403
-    assert "10.0.0.55" in res.json()["detail"]
+    assert "192.0.2.55" in res.json()["detail"]
 
 
 def test_a_rewritten_peer_address_is_diagnosed_not_silently_refused():
@@ -66,12 +66,13 @@ def test_a_rewritten_peer_address_is_diagnosed_not_silently_refused():
 
     Behind a real `tailscale serve` that turns 127.0.0.1 into the caller's
     tailnet address, which refuses every legitimate request. Verified against
-    live serve: client_host became 100.121.49.46 with default uvicorn flags.
+    live serve: client_host became the caller's 100.64.0.0/10 tailnet address
+    with default uvicorn flags.
     The request must still fail -- a forwarded address proves nothing -- but
     the reason has to point at the misconfiguration.
     """
-    res = client(peer=("100.121.49.46", 51000)).get(
-        "/api/whoami", headers={**IDENT, "X-Forwarded-For": "100.121.49.46"})
+    res = client(peer=("100.64.0.46", 51000)).get(
+        "/api/whoami", headers={**IDENT, "X-Forwarded-For": "100.64.0.46"})
     assert res.status_code == 403
     assert "proxy headers" in res.json()["detail"].lower()
 

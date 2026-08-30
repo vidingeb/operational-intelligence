@@ -17,7 +17,7 @@ Two GB10-specific details drive the implementation:
 
 Bind to the tailnet address only. There is no authentication here.
 
-    python3 telemetry.py --host 100.85.206.58 --port 9101
+    python3 telemetry.py --host <this-node's-tailnet-ip> --port 9101
 """
 
 import argparse
