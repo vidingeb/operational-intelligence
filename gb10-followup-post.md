@@ -204,6 +204,51 @@ The demo was not backing itself up.
 
 ---
 
+## Who is actually asking?
+
+Everything above runs behind a tailnet, and for a while I treated that as the security story. It isn't. A tailnet answers *which machines can connect*. It says nothing about *who is at the keyboard* — and those are different questions the moment a device is shared, borrowed, or left unlocked.
+
+What was actually sitting there was a chat box wired to five production systems, answering anyone who could open a socket to it, with an API beside it on another port that would run all 72 tools without so much as asking a name.
+
+The fix turns out to be almost free, because `tailscale serve` already knows who you are. It terminates TLS and adds the caller's identity to every request it forwards:
+
+```
+Tailscale-User-Login: someone@example.com
+Tailscale-User-Name:  Some One
+```
+
+The obvious worry is that a header is the easiest thing in the world to fake. So I tested it rather than trusting it, and the result is the part worth internalising:
+
+| Path | Forged `Tailscale-User-Login` |
+|---|---|
+| Through `tailscale serve` | **Overwritten** with your real identity |
+| Straight to the app's port | **Passes through untouched** |
+
+The header isn't trustworthy. *The header on the proxied path* is trustworthy. That distinction is the entire design, because it means the header is worthless on its own — you also need certainty about which path the request took.
+
+That certainty is a network property, not an application one: bind the service to `127.0.0.1`, and the only thing that can connect is the proxy on the same machine. So the two checks answer two different questions, and neither is sufficient alone.
+
+| Layer | Answers | Guaranteed by |
+|---|---|---|
+| Loopback bind | *Did this come via the proxy?* | The kernel — you can see it in `ss -lntp` |
+| Identity header | *Who sent it?* | Tailscale — only meaningful given the row above |
+
+Which is why the service now refuses to start if you ask for identity checking while bound to `0.0.0.0`. That combination isn't half-secure, it's decorative — anyone who can reach the port supplies their own name — and a configuration that *looks* protected is worse than one that obviously isn't.
+
+You can watch both halves work from opposite directions. Through the tailnet URL, `/api/whoami` returns my login. From a root shell on the box itself, a foot away from the process, the same request is refused — because a local shell can't produce an identity, and can't forge one, since the only path that sets that header overwrites whatever you send.
+
+### The bit that nearly locked me out
+
+I wrote thirteen tests. All thirteen passed. The implementation would have locked me out of my own datacenter completely.
+
+Uvicorn, by default, honours `X-Forwarded-For` from a local proxy and rewrites the recorded peer address to the *original* caller. Perfectly sensible — it's how you get real client IPs in your logs. But it means that behind `tailscale serve`, the peer my code inspected wasn't `127.0.0.1`. It was the tailnet address of whoever was asking. My loopback check would have rejected **every legitimate request**, including mine, on a service reachable only remotely.
+
+The tests didn't catch it because the test client doesn't run that middleware. They were exercising a stack that doesn't exist in production, and reporting green on it.
+
+I only found it by running the real thing behind a real proxy before shipping. The bind now disables that rewrite deliberately, and a request whose peer address has been rewritten returns a 403 that names the cause — because the next person to hit this deserves better than a blank refusal.
+
+---
+
 ## The pattern underneath all of it
 
 Every serious problem in this project has been the same problem wearing different clothes: **something reported success for a thing it never checked.**
@@ -213,6 +258,7 @@ Every serious problem in this project has been the same problem wearing differen
 - The chat pane said memory was working. The server's memory *was* working perfectly — the browser was starting a new conversation on every reload, because the id lived in a JavaScript variable that a refresh threw away. The comment above that variable claimed a reload picked the thread back up. It never had.
 - My own web UI returned a blank `500`. The orchestrator had sent a precise explanation; `raise_for_status()` in the proxy threw it away and substituted nothing. The one fact needed to diagnose the fault was being destroyed at the last hop.
 - Tailscale showed my laptop **online, healthy, key valid, zero warnings** — and zero peers, because I'd tagged the machine. Tagging transfers ownership from the user to the tag, so every policy rule keyed to "me" stopped matching. A node in perfect health that could see nothing.
+- And then my own test suite did it to me. Thirteen tests, all green, on authentication that would have refused every real request. They were testing a stack that doesn't exist in production.
 
 None of these were subtle once seen. All of them presented as a green light.
 
@@ -234,6 +280,8 @@ The habit that catches them isn't cleverness, it's refusing to accept a status a
 
 **Tagged nodes have key expiry disabled.** That's the right property for an unattended server and the wrong one for a laptop. Tag the boxes in the cupboard, not the thing in your bag.
 
+**Your web framework may rewrite the client's IP address behind your back.** Uvicorn trusts `X-Forwarded-For` from a local proxy by default and rewrites the peer address to match. If any security decision you make depends on the connection coming from localhost, that default silently inverts it — and your tests won't tell you, because test clients skip the middleware that does it.
+
 ---
 
 ## What's still unresolved
@@ -242,7 +290,7 @@ Being honest about the ragged edges, since the interesting part of a homelab wri
 
 - **26 production VMs still have no backup.** Finding it was the easy half.
 - **The datacenter's own alerting is louder than its worst problem.** VCF Operations is carrying 99 active alerts. A red "Backup job status" alarm has been showing since April. When everything is red, nothing is.
-- **No authentication on the web UI.** It's tailnet-only, which is a network control, not an identity one.
+- **No authorisation, only authentication.** The UI now knows who you are and can be restricted to named accounts, but everyone who gets in gets the same 72 tools. There's no reason a read-only viewer should be able to trigger a scheduled report.
 - **The Veeam service account is an administrator.** It should be a read-only account, and the fact that everything it does is read-only by convention is not the same as by permission.
 - **The access path needs sign-off.** A personal tailnet terminating on a work VM that reaches five production systems is a conversation to have with your employer *before* you build it, not after. I'm having it.
 
