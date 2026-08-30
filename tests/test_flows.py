@@ -47,8 +47,8 @@ def make_flow(idx, traffic_type, src_vm, dst_vm=None):
     flow = {
         "entity_id": f"10000:515:{idx}",
         "name": f"flow-{idx}",
-        "source_ip": {"ip_address": f"10.0.0.{idx}"},
-        "destination_ip": {"ip_address": "8.8.8.8" if dst_vm is None else "10.0.0.99"},
+        "source_ip": {"ip_address": f"192.0.2.{idx}"},
+        "destination_ip": {"ip_address": "8.8.8.8" if dst_vm is None else "192.0.2.99"},
         "port": {"start": 443, "display": "443", "iana_port_display": "443 [https]"},
         "protocol": "TCP",
         "traffic_type": traffic_type,
@@ -82,7 +82,7 @@ def test_flow_record_uses_real_field_names():
     rec = m.flow_record(make_flow(1, "EAST_WEST_TRAFFIC", "rhel9-ipxe", dst_vm="adc01"))
     assert rec["source_vm"] == "rhel9-ipxe"
     assert rec["destination_vm"] == "adc01"
-    assert rec["source_ip"] == "10.0.0.1"
+    assert rec["source_ip"] == "192.0.2.1"
     assert rec["protocol"] == "TCP"
     assert rec["traffic_type"] == "EAST_WEST_TRAFFIC"
     assert rec["port"] == "443 [https]"

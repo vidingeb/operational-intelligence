@@ -451,7 +451,7 @@ def resolve_ip(name: str) -> str:
     entity_id = results[0].get("entity_id")
     detail = client.request("GET", f"/api/ni/entities/vms/{quote(str(entity_id), safe='')}")
 
-    # ip_addresses is a list of objects: [{"ip_address": "10.0.0.100", ...}]
+    # ip_addresses is a list of objects: [{"ip_address": "192.0.2.100", ...}]
     for entry in detail.get("ip_addresses") or []:
         if isinstance(entry, dict) and entry.get("ip_address"):
             return entry["ip_address"]

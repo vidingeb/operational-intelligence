@@ -23,14 +23,16 @@ import vcf_networks_api as m  # noqa: E402
 
 LIVE_VERSION = {"api_version": "9.0.2.0"}
 
-# Verbatim from the live collector node.
+# Shape and values verbatim from the live collector node, except the address,
+# which is a documentation address (RFC 5737). The build, node_type and health
+# are what the estate actually returned — those are what the tests assert on.
 LIVE_NODE = {
     "id": "10000:901:4351403602829049222",
     "entity_type": "Node",
     "node_type": "PROXY_VM",
     "node_id": "I2BK8VIZSDKDM4JET8JL47AFW0",
-    "ip_address": "10.0.0.169",
-    "name": "Collector_10.0.0.169",
+    "ip_address": "192.0.2.169",
+    "name": "Collector_192.0.2.169",
     "is_physical_flow_collector": False,
     "version": "9.0.2.0.25119537",
     "health": {"health_status": "HEALTHY",
@@ -73,7 +75,7 @@ def test_node_build_comes_from_the_node_record(monkeypatch):
     out = m.version()
 
     assert out["node_build"] == "9.0.2.0.25119537"
-    assert out["nodes"][0]["name"] == "Collector_10.0.0.169"
+    assert out["nodes"][0]["name"] == "Collector_192.0.2.169"
     assert out["nodes"][0]["health_status"] == "HEALTHY"
 
 
@@ -91,7 +93,7 @@ def test_collector_build_is_not_called_the_platform_version(monkeypatch):
 
 
 def test_platform_node_present_means_no_caveat(monkeypatch):
-    platform = dict(LIVE_NODE, node_type="PLATFORM", name="Platform_10.0.0.168")
+    platform = dict(LIVE_NODE, node_type="PLATFORM", name="Platform_192.0.2.168")
     _routes(monkeypatch, detail=platform)
 
     assert "platform_version_note" not in m.version()
