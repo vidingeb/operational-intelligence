@@ -1280,7 +1280,7 @@ HTML_PAGE = """<!DOCTYPE html>
             const doc = win.document;
             const stamp = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
-            doc.title = 'Estate report ' + stamp;
+            doc.title = 'Datacenter report ' + stamp;
             const style = doc.createElement('style');
             style.textContent = PRINT_CSS;
             doc.head.appendChild(style);
@@ -1293,7 +1293,7 @@ HTML_PAGE = """<!DOCTYPE html>
             meta.className = 'meta';
             meta.textContent = 'Generated ' + stamp + ' UTC'
                 + (model ? '  |  model: ' + model : '')
-                + '  |  source: live estate APIs, read-only';
+                + '  |  source: live datacenter APIs, read-only';
             doc.body.appendChild(meta);
 
             if (question) {

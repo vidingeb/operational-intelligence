@@ -430,10 +430,10 @@ def test_export_opens_a_print_view_and_prints():
     result = _run("""
         var msg = new El('div');
         exportPdf(msg, 'gpt-oss:120b', 'what software versions are we running?');
-        JSON.stringify([printed, openedDoc.title.slice(0, 13),
+        JSON.stringify([printed, openedDoc.title.slice(0, 17),
                         openedDoc.body.children.map(function (k) { return k.tag; })]);
     """)
-    assert result == '[true,"Estate report",["h1","div","div","div"]]'
+    assert result == '[true,"Datacenter report",["h1","div","div","div"]]'
 
 
 def test_export_includes_the_question_that_produced_it():
