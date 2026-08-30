@@ -6,10 +6,14 @@ A local LLM-powered orchestrator that routes natural-language questions to your 
 
 ```
 User → Orchestrator (port 8090) → Ollama (local LLM, port 11434)
-                                 → vCenter API (10.0.0.140:8080)
-                                 → VCF Operations API (10.0.0.140:8081)
-                                 → VCF Networks API (10.0.0.140:8082)
+                                 → vCenter API (192.0.2.140:8080)
+                                 → VCF Operations API (192.0.2.140:8081)
+                                 → VCF Networks API (192.0.2.140:8082)
 ```
+
+Addresses in this repo use the [RFC 5737](https://datatracker.ietf.org/doc/html/rfc5737)
+documentation range (`192.0.2.0/24`). They are placeholders, not a real deployment —
+point `MCP_SERVER` at your own host.
 
 ## Setup
 
@@ -20,7 +24,8 @@ tdnf install -y python3 python3-pip
 # Install dependencies
 pip3 install -r requirements.txt
 
-# Run the orchestrator
+# Run the orchestrator (point it at your MCP server)
+export MCP_SERVER="http://your-mcp-host"
 python3 orchestrator.py
 ```
 
@@ -32,7 +37,7 @@ environment set behaves exactly as before.
 | Variable | Default | Purpose |
 |---|---|---|
 | `OLLAMA_URL` | `http://localhost:11434` | Inference endpoint |
-| `MCP_SERVER` | `http://10.0.0.140` | Base URL of the five APIs |
+| `MCP_SERVER` | `http://192.0.2.140` | Base URL of the five APIs |
 | `DEFAULT_MODEL` | `llama3.1:8b` | Model used when the request omits one |
 | `OLLAMA_TIMEOUT` | per-model | Seconds; overrides the built-in ceiling |
 | `ORCHESTRATOR_URL` | `http://localhost:8090` | Used by `web_ui.py` only |
@@ -128,7 +133,7 @@ much stronger multi-step tool calling than an 8B model can manage:
 ```bash
 OLLAMA_URL=http://gb10.your-tailnet.ts.net:11434 \
 DEFAULT_MODEL=gpt-oss:120b \
-MCP_SERVER=http://10.0.0.140 \
+MCP_SERVER=http://192.0.2.140 \
 python3 orchestrator.py
 ```
 

@@ -4,15 +4,18 @@ VCF Operations, and VCF Networks APIs via an Ollama LLM.
 
 Inference and data can live in different places. By default everything is
 local, matching the original single-site deployment: the orchestrator runs on
-the LLM VM (10.0.0.141) and calls APIs on the MCP server (10.0.0.140).
+the LLM VM and calls APIs on the MCP server.
 
 Set OLLAMA_URL to point inference somewhere else — for example a DGX Spark
 GB10 reachable over a tailnet — and only prompts and tool results leave the
 site. vCenter credentials and the API surface stay put.
 
+Addresses in this file use the RFC 5737 documentation range (192.0.2.0/24).
+They are placeholders — set MCP_SERVER and OLLAMA_URL for your own hosts.
+
 Environment:
     OLLAMA_URL      Ollama endpoint       (default http://localhost:11434)
-    MCP_SERVER      API host base URL     (default http://10.0.0.140)
+    MCP_SERVER      API host base URL     (default http://192.0.2.140)
     DEFAULT_MODEL   Model to use          (default llama3.1:8b)
     OLLAMA_TIMEOUT  Seconds, overrides the per-model default
     MAX_TOOL_ROUNDS Agentic tool-calling rounds  (default 8)
@@ -39,6 +42,7 @@ import store
 import schedule_times
 
 
+
 @asynccontextmanager
 async def lifespan(_app):
     """Open the state database and start the schedule runner.
@@ -60,7 +64,7 @@ app = FastAPI(title="On-Prem AI Orchestrator", version="1.2", lifespan=lifespan)
 
 # Configuration — env-overridable so the same code runs single- or split-site
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-MCP_SERVER = os.getenv("MCP_SERVER", "http://10.0.0.140").rstrip("/")
+MCP_SERVER = os.getenv("MCP_SERVER", "http://192.0.2.140").rstrip("/")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3.1:8b")
 
 AVAILABLE_MODELS = {
