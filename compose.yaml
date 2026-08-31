@@ -169,12 +169,25 @@ services:
   # This runs first, as root, and hands the volumes to uid 1000. It reuses the
   # NIM image itself so there is no second image to pull and no chance of an
   # arch mismatch. Idempotent, so it is safe on every `up`.
+  #
+  # It also WIPES the workspace, which is derived state, not data. NIM fills
+  # /opt/nim/workspace with symlinks into the cache and points vLLM at it. The
+  # links are model-specific, so reusing the volume across models leaves the
+  # previous model's layout in place and the next one fails on whichever file
+  # differs between them, e.g. switching llama-3.1-8b -> qwen3-32b:
+  #
+  #   ManifestDownloadError: file: file not found: added_tokens.json
+  #
+  # (Llama has no added_tokens.json; Qwen does.) That error names a download,
+  # so it reads like a broken NGC repo, but the weights are present and intact
+  # in the cache. Only the workspace is stale. The cache is deliberately NOT
+  # wiped: it holds the expensive downloads and is keyed by model already.
   nim-init:
     profiles: ["nim"]
     image: nvcr.io/nim/${NIM_ORG:-meta}/${NIM_MODEL:-llama-3.1-8b-instruct-dgx-spark}:${NIM_TAG:-latest}
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
-    command: ["mkdir -p /opt/nim/.cache /opt/nim/workspace && chown -R 1000:1000 /opt/nim/.cache /opt/nim/workspace"]
+    command: ["mkdir -p /opt/nim/.cache /opt/nim/workspace && rm -rf /opt/nim/workspace/* /opt/nim/workspace/.[!.]* 2>/dev/null; chown -R 1000:1000 /opt/nim/.cache /opt/nim/workspace"]
     volumes:
       - nim-cache:/opt/nim/.cache
       - nim-workspace:/opt/nim/workspace
