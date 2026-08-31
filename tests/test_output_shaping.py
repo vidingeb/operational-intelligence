@@ -187,3 +187,19 @@ def test_repeated_identical_failures_are_reported_once():
     ])
     assert answer.count("vcenter_list_vms") == 1
     assert answer.count("veeam_jobs") == 1
+
+
+def test_empty_error_string_still_counts_as_a_failure():
+    """Found by probing the real pipeline, not by reading the code.
+
+    A connection timeout to an unroutable address surfaces as {"error": ""},
+    because str(exc) is empty for some httpx exceptions. A truthiness check
+    dropped it, so the one failure mode this whole guard exists for was the
+    one it silently ignored.
+    """
+    answer = o._flag_tool_failures(
+        "I could not reach the API.",
+        [{"tool": "vcenter_list_vms", "error": "failed without a message (usually a connection timeout)"}],
+    )
+    assert "vcenter_list_vms" in answer
+    assert "incomplete" in answer

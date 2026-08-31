@@ -1615,10 +1615,15 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
                 # A failed tool is recorded here, in code, rather than trusted to
                 # the model's prose. The model has been observed reporting "no
                 # errors were encountered" for a call that returned nothing.
-                if isinstance(result_data, dict) and result_data.get("error"):
+                # Test for the KEY, not its truthiness: a connection timeout
+                # surfaces as {"error": ""} because str(exc) is empty for some
+                # httpx exceptions, and a falsy check silently drops exactly the
+                # failure mode that started all this.
+                if isinstance(result_data, dict) and "error" in result_data:
+                    detail = str(result_data["error"]).strip()
                     tool_errors.append({
                         "tool": tc["function"]["name"],
-                        "error": str(result_data["error"])[:300],
+                        "error": detail[:300] or "failed without a message (usually a connection timeout)",
                     })
                 conversation.append({
                     "role": "tool",
