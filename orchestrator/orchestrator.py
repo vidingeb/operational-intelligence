@@ -35,7 +35,8 @@ import httpx
 import asyncio
 from datetime import datetime, timezone
 from typing import Any, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import store
@@ -2236,6 +2237,219 @@ async def get_single_run(run_id: str):
     if not run:
         raise HTTPException(status_code=404, detail="No such run")
     return run
+
+
+# --- OpenAI-compatible surface ------------------------------------------------
+#
+# Lets any OpenAI-speaking client (Open WebUI, in practice) drive the assistant,
+# so the tools are reachable from a general chat UI and not only the bespoke one.
+# The bespoke UI keeps the things a plain chat client cannot express: schedules,
+# reports, CSV export, pin/unpin, the telemetry bar.
+#
+# SCOPE IS THE MODEL ID. A chat client has exactly one selector, and scope --
+# which of the tools the model may call -- is the choice worth spending it on.
+# The underlying LLM stays DEFAULT_MODEL.
+#
+# STATE LIVES IN THE CLIENT. /chat keeps conversations server-side by
+# conversation_id; an OpenAI client instead resends the whole thread each turn.
+# So this path is deliberately stateless: it rebuilds context from the supplied
+# messages and writes nothing to the conversation store, which keeps the two
+# front ends from interleaving turns into each other's histories.
+
+OPENAI_MODEL_PREFIX = "assistant-"
+
+# "confirm <token>" / "cancel <token>", typed as an ordinary message. A chat
+# client has no buttons, so the two-step approval for writes has to be
+# expressible as text or it cannot be completed at all -- and silently
+# auto-approving writes because the UI is inconvenient is not an option.
+_APPROVAL_RE = re.compile(r"^\s*(confirm|cancel)\s+([A-Za-z0-9._:\-]+)\s*$", re.IGNORECASE)
+
+
+def _scope_from_model_id(model_id: Optional[str]) -> str:
+    """Map an OpenAI model id back to a tool scope, tolerantly."""
+    name = (model_id or "").split("/")[-1]
+    if name.startswith(OPENAI_MODEL_PREFIX):
+        name = name[len(OPENAI_MODEL_PREFIX):]
+    # An unknown id must not silently widen the tool set to everything.
+    return name if name in TOOLS_BY_SCOPE else "all"
+
+
+def _flatten_content(content) -> str:
+    """OpenAI content is a string, or a list of typed parts when images ride along."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def _has_image(messages: list) -> bool:
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+    return False
+
+
+def _describe_pending(pending_actions: list) -> str:
+    """Spell out proposed writes and how to approve them, since there is no button."""
+    if not pending_actions:
+        return ""
+    lines = ["", "---", "**Proposed changes — not yet applied.**", ""]
+    for action in pending_actions:
+        token = action.get("confirmation_token", "?")
+        mark = " ⚠️ irreversible" if action.get("irreversible") else ""
+        lines.append(f"- `{action.get('tool')}` {action.get('arguments')}{mark}")
+        if action.get("warning"):
+            lines.append(f"  - {action['warning']}")
+        lines.append(f"  - approve with `confirm {token}`, discard with `cancel {token}`")
+    return "\n".join(lines)
+
+
+def _openai_response(model_id: str, text: str, usage: dict) -> dict:
+    return {
+        "id": f"chatcmpl-{secrets.token_hex(12)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_id,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": (usage or {}).get("prompt_tokens", 0),
+            "completion_tokens": (usage or {}).get("completion_tokens", 0),
+            "total_tokens": (usage or {}).get("total_tokens", 0),
+        },
+    }
+
+
+def _sse_stream(payload: dict):
+    """One-shot SSE.
+
+    The tool loop runs many rounds before there is anything to say, so there is
+    no partial text to stream. Clients still default to stream=true, and a
+    client waiting for an SSE frame it never gets just hangs, so answer in the
+    shape it asked for.
+    """
+    created = payload["created"]
+    base = {"id": payload["id"], "object": "chat.completion.chunk",
+            "created": created, "model": payload["model"]}
+    first = dict(base, choices=[{"index": 0, "delta": {"role": "assistant"},
+                                 "finish_reason": None}])
+    body = dict(base, choices=[{
+        "index": 0,
+        "delta": {"content": payload["choices"][0]["message"]["content"]},
+        "finish_reason": None}])
+    last = dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}])
+    for chunk in (first, body, last):
+        yield f"data: {json.dumps(chunk)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+@app.get("/v1/models")
+async def openai_models():
+    """One entry per scope, so the client's model picker chooses the tool set."""
+    created = int(time.time())
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": f"{OPENAI_MODEL_PREFIX}{scope}",
+                "object": "model",
+                "created": created,
+                "owned_by": "operational-intelligence",
+            }
+            for scope in sorted(TOOLS_BY_SCOPE)
+        ],
+    }
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    """Answer an OpenAI-shaped request using the same tool loop as /chat."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Body must be JSON.")
+
+    messages = body.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="messages must be a non-empty list.")
+
+    model_id = body.get("model") or f"{OPENAI_MODEL_PREFIX}all"
+    scope = _scope_from_model_id(model_id)
+    stream = bool(body.get("stream"))
+
+    # Drop the client's own system prompt: prompt_for(scope) is what teaches the
+    # model these tools exist, and a generic "you are a helpful assistant" on top
+    # of it produces confident answers that never call a tool.
+    turns = [m for m in messages if m.get("role") in ("user", "assistant")]
+    if not turns or turns[-1].get("role") != "user":
+        raise HTTPException(status_code=400, detail="The last message must be from the user.")
+
+    latest = _flatten_content(turns[-1].get("content")).strip()
+    if not latest:
+        if _has_image(messages):
+            raise HTTPException(
+                status_code=400,
+                detail="This assistant is text-only: it answers from the vCenter, "
+                       "VCF Operations, logs and Veeam APIs rather than from images.",
+            )
+        raise HTTPException(status_code=400, detail="The last user message is empty.")
+
+    # Approval typed as text, handled before the model sees it.
+    approval = _APPROVAL_RE.match(latest)
+    if approval:
+        verb, token = approval.group(1).lower(), approval.group(2)
+        try:
+            if verb == "confirm":
+                result = await confirm_action(ConfirmRequest(token=token))
+                text = f"Executed `{result.get('tool')}`.\n\n```json\n{json.dumps(result, indent=2, default=str)}\n```"
+            else:
+                result = await cancel_action(ConfirmRequest(token=token))
+                text = f"Cancelled `{result.get('tool')}`. Nothing was changed."
+        except HTTPException as exc:
+            text = f"Could not {verb} `{token}`: {exc.detail}"
+        payload = _openai_response(model_id, text, {})
+        if stream:
+            return StreamingResponse(_sse_stream(payload), media_type="text/event-stream")
+        return payload
+
+    # Prose history only, mirroring build_conversation: replaying tool results
+    # would spend the context window on JSON instead of the question.
+    history = [
+        {"role": m["role"], "content": _flatten_content(m.get("content"))}
+        for m in turns[:-1]
+    ]
+    history = [m for m in history if m["content"].strip()][-(HISTORY_TURNS * 2):]
+    conversation = [{"role": "system", "content": prompt_for(scope)}] + history
+
+    try:
+        result = await chat_with_tools(
+            latest,
+            model=DEFAULT_MODEL,
+            conversation=conversation,
+            scope=scope,
+        )
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot reach Ollama at {OLLAMA_URL} — is it running and reachable?",
+        )
+
+    text = plain_text(result["answer"]) + _describe_pending(result.get("pending_actions", []))
+    payload = _openai_response(model_id, text, result.get("usage") or {})
+    if stream:
+        return StreamingResponse(_sse_stream(payload), media_type="text/event-stream")
+    return payload
 
 
 if __name__ == "__main__":
