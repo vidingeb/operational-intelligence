@@ -11,7 +11,7 @@ Three things are worth proving here, because all three fail quietly:
 """
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import pytest
 
@@ -577,3 +577,35 @@ def test_chat_rejects_a_wrongly_typed_conversation_id(client):
     """Optional must not become "anything goes"."""
     response = client.post("/chat", json={"message": "hi", "conversation_id": 12})
     assert response.status_code == 422
+
+
+# --- resident is not the same as pinned ---------------------------------------
+#
+# The inference host's OLLAMA_KEEP_ALIVE default was -1, which held every model
+# it loaded forever. That made "resident" and "pinned" indistinguishable, and
+# /memory reported a pin whenever the model was merely loaded. With the default
+# changed to a 5m idle timeout an ordinary chat request loads the model WITHOUT
+# pinning it, so the old check would offer to Unpin something that frees itself.
+#
+# Ollama signals a real pin with a sentinel expiry in the year 2318.
+
+def test_a_far_future_expiry_is_a_pin():
+    assert o._is_pinned("2318-12-11T17:57:37.968116772+01:00") is True
+
+
+def test_an_idle_timeout_expiry_is_not_a_pin():
+    """The regression: loaded for another few minutes is not pinned."""
+    soon = datetime.now(timezone.utc) + timedelta(minutes=5)
+    assert o._is_pinned(soon.isoformat()) is False
+
+
+def test_an_absent_or_unparseable_expiry_is_not_a_pin():
+    """/memory is polled every 15s, so a surprising value must not raise."""
+    assert o._is_pinned(None) is False
+    assert o._is_pinned("") is False
+    assert o._is_pinned("not a timestamp") is False
+
+
+def test_nanosecond_precision_parses():
+    """Ollama emits 9 fractional digits; datetime historically took at most 6."""
+    assert o._is_pinned("2318-12-11T17:57:37.968116772+01:00") is True

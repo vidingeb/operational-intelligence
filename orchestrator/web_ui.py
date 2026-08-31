@@ -1656,6 +1656,10 @@ HTML_PAGE = """<!DOCTYPE html>
         // The inference host has one pool of unified memory and no MIG, so the
         // pinned assistant model blocks anything else that wants the GPU — an
         // NVIDIA NIM, say. This releases it without an SSH session to the box.
+        //
+        // Three states, not two. The host's idle timeout means the model can be
+        // loaded WITHOUT being pinned, in which case it frees itself shortly and
+        // the useful action is still Pin, not Unpin.
 
         const pinBtn = document.getElementById('pin-btn');
         let pinBusy = false;
@@ -1672,6 +1676,9 @@ HTML_PAGE = """<!DOCTYPE html>
                 pinBtn.title = d.pinned
                     ? d.assistant_model + ' is held in memory (' + d.total_gb +
                       ' GB). Unpin to free it for other GPU work.'
+                    : d.resident
+                    ? d.assistant_model + ' is loaded but not pinned, so it will ' +
+                      'free itself once idle. Pin to keep it resident.'
                     : d.assistant_model + ' is not resident. Pin to preload it ' +
                       'and avoid a slow first question.';
                 pinBtn.dataset.pinned = d.pinned ? '1' : '';

@@ -1926,6 +1926,37 @@ async def telemetry():
 ASSISTANT_MODEL = os.getenv("ASSISTANT_MODEL") or DEFAULT_MODEL
 
 
+# Ollama reports a far-future sentinel expiry for a pinned model — keep_alive
+# of -1 lands in the year 2318 — and a real clock time for one loaded normally.
+#
+# This distinction only started to matter once the inference host's
+# OLLAMA_KEEP_ALIVE default became a 5m idle timeout instead of -1. Under the
+# old default every resident model was also pinned, so "is it loaded" and "is
+# it held" were the same question. They are not anymore: an ordinary chat
+# request now loads the model for a few minutes without pinning it, and
+# treating that as pinned would offer an Unpin button for a model that is
+# about to release itself anyway.
+#
+# A day is far outside any plausible idle timeout but far short of the
+# sentinel, so it separates the two cases without hardcoding the year.
+_PIN_HORIZON_SECONDS = 24 * 60 * 60
+
+
+def _is_pinned(expires_at: Optional[str]) -> bool:
+    """True when a resident model is held indefinitely rather than idling out."""
+    if not expires_at:
+        return False
+    try:
+        expiry = datetime.fromisoformat(expires_at)
+    except (TypeError, ValueError):
+        # An unparseable timestamp is not evidence of a pin, and this endpoint
+        # is polled every 15s — it must not raise on a surprising value.
+        return False
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return (expiry - datetime.now(timezone.utc)).total_seconds() > _PIN_HORIZON_SECONDS
+
+
 async def _set_keep_alive(model: str, keep_alive) -> None:
     # Pinning reloads the whole model from disk; on a 120B that is tens of
     # seconds, so this timeout is deliberately generous.
@@ -1951,15 +1982,23 @@ async def memory_status():
             detail=f"Cannot reach Ollama at {OLLAMA_URL}: {exc}",
         )
 
+    assistant = next(
+        (m for m in models if m.get("name") == ASSISTANT_MODEL), None
+    )
+
     return {
         "assistant_model": ASSISTANT_MODEL,
-        "pinned": any(m.get("name") == ASSISTANT_MODEL for m in models),
+        # Loaded right now, but possibly only until the idle timeout expires.
+        "resident": assistant is not None,
+        # Held indefinitely by an explicit pin. See _is_pinned.
+        "pinned": _is_pinned(assistant.get("expires_at")) if assistant else False,
         "total_gb": round(sum(m.get("size") or 0 for m in models) / 1024**3, 1),
         "models": [
             {
                 "name": m.get("name"),
                 "size_gb": round((m.get("size") or 0) / 1024**3, 1),
                 "expires_at": m.get("expires_at"),
+                "pinned": _is_pinned(m.get("expires_at")),
             }
             for m in models
         ],
