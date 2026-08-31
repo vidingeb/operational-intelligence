@@ -18,9 +18,13 @@
 #
 # Env:
 #   REQUIRED_FREE_GB   headroom demanded before starting   (default 24)
+#                      24 suits an 8B. For the 32B use REQUIRED_FREE_GB=40.
 #   ASSISTANT_MODEL    model to pin/unpin           (default gpt-oss:120b)
 #   NIM_PORT           host port for the NIM               (default 8000)
-#   READY_TIMEOUT      seconds to wait for readiness       (default 900)
+#   READY_TIMEOUT      seconds to wait for readiness      (default 3600)
+#                      First start downloads the weights; NVIDIA warns this
+#                      "may take several minutes" and community reports run
+#                      to 20-60 min for a 32B. Cached restarts are quick.
 #   AUTO_UNPIN=0       do not evict the assistant automatically on `up`
 #   FORCE=1            skip the memory preflight
 
@@ -29,7 +33,7 @@ set -euo pipefail
 REQUIRED_FREE_GB="${REQUIRED_FREE_GB:-24}"
 ASSISTANT_MODEL="${ASSISTANT_MODEL:-gpt-oss:120b}"
 NIM_PORT="${NIM_PORT:-8000}"
-READY_TIMEOUT="${READY_TIMEOUT:-900}"
+READY_TIMEOUT="${READY_TIMEOUT:-3600}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 
 cd "$(dirname "$0")/.."
@@ -233,7 +237,13 @@ cmd_up() {
     fi
   done
 
-  die "NIM did not become ready in ${READY_TIMEOUT}s. Check: ./scripts/spark-nim logs"
+  die "NIM did not become ready in ${READY_TIMEOUT}s.
+      The container is still running and is most likely still downloading —
+      first start pulls the weights (~8-20 GB for the 8B, ~19 GB for the 32B).
+      This is not necessarily a failure. Watch it with:
+        ./scripts/spark-nim logs
+      and re-check with:
+        ./scripts/spark-nim status"
 }
 
 cmd_down() {
