@@ -180,11 +180,12 @@ services:
       # service that was never going to start. scripts/spark-nim checks the
       # key before launching instead.
       - NGC_API_KEY=${NGC_API_KEY:-}
-      - NIM_MODEL_PROFILE=${NIM_MODEL_PROFILE:-}
-      # NVIDIA's GB10 guidance needs no NIM_* tuning for single-node use, so
-      # this is unset by default — setting it silently caps context length.
-      # Set it only to bound KV cache growth when running beside the 120B.
-      - NIM_MAX_MODEL_LEN=${NIM_MAX_MODEL_LEN:-}
+      # Bare names, not NAME=${NAME:-}. The latter passes an EMPTY STRING when
+      # unset, and NIM does int(os.getenv("NIM_MAX_MODEL_LEN", 8192)) — whose
+      # default only covers an ABSENT variable, so int('') crashes the
+      # container on startup. The bare form omits the variable entirely.
+      - NIM_MAX_MODEL_LEN
+      - NIM_MODEL_PROFILE
     ports:
       - "${NIM_PORT:-8000}:8000"
     volumes:
