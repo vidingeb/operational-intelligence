@@ -151,3 +151,39 @@ def test_single_system_reads_correctly():
     text = web_ui.build_welcome(_cfg(systems=[{"label": "vCenter"}]))
     assert "query vCenter" in text
     assert " and " not in text.split("Try asking")[0]
+
+
+# --- _flag_tool_failures -----------------------------------------------------
+# The model was observed answering "122 virtual machines ... No errors were
+# encountered" for a call that returned nothing, while the backend was pointed
+# at an unroutable address. It does not always do this, which is worse than
+# always: a component that is usually honest never earns the distrust it needs.
+# So the warning is emitted from code and these tests pin that it cannot be
+# suppressed by whatever the model happened to say.
+
+def test_clean_answer_is_untouched_when_no_tool_failed():
+    assert o._flag_tool_failures("All 63 VMs are powered on.", []) == \
+        "All 63 VMs are powered on."
+
+
+def test_failure_notice_contradicts_a_confident_answer():
+    answer = o._flag_tool_failures(
+        "There are 122 virtual machines. No errors were encountered.",
+        [{"tool": "vcenter_list_vms", "error": "API returned 500: boom"}],
+    )
+    assert "vcenter_list_vms" in answer
+    assert "incomplete" in answer
+    assert "unverified" in answer
+    # The model's own wrong claim survives; the correction sits beneath it.
+    assert "No errors were encountered." in answer
+
+
+def test_repeated_identical_failures_are_reported_once():
+    """A retried tool must not stack the same line three times."""
+    answer = o._flag_tool_failures("Answer.", [
+        {"tool": "vcenter_list_vms", "error": "boom"},
+        {"tool": "vcenter_list_vms", "error": "boom"},
+        {"tool": "veeam_jobs", "error": "unreachable"},
+    ])
+    assert answer.count("vcenter_list_vms") == 1
+    assert answer.count("veeam_jobs") == 1

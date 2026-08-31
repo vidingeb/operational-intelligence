@@ -1477,6 +1477,32 @@ class Usage:
         }
 
 
+def _flag_tool_failures(answer: str, tool_errors: list) -> str:
+    """Append a machine-generated notice for any tool that failed.
+
+    The model is asked to report tool failures and usually does, but it has
+    been observed answering "122 virtual machines ... No errors were
+    encountered" for a call that returned nothing at all. Prompting cannot make
+    that reliable, and a component that is usually honest is more dangerous
+    than one that is never honest, because nobody learns to distrust it. So the
+    warning is emitted from code, where it cannot be talked out of, even at the
+    cost of repeating a failure the model already described.
+    """
+    if not tool_errors:
+        return answer
+    lines = ["", "---", "**⚠️ Some data could not be retrieved — this answer is incomplete.**", ""]
+    seen = set()
+    for failure in tool_errors:
+        key = (failure["tool"], failure["error"])
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"- `{failure['tool']}` failed: {failure['error']}")
+    lines.append("")
+    lines.append("Treat any count or list above as unverified.")
+    return answer + "\n".join(lines)
+
+
 async def chat_with_tools(user_message: str, model: str = None, conversation: list = None,
                           scope: str = "all", read_only: bool = False) -> dict:
     """Send a message to Ollama with tool-calling, execute tools, return the answer.
@@ -1506,6 +1532,7 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
     usage = Usage()
     tools_called = []
     pending_actions = []
+    tool_errors = []
 
     # Large models need a longer ceiling; OLLAMA_TIMEOUT overrides
     timeout = timeout_for(use_model)
@@ -1535,10 +1562,11 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
                 content = (assistant_message.get("content") or "").strip()
                 if content:
                     return {
-                        "answer": content,
+                        "answer": _flag_tool_failures(content, tool_errors),
                         "usage": usage.as_dict(),
                         "tools_called": tools_called,
                         "pending_actions": pending_actions,
+                        "tool_errors": tool_errors,
                     }
                 break  # empty answer with no tool calls — force a synthesis pass
 
@@ -1584,6 +1612,14 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
                          "irreversible", "warning")
                         if k in result_data
                     })
+                # A failed tool is recorded here, in code, rather than trusted to
+                # the model's prose. The model has been observed reporting "no
+                # errors were encountered" for a call that returned nothing.
+                if isinstance(result_data, dict) and result_data.get("error"):
+                    tool_errors.append({
+                        "tool": tc["function"]["name"],
+                        "error": str(result_data["error"])[:300],
+                    })
                 conversation.append({
                     "role": "tool",
                     "name": tc["function"]["name"],
@@ -1605,10 +1641,11 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
             "model with stronger tool-calling support."
         )
         return {
-            "answer": answer,
+            "answer": _flag_tool_failures(answer, tool_errors),
             "usage": usage.as_dict(),
             "tools_called": tools_called,
             "pending_actions": pending_actions,
+            "tool_errors": tool_errors,
         }
 
 
@@ -2458,5 +2495,12 @@ if __name__ == "__main__":
     # tool on it reaches a production system, so the UI in front of it enforcing
     # identity is worth nothing if this port is open on the LAN beside it.
     bind = os.getenv("ORCHESTRATOR_BIND", "127.0.0.1")
+    # Log the RESOLVED config, not just the port. A misconfigured MCP_SERVER or
+    # OLLAMA_URL produces confident wrong answers rather than a crash, and with
+    # nothing in the journal there is no way to tell after the fact which values
+    # a running process actually had. That gap cost a production outage.
     print(f"[orchestrator] bind={bind}:8090 tools={len(TOOLS)}")
+    print(f"[orchestrator] mcp_server={MCP_SERVER}")
+    print(f"[orchestrator] ollama_url={OLLAMA_URL} default_model={DEFAULT_MODEL}")
+    print(f"[orchestrator] write_tools={ENABLE_WRITE_TOOLS} require_confirm={WRITE_REQUIRE_CONFIRM}")
     uvicorn.run(app, host=bind, port=8090)
