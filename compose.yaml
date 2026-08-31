@@ -45,15 +45,31 @@
 #
 # MEMORY BUDGET (GB10 = 128 GB unified, ~121 GB usable, shared CPU+GPU)
 #   gpt-oss:120b resident    ~60.7 GB
-#   NIM Llama 3.1 8B FP16      ~18 GB  + KV cache
-#   headroom                   ~40 GB
-# An 8B NIM fits alongside the 120B. For a 70B-class NIM, free the big
-# model first — the Unpin button in the assistant UI, or `spark-nim up`,
-# which does it for you.
+#   NIM Llama 3.1 8B           ~18 GB  + KV cache
+#   NIM Qwen3-32B              ~19 GB cache footprint
+# An 8B NIM fits alongside the 120B. For the 32B, free the big model first —
+# the Unpin button in the assistant UI, or `spark-nim up`, which does it.
 #
-# The contended resource is MEMORY BANDWIDTH (~273 GB/s), not capacity.
+# WHICH MODEL TO PICK (this hardware punishes the obvious choice)
+# Bandwidth (~273 GB/s), not capacity, sets decode speed: roughly
+# tok/s ~= bandwidth / bytes-read-per-token. So a DENSE 70B at FP8 reads
+# ~70 GB per token and lands at ~3 tok/s — it fits, and it is useless for
+# chat. Community DGX Spark numbers:
+#   dense 70B FP8   ~3 tok/s      <- fits, unusable interactively
+#   dense 32B       ~57 tok/s
+#   MoE 30B-class   ~72 tok/s
+#   gpt-oss:120b    ~39 tok/s     <- MoE, only ~5B active per token
+# That is why the resident 120B feels fast despite its size. Prefer MoE or
+# <=32B dense; treat dense 70B as a benchmark curiosity, not a daily driver.
+# NVIDIA does not list any 70B as GB10-verified in the NIM support matrix.
+#
 # There is no MIG on GB10, so the GPU is time-sliced: concurrent inference
 # makes both sides slower. That is expected, not a misconfiguration.
+#
+# UMA GOTCHA: NVIDIA warns that allocations can fail even when capacity
+# looks fine, because the buffer cache holds unified memory. If NIM fails
+# to allocate with the 120B evicted and free memory looking ample:
+#   sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 
 x-host-ollama: &host-ollama
   # Reach the native Ollama running on the Spark host itself.
@@ -143,7 +159,20 @@ services:
   # ---------------------------------------------------------------
   nim:
     profiles: ["nim"]
-    image: nvcr.io/nim/${NIM_ORG:-meta}/${NIM_MODEL:-llama-3.1-8b-instruct}:${NIM_TAG:-latest}
+    # NOTE THE `-dgx-spark` SUFFIX. It is not optional.
+    # Standard NIM images (e.g. .../llama-3.1-8b-instruct:latest) publish no
+    # arm64 manifest and die with "exec format error" on GB10. Worse, some
+    # images that DO list GB10 in the support matrix still crash while
+    # compiling Triton kernels ("'sm_121' is not a recognized processor")
+    # after downloading tens of GB. The -dgx-spark variants exist precisely
+    # to avoid that: they ship a vLLM build with SM121 support.
+    #
+    # Confirmed -dgx-spark images (2026-08):
+    #   meta/llama-3.1-8b-instruct-dgx-spark   <- NVIDIA's own entry point
+    #   qwen/qwen3-32b-dgx-spark               <- 32B, the "bigger than 8B" pick
+    # Avoid nvidia-nemotron-nano-9b-v2-dgx-spark: NGC still lists it under
+    # nvstaging, and it has open permission-error reports.
+    image: nvcr.io/nim/${NIM_ORG:-meta}/${NIM_MODEL:-llama-3.1-8b-instruct-dgx-spark}:${NIM_TAG:-latest}
     environment:
       # NOTE: deliberately NOT ${NGC_API_KEY:?...}. Compose interpolates the
       # whole file before filtering by profile, so a required-variable guard
@@ -152,12 +181,17 @@ services:
       # key before launching instead.
       - NGC_API_KEY=${NGC_API_KEY:-}
       - NIM_MODEL_PROFILE=${NIM_MODEL_PROFILE:-}
-      - NIM_MAX_MODEL_LEN=${NIM_MAX_MODEL_LEN:-16384}
+      # NVIDIA's GB10 guidance needs no NIM_* tuning for single-node use, so
+      # this is unset by default — setting it silently caps context length.
+      # Set it only to bound KV cache growth when running beside the 120B.
+      - NIM_MAX_MODEL_LEN=${NIM_MAX_MODEL_LEN:-}
     ports:
       - "${NIM_PORT:-8000}:8000"
     volumes:
-      # Cache the weights, or every recreate re-downloads them.
+      # Cache the weights, or every recreate re-downloads them (8-20 GB for
+      # the 8B, ~19 GB for the 32B).
       - nim-cache:/opt/nim/.cache
+      - nim-workspace:/opt/nim/workspace
     # NIM uses shared memory for tensor traffic; the 64 MB default is too
     # small and surfaces as an obscure crash rather than a clear error.
     shm_size: "16gb"
@@ -274,4 +308,9 @@ volumes:
   orchestrator-state:
   ollama-models:
   nim-cache:
+  # Named volumes rather than host bind mounts: Docker seeds them from the
+  # image, so they inherit the ownership NIM expects. The official playbook
+  # bind-mounts host dirs and has to `chmod -R a+w` them first; skipping
+  # that step is a common cause of cache write failures.
+  nim-workspace:
   open-webui:
