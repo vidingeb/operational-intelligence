@@ -157,8 +157,34 @@ services:
   # NIM_MAX_MODEL_LEN caps KV cache growth, which is what actually blows
   # the memory budget under load; the weights are the predictable part.
   # ---------------------------------------------------------------
+  # Docker only inherits ownership for a named volume when the image already
+  # has content at the mount path. The NIM image ships NO /opt/nim/.cache and
+  # no /opt/nim/workspace, so Docker creates both mountpoints root:root 0755
+  # while the image runs as uid 1000 (`nvs`). NIM then dies partway through
+  # the weight download with:
+  #
+  #   ManifestDownloadError: Error downloading manifest:
+  #   I/O error Permission denied (os error 13)
+  #
+  # This runs first, as root, and hands the volumes to uid 1000. It reuses the
+  # NIM image itself so there is no second image to pull and no chance of an
+  # arch mismatch. Idempotent, so it is safe on every `up`.
+  nim-init:
+    profiles: ["nim"]
+    image: nvcr.io/nim/${NIM_ORG:-meta}/${NIM_MODEL:-llama-3.1-8b-instruct-dgx-spark}:${NIM_TAG:-latest}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["mkdir -p /opt/nim/.cache /opt/nim/workspace && chown -R 1000:1000 /opt/nim/.cache /opt/nim/workspace"]
+    volumes:
+      - nim-cache:/opt/nim/.cache
+      - nim-workspace:/opt/nim/workspace
+    restart: "no"
+
   nim:
     profiles: ["nim"]
+    depends_on:
+      nim-init:
+        condition: service_completed_successfully
     # NOTE THE `-dgx-spark` SUFFIX. It is not optional.
     # Standard NIM images (e.g. .../llama-3.1-8b-instruct:latest) publish no
     # arm64 manifest and die with "exec format error" on GB10. Worse, some
@@ -309,9 +335,9 @@ volumes:
   orchestrator-state:
   ollama-models:
   nim-cache:
-  # Named volumes rather than host bind mounts: Docker seeds them from the
-  # image, so they inherit the ownership NIM expects. The official playbook
-  # bind-mounts host dirs and has to `chmod -R a+w` them first; skipping
-  # that step is a common cause of cache write failures.
+  # Named volumes rather than host bind mounts, so nothing depends on the host
+  # user's uid matching the container's. They are NOT seeded from the image
+  # though — the NIM image has no /opt/nim/.cache — so the nim-init service
+  # above chowns them to uid 1000 before NIM starts.
   nim-workspace:
   open-webui:
