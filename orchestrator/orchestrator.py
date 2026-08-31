@@ -2499,8 +2499,8 @@ if __name__ == "__main__":
     # OLLAMA_URL produces confident wrong answers rather than a crash, and with
     # nothing in the journal there is no way to tell after the fact which values
     # a running process actually had. That gap cost a production outage.
-    print(f"[orchestrator] bind={bind}:8090 tools={len(TOOLS)}")
-    print(f"[orchestrator] mcp_server={MCP_SERVER}")
-    print(f"[orchestrator] ollama_url={OLLAMA_URL} default_model={DEFAULT_MODEL}")
-    print(f"[orchestrator] write_tools={ENABLE_WRITE_TOOLS} require_confirm={WRITE_REQUIRE_CONFIRM}")
+    print(f"[orchestrator] bind={bind}:8090 tools={len(TOOLS)}", flush=True)
+    print(f"[orchestrator] mcp_server={MCP_SERVER}", flush=True)
+    print(f"[orchestrator] ollama_url={OLLAMA_URL} default_model={DEFAULT_MODEL}", flush=True)
+    print(f"[orchestrator] write_tools={ENABLE_WRITE_TOOLS} require_confirm={WRITE_REQUIRE_CONFIRM}", flush=True)
     uvicorn.run(app, host=bind, port=8090)
