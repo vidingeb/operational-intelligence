@@ -17,8 +17,18 @@
 #   ./scripts/spark-nim logs       # follow NIM logs
 #
 # Env:
-#   REQUIRED_FREE_GB   headroom demanded before starting   (default 24)
-#                      24 suits an 8B. For the 32B use REQUIRED_FREE_GB=40.
+#   REQUIRED_FREE_GB   headroom demanded before starting   (default 64)
+#                      This is NOT the model size. NIM asks vLLM to reserve a
+#                      FRACTION of the whole unified pool up front, defaulting
+#                      to 0.5 -> ~61 GiB of the GB10's 121 GiB, regardless of
+#                      whether the model is 8B or 32B. Ask for less than that
+#                      and NIM dies with:
+#                        ValueError: Free memory on device (41.53/121.63 GiB)
+#                        on startup is less than desired GPU memory
+#                        utilization (0.5, 60.81 GiB)
+#                      Lower it only alongside NIM_GPU_MEM_FRACTION, e.g.
+#                      NIM_GPU_MEM_FRACTION=0.25 REQUIRED_FREE_GB=32, which
+#                      lets an 8B NIM run WITHOUT evicting the 120B.
 #   ASSISTANT_MODEL    model to pin/unpin           (default gpt-oss:120b)
 #   NIM_PORT           host port for the NIM               (default 8000)
 #   READY_TIMEOUT      seconds to wait for readiness      (default 3600)
@@ -30,7 +40,7 @@
 
 set -euo pipefail
 
-REQUIRED_FREE_GB="${REQUIRED_FREE_GB:-24}"
+REQUIRED_FREE_GB="${REQUIRED_FREE_GB:-64}"
 ASSISTANT_MODEL="${ASSISTANT_MODEL:-gpt-oss:120b}"
 NIM_PORT="${NIM_PORT:-8000}"
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"

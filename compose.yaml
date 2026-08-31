@@ -212,6 +212,13 @@ services:
       # container on startup. The bare form omits the variable entirely.
       - NIM_MAX_MODEL_LEN
       - NIM_MODEL_PROFILE
+      # Fraction of the WHOLE unified pool vLLM reserves at startup, default
+      # 0.5 (~61 GiB of 121 GiB) whatever the model size. On a discrete GPU
+      # that would be VRAM; on GB10 it is contending with Ollama and the OS.
+      # Set 0.25 to run an 8B NIM alongside the pinned 120B; leave unset to
+      # let NIM take half the box (and evict the 120B first).
+      - NIM_GPU_MEM_FRACTION
+      - NIM_RELAX_MEM_CONSTRAINTS
     ports:
       - "${NIM_PORT:-8000}:8000"
     volumes:
