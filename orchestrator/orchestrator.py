@@ -627,8 +627,20 @@ the way an experienced engineer does.
 - Output is displayed in a pane that renders Markdown tables as real tables
   with a CSV download button. Use a Markdown table whenever you are reporting
   more than about three items that share the same fields — one row per object,
-  a header row, and a separator row. Do not emit HTML such as <br>; it is
-  stripped. Prose, headings and "- " bullets are fine for everything else.
+  a header row, and a separator row. Do not emit HTML such as <br> in prose; it
+  is stripped. Prose, headings and "- " bullets are fine for everything else.
+- The pane renders Mermaid diagrams from a ```mermaid fenced block. Use one for
+  topology, dependencies and design questions, where a picture carries what a
+  table cannot. Two syntax rules matter, because breaking either fails the
+  whole diagram rather than one line, and the operator sees an error instead of
+  a picture:
+  1. A %% comment must be on a line of its own. Never append one to a
+     statement: "a --> b %% note" is a parse error, not an ignored comment.
+  2. For a line break inside a label use <br/>, which is preserved inside a
+     fence. Do not rely on a backslash-n escape.
+  Diagram the estate as you actually measured it. A diagram is read as fact and
+  invites less scrutiny than prose, so never draw a component you have not
+  confirmed, and label anything unverified as such.
 - Put every row you are reporting in the table. Never write "the remaining N
   follow the same pattern", "omitted for brevity", or "the full list is in the
   raw output": you have not checked that they do, the operator cannot see the
@@ -1344,16 +1356,95 @@ async def estate_versions() -> dict:
 
 _HTML_BREAK = re.compile(r"<br\s*/?>", re.I)
 
+# Opening or closing line of a fenced block, capturing the fence run and the
+# info string (```mermaid -> "mermaid").
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)")
+
+
+def _iter_fence_segments(text: str):
+    """Split text into (is_fenced, info_string, lines) runs, preserving order.
+
+    Shaping rules that are right for prose are wrong inside a code fence, so
+    every transformation below needs to know which side of a fence it is on.
+    """
+    seg, in_fence, fence, info = [], False, None, ""
+    for line in text.split("\n"):
+        match = _FENCE.match(line)
+        if match and not in_fence:
+            if seg:
+                yield (False, "", seg)
+            in_fence, fence, info = True, match.group(1), (match.group(2) or "").lower()
+            seg = [line]
+        elif match and in_fence and line.strip().startswith(fence):
+            seg.append(line)
+            yield (True, info, seg)
+            seg, in_fence, fence, info = [], False, None, ""
+        else:
+            seg.append(line)
+    if seg:
+        yield (in_fence, info, seg)
+
 
 def plain_text(answer: str) -> str:
     """Remove HTML that the pane will not render, leaving Markdown tables intact.
 
     The table rows are passed through untouched for the client-side renderer.
+
+    Fenced blocks are exempt. Stripping ``<br/>`` from inside a code fence
+    corrupts the code being displayed rather than cleaning markup, and it also
+    silently defeats the one line-break syntax Mermaid labels accept.
     """
     if not answer:
         return answer
-    text = _HTML_BREAK.sub(" ", answer)
-    return re.sub(r"\n{3,}", "\n\n", text)
+    parts = []
+    for fenced, _info, lines in _iter_fence_segments(answer):
+        block = "\n".join(lines)
+        if not fenced:
+            block = re.sub(r"\n{3,}", "\n\n", _HTML_BREAK.sub(" ", block))
+        parts.append(block)
+    return "\n".join(parts)
+
+
+def _strip_inline_mermaid_comment(line: str) -> str:
+    """Drop a trailing ``%%`` comment, leaving ``%%`` inside quoted labels alone.
+
+    Mermaid only accepts a comment on a line of its own. A trailing one such as
+    ``win2022 --> sw1001 %% lives on host`` is not ignored, it is a parse error,
+    and one of them fails the whole diagram: the reader gets a red box instead
+    of a picture. A label like ``x["50%% used"]`` is legitimate, so the scan has
+    to track quoting rather than cut at the first ``%%``.
+    """
+    if line.lstrip().startswith("%%"):
+        return line  # whole-line comment, or a %%{init: ...}%% directive
+    in_quote = False
+    for i in range(len(line) - 1):
+        char = line[i]
+        if char == '"':
+            in_quote = not in_quote
+        elif not in_quote and char == "%" and line[i + 1] == "%":
+            return line[:i].rstrip()
+    return line
+
+
+def repair_mermaid(answer: str) -> str:
+    """Make Mermaid blocks parseable, from code rather than by asking nicely.
+
+    The model was observed emitting trailing ``%%`` comments, which Mermaid
+    rejects outright. Prompting reduces it but cannot remove it, and the failure
+    is total rather than partial, so the guarantee is enforced here for the same
+    reason as _flag_tool_failures.
+    """
+    if not answer or "mermaid" not in answer.lower():
+        return answer
+    parts = []
+    for fenced, info, lines in _iter_fence_segments(answer):
+        if fenced and info == "mermaid" and len(lines) > 1:
+            body, closing = lines[1:], []
+            if body and _FENCE.match(body[-1]):
+                body, closing = body[:-1], [body[-1]]
+            lines = [lines[0]] + [_strip_inline_mermaid_comment(b) for b in body] + closing
+        parts.append("\n".join(lines))
+    return "\n".join(parts)
 
 
 LOCAL_HANDLERS = {
@@ -1562,7 +1653,7 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
                 content = (assistant_message.get("content") or "").strip()
                 if content:
                     return {
-                        "answer": _flag_tool_failures(content, tool_errors),
+                        "answer": _flag_tool_failures(repair_mermaid(content), tool_errors),
                         "usage": usage.as_dict(),
                         "tools_called": tools_called,
                         "pending_actions": pending_actions,
@@ -1646,7 +1737,7 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
             "model with stronger tool-calling support."
         )
         return {
-            "answer": _flag_tool_failures(answer, tool_errors),
+            "answer": _flag_tool_failures(repair_mermaid(answer), tool_errors),
             "usage": usage.as_dict(),
             "tools_called": tools_called,
             "pending_actions": pending_actions,

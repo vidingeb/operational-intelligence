@@ -203,3 +203,87 @@ def test_empty_error_string_still_counts_as_a_failure():
     )
     assert "vcenter_list_vms" in answer
     assert "incomplete" in answer
+
+
+# --- repair_mermaid ----------------------------------------------------------
+# Seen in the running system: asked for a picture of the datacenter design, the
+# model produced a Mermaid diagram whose line 80 read
+#     win2022 --> sw1001 %% win2022 lives on ...
+# Mermaid only accepts a comment on its own line, so that is a parse error, and
+# one of them fails the entire diagram. The operator gets a red error box. The
+# model is asked not to do it, but a total failure from a single stray comment
+# is not worth leaving to prompt compliance.
+
+def _fence(*body):
+    return "\n".join(["```mermaid", *body, "```"])
+
+
+def test_trailing_comment_is_removed_and_the_statement_survives():
+    out = o.repair_mermaid(_fence("graph TD", "  win2022 --> sw1001 %% win2022 lives on esx03"))
+    assert "win2022 --> sw1001" in out
+    assert "lives on" not in out
+
+
+def test_whole_line_comment_is_preserved():
+    """These are valid, and they carry the section headings the model writes."""
+    out = o.repair_mermaid(_fence("graph TD", "  %% ===== STORAGE ====="))
+    assert "%% ===== STORAGE =====" in out
+
+
+def test_init_directive_survives():
+    out = o.repair_mermaid(_fence("%%{init: {'theme':'dark'}}%%", "graph TD"))
+    assert "%%{init: {'theme':'dark'}}%%" in out
+
+
+def test_percent_inside_a_quoted_label_is_not_treated_as_a_comment():
+    """A naive cut at the first %% would truncate the node and break the line."""
+    out = o.repair_mermaid(_fence("graph TD", '  ds["datastore1 8%% free"] --> alert'))
+    assert '8%% free' in out
+    assert "--> alert" in out
+
+
+def test_a_non_mermaid_fence_is_left_alone():
+    """The repair must be scoped by info string, not applied to every fence.
+
+    Written deliberately alongside a real mermaid block, because without one
+    the early return makes this pass without exercising anything.
+    """
+    text = ("```python\nx = a %% b  # not a comment here\n```\n"
+            "```mermaid\ngraph TD\n  a --> b %% drop me\n```")
+    out = o.repair_mermaid(text)
+    assert "x = a %% b  # not a comment here" in out
+    assert "drop me" not in out
+
+
+def test_prose_containing_percent_signs_is_untouched():
+    text = "Utilisation rose 40%% then fell.\n\n```mermaid\ngraph TD\n```"
+    assert "rose 40%% then fell" in o.repair_mermaid(text)
+
+
+def test_answer_without_a_diagram_is_returned_unchanged():
+    text = "There are 63 VMs and 5 hosts."
+    assert o.repair_mermaid(text) is text
+
+
+# --- plain_text and code fences ----------------------------------------------
+# <br> was stripped everywhere, including inside fences. That corrupts any code
+# being displayed, and it destroys the only line-break syntax a Mermaid label
+# accepts — so the documented fix for one bug was silently undone by another.
+
+def test_br_survives_inside_a_fence():
+    text = '```mermaid\ngraph TD\n  vc["vCenter<br/>vc01.vcf.local"]\n```'
+    assert "<br/>" in o.plain_text(text)
+
+
+def test_br_is_still_stripped_outside_a_fence():
+    text = 'esx03 is hot<br/>and getting hotter'
+    out = o.plain_text(text)
+    assert "<br/>" not in out
+    assert "esx03 is hot and getting hotter" in out
+
+
+def test_br_stripped_before_a_fence_and_kept_within_it():
+    text = 'summary<br/>follows\n\n```mermaid\na["x<br/>y"]\n```'
+    out = o.plain_text(text)
+    assert "summary follows" in out
+    assert 'a["x<br/>y"]' in out
