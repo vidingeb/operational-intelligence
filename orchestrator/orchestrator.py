@@ -29,6 +29,7 @@ Environment:
 import os
 import re
 import json
+import hashlib
 import urllib.parse
 import time
 import secrets
@@ -38,7 +39,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 import store
@@ -108,6 +109,25 @@ VISION_MODEL = os.getenv("VISION_MODEL", "")
 VISION_NUM_CTX = int(os.getenv("VISION_NUM_CTX", "8192"))
 VISION_KEEP_ALIVE = os.getenv("VISION_KEEP_ALIVE", "5m")
 VISION_TIMEOUT = float(os.getenv("VISION_TIMEOUT", "180"))
+
+# Server-side diagram rendering. A diffusion model asked for this estate's
+# topology returned "EXN03", "ESXt01" and "Magrmnt VSAN 01" in 54 s on the GPU;
+# mermaid-cli typesets the same labels exactly, on the CPU, in 1.9 s. Drawing a
+# diagram is a typesetting problem, not an image-generation one.
+#
+# Empty disables it and the answer keeps its Mermaid source, which the chat
+# client renders on its own -- so a missing renderer costs a download, not a
+# diagram.
+DIAGRAM_IMAGE = os.getenv("DIAGRAM_IMAGE", "")
+DIAGRAM_DIR = os.getenv("DIAGRAM_DIR", "/opt/diagrams")
+DIAGRAM_TIMEOUT = float(os.getenv("DIAGRAM_TIMEOUT", "60"))
+DIAGRAM_WIDTH = os.getenv("DIAGRAM_WIDTH", "1400")
+# Resolved by the browser against whichever origin served the chat, so the same
+# answer works behind the proxy without knowing its own public URL.
+DIAGRAM_URL_BASE = os.getenv("DIAGRAM_URL_BASE", "/diagrams")
+# "tailscale" requires the proxy's identity header; "none" serves to anyone who
+# can reach the port, which is loopback plus whatever the proxy forwards.
+DIAGRAM_AUTH = os.getenv("DIAGRAM_AUTH", "tailscale").lower()
 
 
 def timeout_for(model: str) -> float:
@@ -1464,6 +1484,114 @@ def repair_mermaid(answer: str) -> str:
     return "\n".join(parts)
 
 
+_DIAGRAM_NAME = re.compile(r"^[0-9a-f]{16}\.png$")
+
+
+def _mermaid_body(lines: list) -> str:
+    """The diagram source inside a fence, without the fence markers."""
+    body = lines[1:]
+    if body and _FENCE.match(body[-1]):
+        body = body[:-1]
+    return "\n".join(body).strip()
+
+
+async def _render_one(source: str) -> Optional[str]:
+    """Render one diagram to a PNG under DIAGRAM_DIR, returning its filename.
+
+    Named by content hash, so asking the same question twice costs one render,
+    and an edited diagram never collides with the old picture.
+    """
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+    name = f"{digest}.png"
+    target = os.path.join(DIAGRAM_DIR, name)
+    if os.path.exists(target):
+        return name
+
+    try:
+        os.makedirs(DIAGRAM_DIR, exist_ok=True)
+        # The renderer runs as its own uid inside the container. A directory
+        # only root can enter makes mermaid-cli report the input file as
+        # missing rather than unreadable, which is a long way from the cause.
+        os.chmod(DIAGRAM_DIR, 0o755)
+        config = os.path.join(DIAGRAM_DIR, "puppeteer.json")
+        if not os.path.exists(config):
+            with open(config, "w") as handle:
+                handle.write('{"args":["--no-sandbox","--disable-setuid-sandbox"]}')
+            os.chmod(config, 0o644)
+        source_file = os.path.join(DIAGRAM_DIR, f"{digest}.mmd")
+        with open(source_file, "w") as handle:
+            handle.write(source)
+        os.chmod(source_file, 0o644)
+    except OSError as exc:
+        print(f"[orchestrator] diagram setup failed: {exc!r}", flush=True)
+        return None
+
+    command = [
+        "docker", "run", "--rm",
+        # Rendering a diagram needs no network, and the diagram is a map of the
+        # estate. Nothing here should be able to post it anywhere.
+        "--network", "none",
+        "-v", f"{DIAGRAM_DIR}:/data", DIAGRAM_IMAGE,
+        "-p", "/data/puppeteer.json",
+        "-i", f"/data/{digest}.mmd",
+        "-o", f"/data/{name}",
+        "-b", "white", "-w", DIAGRAM_WIDTH,
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            output, _ = await asyncio.wait_for(
+                process.communicate(), timeout=DIAGRAM_TIMEOUT)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            print(f"[orchestrator] diagram render timed out after {DIAGRAM_TIMEOUT}s", flush=True)
+            return None
+    except OSError as exc:
+        print(f"[orchestrator] diagram render could not start: {exc!r}", flush=True)
+        return None
+    finally:
+        try:
+            os.remove(os.path.join(DIAGRAM_DIR, f"{digest}.mmd"))
+        except OSError:
+            pass
+
+    if process.returncode == 0 and os.path.exists(target):
+        return name
+    # A diagram the renderer rejects is worth seeing in the journal: the model
+    # writes the source, so a recurring failure is a prompt problem.
+    print(f"[orchestrator] diagram render failed rc={process.returncode}: "
+          f"{(output or b'').decode('utf-8', 'replace')[-400:]}", flush=True)
+    return None
+
+
+async def render_diagrams(answer: str) -> str:
+    """Add a rendered PNG under each Mermaid block, keeping the source.
+
+    The source stays because the chat client renders it inline anyway, and
+    because a picture cannot be corrected -- when the topology is wrong, the
+    reader needs the text that produced it.
+    """
+    if not answer or not DIAGRAM_IMAGE:
+        return answer
+    parts = []
+    for fenced, info, lines in _iter_fence_segments(answer):
+        parts.append("\n".join(lines))
+        if not (fenced and info == "mermaid" and len(lines) > 1):
+            continue
+        source = _mermaid_body(lines)
+        if not source:
+            continue
+        name = await _render_one(source)
+        if name:
+            parts.append(f"\n![Diagram]({DIAGRAM_URL_BASE}/{name})")
+    return "\n".join(parts)
+
+
 LOCAL_HANDLERS = {
     "triage_vm": triage_vm,
     "triage_host": triage_host,
@@ -1880,6 +2008,7 @@ async def config():
         "write_tools_enabled": ENABLE_WRITE_TOOLS,
         "telemetry_url": GB10_TELEMETRY_URL or None,
         "vision_model": VISION_MODEL or None,
+        "diagram_renderer": DIAGRAM_IMAGE or None,
         # Exposed so the UI describes the systems actually wired up rather
         # than a list written by hand, which went stale the moment logs and
         # backup were added.
@@ -2043,7 +2172,7 @@ async def chat(request: ChatRequest):
         # Telemetry is best-effort decoration; a dead exporter must not fail a
         # question that was answered successfully.
         return ChatResponse(
-            answer=plain_text(result["answer"]),
+            answer=await render_diagrams(plain_text(result["answer"])),
             model=use_model,
             usage=result["usage"],
             tools_called=result["tools_called"],
@@ -2056,6 +2185,33 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=503, detail=f"Cannot reach Ollama at {OLLAMA_URL} — is it running and reachable?")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/diagrams/{name}")
+async def get_diagram(name: str, request: Request):
+    """Serve a rendered diagram to the browser that is showing the answer.
+
+    The name is a content hash and is checked against a strict pattern, so this
+    route cannot be walked out of its directory whatever arrives in the path.
+
+    Identity is the proxy's header rather than the peer address: this app runs
+    behind uvicorn's default proxy handling, which rewrites the peer from
+    X-Forwarded-For, so a loopback check here would reject every real request
+    for a reason that looks nothing like the cause. The port is bound to
+    loopback, which is what actually keeps the tailnet out.
+    """
+    if not _DIAGRAM_NAME.match(name):
+        raise HTTPException(status_code=404, detail="No such diagram.")
+    if DIAGRAM_AUTH != "none":
+        if not (request.headers.get("tailscale-user-login") or "").strip():
+            raise HTTPException(
+                status_code=403,
+                detail="Diagrams are served through the Tailscale proxy only.",
+            )
+    path = os.path.join(DIAGRAM_DIR, name)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="No such diagram.")
+    return FileResponse(path, media_type="image/png")
 
 
 @app.get("/telemetry")
@@ -2690,6 +2846,7 @@ async def openai_chat_completions(request: Request):
         )
 
     text = plain_text(result["answer"]) + _describe_pending(result.get("pending_actions", []))
+    text = await render_diagrams(text)
     payload = _openai_response(model_id, text, result.get("usage") or {})
     if stream:
         return StreamingResponse(_sse_stream(payload), media_type="text/event-stream")
@@ -2711,4 +2868,5 @@ if __name__ == "__main__":
     print(f"[orchestrator] ollama_url={OLLAMA_URL} default_model={DEFAULT_MODEL}", flush=True)
     print(f"[orchestrator] write_tools={ENABLE_WRITE_TOOLS} require_confirm={WRITE_REQUIRE_CONFIRM}", flush=True)
     print(f"[orchestrator] vision={VISION_MODEL or 'disabled'} num_ctx={VISION_NUM_CTX}", flush=True)
+    print(f"[orchestrator] diagrams={DIAGRAM_IMAGE or 'disabled'} dir={DIAGRAM_DIR}", flush=True)
     uvicorn.run(app, host=bind, port=8090)
