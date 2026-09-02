@@ -15,6 +15,8 @@ They are placeholders — set MCP_SERVER and OLLAMA_URL for your own hosts.
 
 Environment:
     OLLAMA_URL      Ollama endpoint       (default http://localhost:11434)
+    VISION_MODEL    Vision model for pasted screenshots, e.g. qwen2.5vl:7b
+                    (unset = images are reported as unread, never dropped)
     MCP_SERVER      API host base URL     (default http://192.0.2.140)
     DEFAULT_MODEL   Model to use          (default llama3.1:8b)
     OLLAMA_TIMEOUT  Seconds, overrides the per-model default
@@ -91,6 +93,21 @@ MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
 
 # Per-tool-result budget fed back to the model, in characters.
 TOOL_RESULT_LIMIT = int(os.getenv("TOOL_RESULT_LIMIT", "12000"))
+
+# Vision sidecar. The answering model is text-only, so a pasted screenshot is
+# transcribed by a small vision model and handed on as text. Keeping it a
+# sidecar rather than switching models for the turn means tool calling stays
+# with the model that has the tools.
+#
+# Empty disables it, and the turn then says so rather than dropping the image.
+VISION_MODEL = os.getenv("VISION_MODEL", "")
+# Ollama's default allocation for this model reserves 13.5 GB, which does not
+# fit beside a resident 120b inside Ollama's own memory budget and evicts it —
+# costing a full reload on the next question. 8192 measured at 5.9 GB, coexists,
+# and is twice as fast. Raise only if you also have the memory for it.
+VISION_NUM_CTX = int(os.getenv("VISION_NUM_CTX", "8192"))
+VISION_KEEP_ALIVE = os.getenv("VISION_KEEP_ALIVE", "5m")
+VISION_TIMEOUT = float(os.getenv("VISION_TIMEOUT", "180"))
 
 
 def timeout_for(model: str) -> float:
@@ -1862,6 +1879,7 @@ async def config():
         "tool_count": len(TOOLS),
         "write_tools_enabled": ENABLE_WRITE_TOOLS,
         "telemetry_url": GB10_TELEMETRY_URL or None,
+        "vision_model": VISION_MODEL or None,
         # Exposed so the UI describes the systems actually wired up rather
         # than a list written by hand, which went stale the moment logs and
         # backup were added.
@@ -2430,6 +2448,76 @@ def _has_image(messages: list) -> bool:
     return False
 
 
+_DATA_URL = re.compile(r"^data:image/[A-Za-z0-9.+-]+;base64,", re.IGNORECASE)
+
+
+def _extract_images(content) -> list:
+    """Base64 payloads from OpenAI image_url parts, stripped of the data: prefix.
+
+    Only inline data URLs are taken. A remote http URL is left alone on purpose:
+    fetching one would have the orchestrator retrieve an arbitrary address on
+    behalf of whoever is chatting.
+    """
+    images = []
+    if not isinstance(content, list):
+        return images
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "image_url":
+            continue
+        url = part.get("image_url")
+        url = url.get("url") if isinstance(url, dict) else url
+        if isinstance(url, str) and _DATA_URL.match(url):
+            images.append(_DATA_URL.sub("", url, count=1))
+    return images
+
+
+# Transcribe, don't interpret: the model that answers has the tools and the
+# estate knowledge, so the vision model's only job is to report what is on the
+# screen -- and to say when it cannot read something instead of completing it.
+VISION_PROMPT = (
+    "Transcribe every piece of text in this image exactly as it appears, then "
+    "describe the layout and how the elements connect. Do not infer, correct or "
+    "complete anything you cannot actually read: write [unreadable] instead. "
+    "Do not speculate about what the system in the image is for."
+)
+
+
+async def describe_images(images: list) -> str:
+    """Ask the vision model what is in the screenshot, as plain text."""
+    body = {
+        "model": VISION_MODEL,
+        "stream": False,
+        "keep_alive": VISION_KEEP_ALIVE,
+        # Transcription should be reproducible; sampling buys nothing here.
+        "options": {"num_ctx": VISION_NUM_CTX, "temperature": 0},
+        "messages": [{"role": "user", "content": VISION_PROMPT, "images": images}],
+    }
+    async with httpx.AsyncClient(timeout=VISION_TIMEOUT) as client:
+        response = await client.post(f"{OLLAMA_URL}/api/chat", json=body)
+        response.raise_for_status()
+        return (response.json().get("message") or {}).get("content", "").strip()
+
+
+def frame_screenshot(description: str, count: int) -> str:
+    """Label a transcription as a claim, not a reading.
+
+    Measured on a network diagram, this model got every hostname right and three
+    of eight IP addresses wrong -- and wrong plausibly, producing addresses that
+    look exactly like the real ones. An operator acting on 10.0.1.103 when the
+    screen said 10.0.1.101 is a worse outcome than not reading the image at all,
+    so the uncertainty travels with the text rather than sitting in a doc.
+    """
+    plural = "screenshot" if count == 1 else f"{count} screenshots"
+    return (
+        f"[The user attached a {plural}. Transcribed below by {VISION_MODEL}; "
+        "this is a transcription, not a measurement. Dense or small text, "
+        "especially digits, is misread often enough that any hostname, address, "
+        "number or status read from it is unconfirmed. Check it with a tool "
+        "before repeating it as fact, and say which parts you confirmed.]\n\n"
+        f"{description}"
+    )
+
+
 def _describe_pending(pending_actions: list) -> str:
     """Spell out proposed writes and how to approve them, since there is no button."""
     if not pending_actions:
@@ -2529,12 +2617,35 @@ async def openai_chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="The last message must be from the user.")
 
     latest = _flatten_content(turns[-1].get("content")).strip()
-    if not latest:
+
+    # An attached image used to be discarded whenever any text arrived with it,
+    # so the model answered without it while appearing to have looked. Either it
+    # gets transcribed, or the turn says plainly that it was not read.
+    images = _extract_images(turns[-1].get("content"))
+    if images:
+        if VISION_MODEL:
+            print(f"[orchestrator] vision: {len(images)} image(s) -> {VISION_MODEL}", flush=True)
+            try:
+                description = await describe_images(images)
+            except Exception as exc:
+                note = ("[The user attached an image, but it could not be read: "
+                        f"{exc.__class__.__name__}. Say so; do not guess at its contents.]")
+                print(f"[orchestrator] vision failed: {exc!r}", flush=True)
+            else:
+                note = frame_screenshot(description, len(images)) if description else (
+                    "[The user attached an image, but the vision model returned "
+                    "nothing. Say so; do not guess at its contents.]")
+        else:
+            note = ("[The user attached an image. This assistant has no vision model "
+                    "configured and cannot read it. Say so; do not guess at its "
+                    "contents.]")
+        latest = f"{latest}\n\n{note}" if latest else note
+    elif not latest:
         if _has_image(messages):
             raise HTTPException(
                 status_code=400,
-                detail="This assistant is text-only: it answers from the vCenter, "
-                       "VCF Operations, logs and Veeam APIs rather than from images.",
+                detail="An image was referenced by URL rather than attached. "
+                       "Paste or upload the image itself so it can be read.",
             )
         raise HTTPException(status_code=400, detail="The last user message is empty.")
 
@@ -2599,4 +2710,5 @@ if __name__ == "__main__":
     print(f"[orchestrator] mcp_server={MCP_SERVER}", flush=True)
     print(f"[orchestrator] ollama_url={OLLAMA_URL} default_model={DEFAULT_MODEL}", flush=True)
     print(f"[orchestrator] write_tools={ENABLE_WRITE_TOOLS} require_confirm={WRITE_REQUIRE_CONFIRM}", flush=True)
+    print(f"[orchestrator] vision={VISION_MODEL or 'disabled'} num_ctx={VISION_NUM_CTX}", flush=True)
     uvicorn.run(app, host=bind, port=8090)
