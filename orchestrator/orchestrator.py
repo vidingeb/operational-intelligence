@@ -1463,6 +1463,42 @@ def _strip_inline_mermaid_comment(line: str) -> str:
     return line
 
 
+_SQUARE_LABEL = re.compile(r"(?<![\[\(])\[([^\[\]]+)\](?!\])")
+_CURLY_LABEL = re.compile(r"(?<!\{)\{([^{}]+)\}(?!\})")
+
+
+def _quote_label(match: "re.Match") -> str:
+    """Quote one node label if a bare parenthesis would break the parse."""
+    label = match.group(1)
+    opening, closing = match.group(0)[0], match.group(0)[-1]
+    if "(" not in label and ")" not in label:
+        return match.group(0)
+    if '"' in label:
+        return match.group(0)  # already quoted, or quoting would nest badly
+    if label.startswith("(") and label.endswith(")"):
+        return match.group(0)  # [(cylinder)] / {(shape)}, parens are syntax
+    return f'{opening}"{label}"{closing}'
+
+
+def _quote_mermaid_labels(line: str) -> str:
+    """Quote node labels containing ``(`` or ``)``, which Mermaid cannot parse bare.
+
+    ``esx01[esx01.vcf.local<br/>9.0.1 (Build 24957456)]`` is a parse error --
+    ``Expecting 'SQE' ... got 'PS'`` -- because an unquoted ``(`` inside ``[...]``
+    starts a shape rather than a character. Quoting the label fixes it and changes
+    nothing else. The model emits this constantly, since writing a build or a
+    version in parentheses is the natural way to write it.
+
+    Shape delimiters are left alone: ``id[(Database)]`` is a cylinder and
+    ``id([Start])`` is a stadium, so a label that is *entirely* parenthesised is
+    assumed to be syntax rather than text. Lines beginning with ``%%`` are skipped
+    so that an ``%%{init: {...}}%%`` directive is never rewritten.
+    """
+    if line.lstrip().startswith("%%"):
+        return line
+    return _CURLY_LABEL.sub(_quote_label, _SQUARE_LABEL.sub(_quote_label, line))
+
+
 def repair_mermaid(answer: str) -> str:
     """Make Mermaid blocks parseable, from code rather than by asking nicely.
 
@@ -1470,6 +1506,8 @@ def repair_mermaid(answer: str) -> str:
     rejects outright. Prompting reduces it but cannot remove it, and the failure
     is total rather than partial, so the guarantee is enforced here for the same
     reason as _flag_tool_failures.
+
+    The same applies to unquoted parentheses in node labels, repaired alongside.
     """
     if not answer or "mermaid" not in answer.lower():
         return answer
@@ -1479,7 +1517,9 @@ def repair_mermaid(answer: str) -> str:
             body, closing = lines[1:], []
             if body and _FENCE.match(body[-1]):
                 body, closing = body[:-1], [body[-1]]
-            lines = [lines[0]] + [_strip_inline_mermaid_comment(b) for b in body] + closing
+            lines = [lines[0]] + [
+                _quote_mermaid_labels(_strip_inline_mermaid_comment(b)) for b in body
+            ] + closing
         parts.append("\n".join(lines))
     return "\n".join(parts)
 
