@@ -45,6 +45,7 @@ from pydantic import BaseModel
 
 import store
 import schedule_times
+import health_report
 
 logger = logging.getLogger(__name__)
 
@@ -516,6 +517,17 @@ REGISTRY = [
        "which systems have no version source (NSX is not integrated), so the "
        "answer can say what was not checked",
        local="estate_versions"),
+    _t("daily_health_report", "LOCAL", "local://reports/daily-health",
+       "Deterministic read-only daily health report across vCenter, VCF Operations, "
+       "Logs, VCF Networks, and Veeam. Use for daily or morning health reports. "
+       "It returns report_markdown whose tables, counts, statuses, arithmetic, "
+       "correlations, trends, and actions are computed in code. Reproduce "
+       "report_markdown verbatim; do not recount, relabel, or reinterpret it.",
+       {
+           "hours": (Int, False, "Report window in hours (default 24)"),
+           "flow_limit": (Int, False, "Maximum resolved flows (default 100)"),
+       },
+       local="daily_health_report"),
 ]
 
 # networks_flows and networks_path are constrained by what Network Insight
@@ -667,6 +679,9 @@ the way an experienced engineer does.
 - Recommend one clear next action rather than listing every possibility.
 
 **Reporting**
+- When daily_health_report returns report_markdown, reproduce that Markdown
+  verbatim. You may add one clearly separated sentence before it, but must not
+  recompute counts, statuses, capacity, correlations, trends, or actions.
 - Be concise and specific. An operator wants "esx03: 94% memory, 3 VMs
   ballooning" not a paragraph of narration.
 - Say what you checked, so the boundaries of the answer are visible.
@@ -902,7 +917,8 @@ async def execute_pending(token: str) -> dict:
 
 
 
-async def call_api(tool_name: str, arguments: dict, confirmed: bool = False) -> dict:
+async def call_api(tool_name: str, arguments: dict, confirmed: bool = False,
+                   progress=None) -> dict:
     """Execute an API call based on the tool name and arguments.
 
     State-changing tools do not execute here by default. They return a
@@ -916,7 +932,10 @@ async def call_api(tool_name: str, arguments: dict, confirmed: bool = False) -> 
         handler = LOCAL_HANDLERS.get(spec["local"])
         if not handler:
             return {"error": f"{tool_name} has no handler"}
-        return await handler(**(arguments or {}))
+        kwargs = dict(arguments or {})
+        if spec["local"] == "daily_health_report":
+            kwargs["progress"] = progress
+        return await handler(**kwargs)
 
     if spec["write"] and WRITE_REQUIRE_CONFIRM and not confirmed:
         return await propose_write(tool_name, arguments or {})
@@ -1265,6 +1284,22 @@ async def triage_estate(full: bool = False) -> dict:
         ),
         **sections,
     }
+
+
+async def daily_health_report(hours: int = 24, flow_limit: int = 100,
+                              progress=None) -> dict:
+    """Collect, score, render, and persist one deterministic read-only report."""
+    return await health_report.collect(
+        call_api,
+        lambda: store.latest_health_snapshot(
+            health_report.SCHEMA_VERSION,
+            health_report.COLLECTOR_VERSION,
+        ),
+        store.save_health_snapshot,
+        hours=max(1, min(int(hours), 168)),
+        flow_limit=max(1, min(int(flow_limit), 500)),
+        progress=progress,
+    )
 
 
 def _version_tuple(text: Any) -> Optional[tuple]:
@@ -1665,6 +1700,7 @@ LOCAL_HANDLERS = {
     "triage_estate": triage_estate,
     "backup_coverage": backup_coverage,
     "estate_versions": estate_versions,
+    "daily_health_report": daily_health_report,
 }
 
 
@@ -1675,6 +1711,19 @@ def summarize_tool_result(data, limit: int = TOOL_RESULT_LIMIT) -> str:
     broken JSON with no clue it was truncated, so it either hallucinates the
     missing part or gives up. Instead drop entire list items and say so.
     """
+    if isinstance(data, dict) and data.get("collector_version") == health_report.COLLECTOR_VERSION:
+        data = {
+            "report_id": data.get("report_id"),
+            "schema_version": data.get("schema_version"),
+            "collector_version": data.get("collector_version"),
+            "instruction": (
+                "Reproduce report_markdown verbatim. Do not recompute or "
+                "reinterpret any fact."
+            ),
+            "report_markdown": data.get("report_markdown"),
+        }
+        return json.dumps(data, default=str)
+
     full = json.dumps(data, default=str)
     if len(full) <= limit:
         return full
@@ -1956,7 +2005,7 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
                     )
                 started = time.perf_counter()
                 try:
-                    return await call_api(name, arguments)
+                    return await call_api(name, arguments, progress=progress)
                 finally:
                     elapsed = time.perf_counter() - started
                     logger.info(
@@ -2526,6 +2575,11 @@ class ScheduleRequest(BaseModel):
     scope: str = "all"
 
 
+class DailyHealthRequest(BaseModel):
+    hours: int = 24
+    flow_limit: int = 100
+
+
 async def run_scheduled(schedule: dict) -> str:
     """Execute one scheduled question and store the result.
 
@@ -2536,6 +2590,19 @@ async def run_scheduled(schedule: dict) -> str:
                              model=schedule.get("model"),
                              scope=schedule.get("scope", "all"))
     try:
+        if schedule["question"].strip().lower() == "daily health report":
+            result = await daily_health_report()
+            store.finish_run(
+                run_id,
+                answer=result["report_markdown"],
+                tools_called=["daily_health_report"],
+                usage={
+                    "deterministic": True,
+                    "report_id": result["report_id"],
+                    "schema_version": result["schema_version"],
+                },
+            )
+            return run_id
         conversation = [{"role": "system",
                          "content": prompt_for(schedule.get("scope", "all"))}]
         # Tell a recurring job what it said last time, so a daily report can
@@ -2564,6 +2631,23 @@ async def run_scheduled(schedule: dict) -> str:
         # stopped producing reports is the failure mode worth avoiding.
         store.finish_run(run_id, error=f"{type(exc).__name__}: {exc}")
     return run_id
+
+
+@app.post("/reports/daily-health")
+async def create_daily_health_report(request: DailyHealthRequest):
+    """Run the deterministic collector immediately and persist its snapshot."""
+    return await daily_health_report(
+        hours=request.hours,
+        flow_limit=request.flow_limit,
+    )
+
+
+@app.get("/reports/daily-health/latest")
+async def latest_daily_health_report():
+    report = store.latest_health_snapshot()
+    if not report:
+        raise HTTPException(status_code=404, detail="No daily health report exists yet.")
+    return report
 
 
 async def scheduler_loop() -> None:

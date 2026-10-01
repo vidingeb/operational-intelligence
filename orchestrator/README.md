@@ -304,6 +304,57 @@ deep copies. Identical concurrent misses share one upstream resolution.
 Failures and partial results containing a failed flow detail are not cached.
 Set the TTL to `0` to disable both reuse and request coalescing.
 
+### Deterministic daily health report
+
+`POST /reports/daily-health` runs a fixed, read-only collection plan across
+vCenter, VCF Operations, Logs, VCF Networks, and Veeam. It does not ask the
+model which tools to call, count records in prose, calculate capacity, assign
+core status, or construct correlations. Python normalizes each query into:
+
+`source`, `query`, `collected_at`, `window`, `status`, `truncated`,
+`records_examined`, `records_returned`, `error`, and `data`.
+
+Statuses are `complete`, `partial`, `truncated`, `failed`, `not_configured`, or
+`unsupported`. A missing required check produces `UNKNOWN`, never a healthy
+aggregate. Direct Dell switch telemetry and BMC/iDRAC hardware health are not
+configured in this environment; IPMI log messages remain log evidence only.
+The Veeam wrapper does not expose repository capacity, so datastore/vSAN
+capacity is never relabelled as backup-repository capacity.
+
+Run and save a preview:
+
+```bash
+curl -s -X POST http://127.0.0.1:8090/reports/daily-health \
+  -H 'Content-Type: application/json' \
+  -d '{"hours":24,"flow_limit":100}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["report_markdown"])'
+```
+
+The response includes the normalized sources, deterministic analysis, and
+`report_markdown`. `GET /reports/daily-health/latest` returns the most recent
+persisted snapshot. Snapshots are versioned and later runs calculate
+new/resolved/worsened/improved/unchanged findings against the previous
+comparable run. The first run states that no baseline exists.
+
+The same collector is exposed as the read-only `daily_health_report` local
+assistant tool. The model is instructed to reproduce `report_markdown`
+verbatim, not rewrite its facts. Streaming clients receive collection phases
+through the existing status mechanism.
+
+For unattended execution, create a normal schedule whose question is exactly
+`daily health report`. That exact scheduled question bypasses inference and
+stores the deterministic Markdown directly:
+
+```bash
+curl -s -X POST http://127.0.0.1:8090/schedules \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"daily health report","kind":"daily","hour":7,"minute":0}'
+```
+
+Times are UTC. The v1 report is intentionally conservative: direct switch
+health, direct server sensors, storage latency/path health, and Veeam
+repository capacity remain unknown until matching APIs are configured.
+
 `/health` always returns HTTP 200 so a probe can read the detail; branch on
 the `status` field instead:
 

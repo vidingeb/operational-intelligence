@@ -71,6 +71,17 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs (started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages (conversation_id, seq);
+
+CREATE TABLE IF NOT EXISTS health_report_snapshots (
+    id               TEXT PRIMARY KEY,
+    schema_version   INTEGER NOT NULL,
+    collector_version TEXT NOT NULL,
+    collected_at     TEXT NOT NULL,
+    report_json      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_snapshots_collected
+ON health_report_snapshots (collected_at DESC);
 """
 
 
@@ -324,3 +335,38 @@ def previous_answer(schedule_id: str, path: str = None):
             " AND status = 'ok' AND answer IS NOT NULL"
             " ORDER BY started_at DESC LIMIT 1", (schedule_id,)).fetchone()
     return dict(row) if row else None
+
+
+def save_health_snapshot(report: dict, path: str = None) -> None:
+    with session(path) as conn:
+        conn.execute(
+            "INSERT INTO health_report_snapshots"
+            " (id, schema_version, collector_version, collected_at, report_json)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                report["report_id"],
+                report["schema_version"],
+                report["collector_version"],
+                report["metadata"]["collected_at"],
+                json.dumps(report, default=str),
+            ),
+        )
+
+
+def latest_health_snapshot(schema_version: int = None, collector_version: str = None,
+                           path: str = None):
+    query = "SELECT report_json FROM health_report_snapshots"
+    args = []
+    clauses = []
+    if schema_version is not None:
+        clauses.append("schema_version = ?")
+        args.append(schema_version)
+    if collector_version is not None:
+        clauses.append("collector_version = ?")
+        args.append(collector_version)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY collected_at DESC LIMIT 1"
+    with session(path) as conn:
+        row = conn.execute(query, args).fetchone()
+    return json.loads(row["report_json"]) if row else None
