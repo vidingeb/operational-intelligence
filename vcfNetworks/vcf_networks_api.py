@@ -1,6 +1,10 @@
+import copy
+import logging
 import os
 import re
+import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +24,18 @@ NI_PASSWORD = os.getenv("NI_PASSWORD", "")
 NI_DOMAIN_TYPE = os.getenv("NI_DOMAIN_TYPE", os.getenv("NI_DOMAIN", "LOCAL"))
 
 REQUEST_TIMEOUT = int(os.getenv("NI_TIMEOUT", "30"))
+FLOW_INVENTORY_CACHE_TTL = max(
+    0.0, float(os.getenv("FLOW_INVENTORY_CACHE_TTL", "60"))
+)
+FLOW_INVENTORY_CACHE_MAX_ENTRIES = max(
+    1, int(os.getenv("FLOW_INVENTORY_CACHE_MAX_ENTRIES", "32"))
+)
+
+logger = logging.getLogger(__name__)
+
+_flow_inventory_cache = OrderedDict()
+_flow_inventory_inflight = set()
+_flow_inventory_cache_condition = threading.Condition()
 
 # One source of truth: root and /ni/health previously reported 1.5.0 and 1.6.0
 # for the same running process.
@@ -695,6 +711,67 @@ def cluster_details(cluster_id: str):
 MAX_HYDRATE = 20
 
 
+def _flow_cache_key(hours: int, limit: int, traffic_type: Optional[str],
+                    vm: Optional[str]) -> tuple:
+    """Include every request value represented in the inventory response."""
+    return hours, limit, traffic_type, vm
+
+
+def _flow_cache_get_or_reserve(key: tuple):
+    """Return a copied hit, or reserve this key for one upstream resolver."""
+    if FLOW_INVENTORY_CACHE_TTL <= 0:
+        logger.info("flow_inventory_cache status=disabled")
+        return None, False
+
+    with _flow_inventory_cache_condition:
+        while True:
+            now = time.monotonic()
+            expired = [
+                cached_key for cached_key, (expires_at, _) in _flow_inventory_cache.items()
+                if expires_at <= now
+            ]
+            for cached_key in expired:
+                _flow_inventory_cache.pop(cached_key, None)
+
+            cached = _flow_inventory_cache.get(key)
+            if cached:
+                _flow_inventory_cache.move_to_end(key)
+                logger.info("flow_inventory_cache status=hit")
+                return copy.deepcopy(cached[1]), False
+
+            if key not in _flow_inventory_inflight:
+                _flow_inventory_inflight.add(key)
+                logger.info("flow_inventory_cache status=miss")
+                return None, True
+
+            logger.info("flow_inventory_cache status=wait")
+            _flow_inventory_cache_condition.wait()
+
+
+def _flow_cache_finish(key: tuple, result: Optional[dict]) -> None:
+    """Publish a successful result and wake identical waiting requests."""
+    if FLOW_INVENTORY_CACHE_TTL <= 0:
+        return
+
+    with _flow_inventory_cache_condition:
+        if result is not None:
+            _flow_inventory_cache[key] = (
+                time.monotonic() + FLOW_INVENTORY_CACHE_TTL,
+                copy.deepcopy(result),
+            )
+            _flow_inventory_cache.move_to_end(key)
+            while len(_flow_inventory_cache) > FLOW_INVENTORY_CACHE_MAX_ENTRIES:
+                _flow_inventory_cache.popitem(last=False)
+        _flow_inventory_inflight.discard(key)
+        _flow_inventory_cache_condition.notify_all()
+
+
+def _reset_flow_inventory_cache() -> None:
+    """Test and maintenance hook; active requests are not interrupted."""
+    with _flow_inventory_cache_condition:
+        _flow_inventory_cache.clear()
+
+
 def flow_record(flow: Dict[str, Any]) -> Dict[str, Any]:
     """Flatten a flow entity into the fields operators actually ask about.
 
@@ -881,73 +958,106 @@ def flows_inventory(
     breakdown is counted across everything fetched, so the split can be
     reported even when the flow list itself is trimmed.
     """
-    now = int(time.time())
-    window = f"?start_time={now - hours * 3600}&end_time={now}"
-    refs, total_known = list_entity_refs("/api/ni/entities/flows" + window, limit)
+    key = _flow_cache_key(hours, limit, traffic_type, vm)
+    cached, reserved = _flow_cache_get_or_reserve(key)
+    if cached is not None:
+        return cached
 
-    def fetch(ref):
-        entity_id = ref.get("entity_id")
-        if not entity_id:
-            return None
-        try:
-            return client.request(
-                "GET", f"/api/ni/entities/flows/{quote(str(entity_id), safe='')}"
-            )
-        except HTTPException:
-            return {"entity_id": entity_id, "error": "could not fetch flow detail"}
+    started = time.perf_counter()
+    result = None
+    cacheable = False
+    try:
+        now = int(time.time())
+        window = f"?start_time={now - hours * 3600}&end_time={now}"
+        refs_started = time.perf_counter()
+        refs, total_known = list_entity_refs("/api/ni/entities/flows" + window, limit)
+        logger.info(
+            "flow_inventory_stage stage=fetch_references elapsed_seconds=%.3f count=%d",
+            time.perf_counter() - refs_started,
+            len(refs),
+        )
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        details = list(pool.map(fetch, refs))
+        def fetch(ref):
+            entity_id = ref.get("entity_id")
+            if not entity_id:
+                return None
+            try:
+                return client.request(
+                    "GET", f"/api/ni/entities/flows/{quote(str(entity_id), safe='')}"
+                )
+            except HTTPException:
+                return {"entity_id": entity_id, "error": "could not fetch flow detail"}
 
-    flows_out = []
-    for detail in details:
-        if not detail:
-            continue
-        if detail.get("error"):
-            flows_out.append(detail)
-            continue
-        flows_out.append(flow_record(detail))
+        details_started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            details = list(pool.map(fetch, refs))
+        logger.info(
+            "flow_inventory_stage stage=resolve_details elapsed_seconds=%.3f count=%d",
+            time.perf_counter() - details_started,
+            len(details),
+        )
 
-    fetched = len(flows_out)
+        flows_out = []
+        for detail in details:
+            if not detail:
+                continue
+            if detail.get("error"):
+                flows_out.append(detail)
+                continue
+            flows_out.append(flow_record(detail))
 
-    # Counted before filtering: the breakdown describes the observed window,
-    # not the subset that survived the filter.
-    breakdown: Dict[str, int] = {}
-    for record in flows_out:
-        label = record.get("traffic_type") or "UNKNOWN"
-        breakdown[label] = breakdown.get(label, 0) + 1
+        fetched = len(flows_out)
 
-    if traffic_type:
-        wanted = traffic_type.strip().upper().replace("-", "_").replace(" ", "_")
-        wanted = wanted.replace("_TRAFFIC", "")
-        flows_out = [
-            f for f in flows_out
-            if wanted in (f.get("traffic_type") or "").upper()
-        ]
+        # Counted before filtering: the breakdown describes the observed window,
+        # not the subset that survived the filter.
+        breakdown: Dict[str, int] = {}
+        for record in flows_out:
+            label = record.get("traffic_type") or "UNKNOWN"
+            breakdown[label] = breakdown.get(label, 0) + 1
 
-    if vm:
-        needle = vm.strip().lower()
-        flows_out = [
-            f for f in flows_out
-            if needle in (f.get("source_vm") or "").lower()
-            or needle in (f.get("destination_vm") or "").lower()
-        ]
+        if traffic_type:
+            wanted = traffic_type.strip().upper().replace("-", "_").replace(" ", "_")
+            wanted = wanted.replace("_TRAFFIC", "")
+            flows_out = [
+                f for f in flows_out
+                if wanted in (f.get("traffic_type") or "").upper()
+            ]
 
-    incomplete = isinstance(total_known, int) and fetched < total_known
+        if vm:
+            needle = vm.strip().lower()
+            flows_out = [
+                f for f in flows_out
+                if needle in (f.get("source_vm") or "").lower()
+                or needle in (f.get("destination_vm") or "").lower()
+            ]
 
-    return {
-        "flow_count": len(flows_out),
-        "flows_examined": fetched,
-        "total_flows_known": total_known,
-        "truncated": incomplete,
-        "traffic_type_breakdown": breakdown,
-        "hint": (
-            f"Examined {fetched} of {total_known} flows in the window; the rest "
-            "were not fetched. Say so rather than presenting this as all traffic."
-        ) if incomplete else None,
-        "filter": {"traffic_type": traffic_type, "vm": vm, "hours": hours},
-        "flows": flows_out,
-    }
+        incomplete = isinstance(total_known, int) and fetched < total_known
+
+        result = {
+            "flow_count": len(flows_out),
+            "flows_examined": fetched,
+            "total_flows_known": total_known,
+            "truncated": incomplete,
+            "traffic_type_breakdown": breakdown,
+            "hint": (
+                f"Examined {fetched} of {total_known} flows in the window; the rest "
+                "were not fetched. Say so rather than presenting this as all traffic."
+            ) if incomplete else None,
+            "filter": {"traffic_type": traffic_type, "vm": vm, "hours": hours},
+            "flows": flows_out,
+        }
+        cacheable = not any(
+            isinstance(flow, dict) and "error" in flow for flow in flows_out
+        )
+        return copy.deepcopy(result)
+    finally:
+        if reserved:
+            _flow_cache_finish(key, result if cacheable else None)
+        logger.info(
+            "flow_inventory_stage stage=complete elapsed_seconds=%.3f cacheable=%s",
+            time.perf_counter() - started,
+            cacheable,
+        )
 
 
 @app.get("/ni/flows/detail/{flow_id}")

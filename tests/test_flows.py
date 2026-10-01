@@ -6,7 +6,12 @@ object rather than a scalar.
 """
 import os
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "vcfNetworks"))
 os.environ.setdefault("NI_HOST", "fake")
@@ -14,6 +19,13 @@ os.environ.setdefault("NI_USERNAME", "u")
 os.environ.setdefault("NI_PASSWORD", "p")
 
 import vcf_networks_api as m  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def clear_flow_cache(monkeypatch):
+    m._reset_flow_inventory_cache()
+    monkeypatch.setattr(m, "FLOW_INVENTORY_CACHE_TTL", 60.0)
+    monkeypatch.setattr(m, "FLOW_INVENTORY_CACHE_MAX_ENTRIES", 32)
 
 
 class FakeNI:
@@ -146,3 +158,101 @@ def test_filtering_to_nothing_does_not_claim_truncation():
     assert out["flow_count"] == 0
     assert out["truncated"] is False
     assert out["hint"] is None
+
+
+def test_equivalent_inventory_request_hits_cache_and_returns_a_copy():
+    fake = install(build(count_ns=1, count_ew=0))
+    first = m.flows_inventory(hours=1, limit=100, traffic_type=None, vm=None)
+    first["flows"][0]["source_vm"] = "mutated"
+
+    second = m.flows_inventory(hours=1, limit=100, traffic_type=None, vm=None)
+
+    assert fake.detail_calls == 1
+    assert second["flows"][0]["source_vm"] == "web0"
+
+
+def test_cache_expires(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(m, "FLOW_INVENTORY_CACHE_TTL", 5.0)
+    fake = install(build(count_ns=1, count_ew=0))
+
+    m.flows_inventory(hours=1, limit=100, traffic_type=None, vm=None)
+    clock[0] += 6
+    m.flows_inventory(hours=1, limit=100, traffic_type=None, vm=None)
+
+    assert fake.detail_calls == 2
+
+
+def test_zero_ttl_disables_cache(monkeypatch):
+    monkeypatch.setattr(m, "FLOW_INVENTORY_CACHE_TTL", 0.0)
+    fake = install(build(count_ns=1, count_ew=0))
+
+    m.flows_inventory(hours=1, limit=100, traffic_type=None, vm=None)
+    m.flows_inventory(hours=1, limit=100, traffic_type=None, vm=None)
+
+    assert fake.detail_calls == 2
+
+
+def test_cache_key_includes_every_filter():
+    fake = install(build(count_ns=2, count_ew=1))
+
+    m.flows_inventory(hours=1, limit=100, traffic_type=None, vm=None)
+    m.flows_inventory(hours=2, limit=100, traffic_type=None, vm=None)
+    m.flows_inventory(hours=1, limit=2, traffic_type=None, vm=None)
+    m.flows_inventory(hours=1, limit=100, traffic_type="north_south", vm=None)
+    m.flows_inventory(hours=1, limit=100, traffic_type=None, vm="web0")
+
+    assert fake.detail_calls == 3 + 3 + 2 + 3 + 3
+
+
+def test_failed_flow_resolution_is_not_cached():
+    class FlakyNI(FakeNI):
+        def __init__(self, flows):
+            super().__init__(flows)
+            self.fail_once = True
+
+        def request(self, method, path, **kw):
+            if path.startswith("/api/ni/entities/flows/") and self.fail_once:
+                self.fail_once = False
+                self.detail_calls += 1
+                raise m.HTTPException(status_code=502, detail="temporary failure")
+            return super().request(method, path, **kw)
+
+    fake = FlakyNI(build(count_ns=1, count_ew=0))
+    m.client = fake
+
+    first = m.flows_inventory(hours=1, limit=100, traffic_type=None, vm=None)
+    second = m.flows_inventory(hours=1, limit=100, traffic_type=None, vm=None)
+
+    assert first["flows"][0]["error"] == "could not fetch flow detail"
+    assert second["flows"][0]["source_vm"] == "web0"
+    assert fake.detail_calls == 2
+
+
+def test_concurrent_identical_requests_share_one_resolution():
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingNI(FakeNI):
+        def request(self, method, path, **kw):
+            if path.startswith("/api/ni/entities/flows/"):
+                started.set()
+                release.wait(timeout=2)
+            return super().request(method, path, **kw)
+
+    fake = BlockingNI(build(count_ns=1, count_ew=0))
+    m.client = fake
+    args = {"hours": 1, "limit": 100, "traffic_type": None, "vm": None}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(m.flows_inventory, **args)
+        assert started.wait(timeout=1)
+        second = pool.submit(m.flows_inventory, **args)
+        time.sleep(0.02)
+        assert not second.done()
+        release.set()
+        assert first.result()["flow_count"] == 1
+        assert second.result()["flow_count"] == 1
+
+    assert fake.detail_calls == 1

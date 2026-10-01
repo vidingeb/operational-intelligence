@@ -48,6 +48,8 @@ User asks natural language question
 1. Clone this repo to your gateway server
 2. Install dependencies: `pip install fastapi uvicorn pyvmomi requests`
 3. Configure environment variables for vCenter credentials
+   (`FLOW_INVENTORY_CACHE_TTL=60` controls the short-lived resolved-flow cache;
+   set it to `0` to disable caching)
 4. Start services:
    ```bash
    uvicorn vcenter.vcenter_api:app --host 0.0.0.0 --port 8080

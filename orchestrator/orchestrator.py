@@ -30,6 +30,7 @@ import os
 import re
 import json
 import hashlib
+import logging
 import urllib.parse
 import time
 import secrets
@@ -37,13 +38,15 @@ from contextlib import asynccontextmanager
 import httpx
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 import store
 import schedule_times
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -620,6 +623,12 @@ the way an experienced engineer does.
 **Diagnose, do not lookup**
 - For "X is slow / broken / degraded / having problems", start with triage_vm or
   triage_host. One call gathers state, alarms, alerts, storage and traffic.
+- Use only the exact tool names in the supplied registry. For host CPU and
+  memory utilization, the registered tool is vcenter_host_usage. Never invent
+  a similar name such as vcenter_host_metrics.
+- Continue automatically with available read-only tools needed to answer the
+  question. Do not ask the operator to run a lookup that you can run in the
+  next tool round.
 - Then correlate. A VM problem is usually explained by its host, its datastore,
   its snapshots or its network, not by the VM record alone. Follow the evidence
   into a second call when the first one points somewhere.
@@ -933,6 +942,24 @@ async def call_api(tool_name: str, arguments: dict, confirmed: bool = False) -> 
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
+            requested_name = (arguments or {}).get("name")
+            if (
+                tool_name == "vcenter_vm_details"
+                and e.response.status_code == 404
+                and isinstance(requested_name, str)
+                and "." in requested_name
+            ):
+                short_name = requested_name.split(".", 1)[0]
+                retry_args = dict(args)
+                retry_args["name"] = short_name
+                logger.info(
+                    "vm_detail_lookup status=retry_short_name original_has_domain=true"
+                )
+                return await call_api(
+                    tool_name,
+                    {**(arguments or {}), "name": retry_args["name"]},
+                    confirmed=confirmed,
+                )
             return {"error": f"API returned {e.response.status_code}: {e.response.text[:500]}"}
         except httpx.ConnectError:
             return {"error": f"Cannot connect to {url} — is the MCP server running?"}
@@ -1779,8 +1806,12 @@ def _flag_tool_failures(answer: str, tool_errors: list) -> str:
     return answer + "\n".join(lines)
 
 
+ProgressCallback = Callable[[str, str, dict], Awaitable[None]]
+
+
 async def chat_with_tools(user_message: str, model: str = None, conversation: list = None,
-                          scope: str = "all", read_only: bool = False) -> dict:
+                          scope: str = "all", read_only: bool = False,
+                          progress: Optional[ProgressCallback] = None) -> dict:
     """Send a message to Ollama with tool-calling, execute tools, return the answer.
 
     Returns {"answer", "usage", "tools_called"}.
@@ -1809,6 +1840,11 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
     tools_called = []
     pending_actions = []
     tool_errors = []
+    round_number = 0
+
+    async def report(stage: str, message: str, **details) -> None:
+        if progress:
+            await progress(stage, message, details)
 
     # Large models need a longer ceiling; OLLAMA_TIMEOUT overrides
     timeout = timeout_for(use_model)
@@ -1816,6 +1852,18 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
     async with httpx.AsyncClient(timeout=timeout) as client:
 
         async def ask(include_tools: bool) -> dict:
+            nonlocal round_number
+            round_number += 1
+            if not include_tools:
+                stage = "final_analysis"
+                message = "Analyzing gathered data and preparing the final answer"
+            elif not tools_called:
+                stage = "selecting_tools"
+                message = "Selecting and analyzing tools"
+            else:
+                stage = "analyzing_results"
+                message = "Analyzing tool results and selecting the next step"
+            await report(stage, message, round=round_number)
             body = {
                 "model": use_model,
                 "messages": conversation,
@@ -1823,10 +1871,24 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
             }
             if include_tools:
                 body["tools"] = tools
-            response = await client.post(f"{OLLAMA_URL}/api/chat", json=body)
-            response.raise_for_status()
-            payload = response.json()
-            usage.add(payload)
+            started = time.perf_counter()
+            outcome = "failed"
+            try:
+                response = await client.post(f"{OLLAMA_URL}/api/chat", json=body)
+                response.raise_for_status()
+                payload = response.json()
+                usage.add(payload)
+                outcome = "ok"
+            finally:
+                logger.info(
+                    "model_inference stage=%s round=%d elapsed_seconds=%.3f "
+                    "model=%s outcome=%s",
+                    stage,
+                    round_number,
+                    time.perf_counter() - started,
+                    use_model,
+                    outcome,
+                )
             return payload["message"]
 
         for _ in range(MAX_TOOL_ROUNDS):
@@ -1837,6 +1899,11 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
             if not tool_calls:
                 content = (assistant_message.get("content") or "").strip()
                 if content:
+                    await report(
+                        "final_analysis",
+                        "Final answer analysis complete",
+                        round=round_number,
+                    )
                     return {
                         "answer": _flag_tool_failures(repair_mermaid(content), tool_errors),
                         "usage": usage.as_dict(),
@@ -1871,10 +1938,41 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
                     if not tool_calls:
                         continue
 
-            results = await asyncio.gather(*[
-                call_api(tc["function"]["name"], tc["function"].get("arguments", {}))
-                for tc in tool_calls
-            ])
+            async def execute_tool(tc):
+                name = tc["function"]["name"]
+                arguments = tc["function"].get("arguments", {})
+                await report(
+                    "executing_tool",
+                    f"Executing {name}",
+                    tool=name,
+                )
+                if name == "networks_flow_inventory":
+                    await report(
+                        "flow_resolution",
+                        "Fetching and resolving VCF Networks flow inventory",
+                        tool=name,
+                        hours=arguments.get("hours", 1),
+                        limit=arguments.get("limit", 100),
+                    )
+                started = time.perf_counter()
+                try:
+                    return await call_api(name, arguments)
+                finally:
+                    elapsed = time.perf_counter() - started
+                    logger.info(
+                        "tool_execution tool=%s elapsed_seconds=%.3f",
+                        name,
+                        elapsed,
+                    )
+                    if name == "networks_flow_inventory":
+                        await report(
+                            "flow_resolution",
+                            "VCF Networks flow inventory resolved",
+                            tool=name,
+                            elapsed_seconds=round(elapsed, 3),
+                        )
+
+            results = await asyncio.gather(*[execute_tool(tc) for tc in tool_calls])
 
             # Label each result with its tool name. Without this, parallel calls
             # come back as anonymous blobs the model cannot tell apart.
@@ -2749,13 +2847,7 @@ def _openai_response(model_id: str, text: str, usage: dict) -> dict:
 
 
 def _sse_stream(payload: dict):
-    """One-shot SSE.
-
-    The tool loop runs many rounds before there is anything to say, so there is
-    no partial text to stream. Clients still default to stream=true, and a
-    client waiting for an SSE frame it never gets just hangs, so answer in the
-    shape it asked for.
-    """
+    """OpenAI SSE for an already-completed response."""
     created = payload["created"]
     base = {"id": payload["id"], "object": "chat.completion.chunk",
             "created": created, "model": payload["model"]}
@@ -2769,6 +2861,113 @@ def _sse_stream(payload: dict):
     for chunk in (first, body, last):
         yield f"data: {json.dumps(chunk)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+async def _progress_sse_stream(model_id: str, complete):
+    """Bridge live tool-loop callbacks into OpenAI-compatible SSE chunks.
+
+    Open WebUI recognizes ``reasoning_content`` as a separate activity panel,
+    while strict OpenAI clients ignore the unknown delta field. Status text is
+    never placed in ``content`` or in the model conversation. The accompanying
+    top-level extension gives other clients a stable machine-readable form.
+    """
+    queue = asyncio.Queue()
+    stream_started = time.perf_counter()
+
+    async def progress(stage: str, message: str, details: dict) -> None:
+        await queue.put(("status", {
+            "stage": stage,
+            "message": message,
+            "elapsed_seconds": round(time.perf_counter() - stream_started, 3),
+            **details,
+        }))
+
+    async def run() -> None:
+        try:
+            await queue.put(("started", None))
+            payload = await complete(progress)
+            await queue.put(("result", payload))
+        except Exception as exc:
+            logger.exception("openai_stream failed")
+            await queue.put(("error", exc))
+
+    task = asyncio.create_task(run())
+    chunk_id = f"chatcmpl-{secrets.token_hex(12)}"
+    created = int(time.time())
+    base = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_id,
+    }
+    role_sent = False
+
+    try:
+        while True:
+            kind, value = await queue.get()
+            if kind == "started":
+                continue
+            if kind == "status":
+                delta = {"reasoning_content": value["message"] + "\n"}
+                if not role_sent:
+                    delta["role"] = "assistant"
+                    role_sent = True
+                chunk = dict(
+                    base,
+                    choices=[{"index": 0, "delta": delta, "finish_reason": None}],
+                    x_copilot_status=value,
+                )
+                yield f"data: {json.dumps(chunk)}\n\n"
+                continue
+            if kind == "error":
+                error = {
+                    "error": {
+                        "message": str(value) or value.__class__.__name__,
+                        "type": value.__class__.__name__,
+                    }
+                }
+                yield f"data: {json.dumps(error)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            payload = value
+            if not role_sent:
+                first = dict(
+                    base,
+                    choices=[{
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "finish_reason": None,
+                    }],
+                )
+                yield f"data: {json.dumps(first)}\n\n"
+            body = dict(
+                base,
+                id=payload["id"],
+                created=payload["created"],
+                choices=[{
+                    "index": 0,
+                    "delta": {"content": payload["choices"][0]["message"]["content"]},
+                    "finish_reason": None,
+                }],
+            )
+            last = dict(
+                base,
+                id=payload["id"],
+                created=payload["created"],
+                choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            )
+            yield f"data: {json.dumps(body)}\n\n"
+            yield f"data: {json.dumps(last)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+    finally:
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/v1/models")
@@ -2872,6 +3071,27 @@ async def openai_chat_completions(request: Request):
     history = [m for m in history if m["content"].strip()][-(HISTORY_TURNS * 2):]
     conversation = [{"role": "system", "content": prompt_for(scope)}] + history
 
+    if stream:
+        async def complete(progress):
+            result = await chat_with_tools(
+                latest,
+                model=DEFAULT_MODEL,
+                conversation=conversation,
+                scope=scope,
+                progress=progress,
+            )
+            text = (
+                plain_text(result["answer"])
+                + _describe_pending(result.get("pending_actions", []))
+            )
+            text = await render_diagrams(text)
+            return _openai_response(model_id, text, result.get("usage") or {})
+
+        return StreamingResponse(
+            _progress_sse_stream(model_id, complete),
+            media_type="text/event-stream",
+        )
+
     try:
         result = await chat_with_tools(
             latest,
@@ -2888,8 +3108,6 @@ async def openai_chat_completions(request: Request):
     text = plain_text(result["answer"]) + _describe_pending(result.get("pending_actions", []))
     text = await render_diagrams(text)
     payload = _openai_response(model_id, text, result.get("usage") or {})
-    if stream:
-        return StreamingResponse(_sse_stream(payload), media_type="text/event-stream")
     return payload
 
 

@@ -352,6 +352,41 @@ def test_an_interactive_run_still_gets_its_tools(monkeypatch):
         "tools were withheld from an interactive question"
 
 
+def test_tool_loop_reports_operational_progress_in_order(monkeypatch):
+    fake = FakeOllama("networks_flow_inventory")
+    events = []
+
+    async def spy(name, args, **kwargs):
+        return {"flow_count": 1, "flows": [{"source_vm": "web01"}]}
+
+    async def progress(stage, message, details):
+        events.append((stage, message, details))
+
+    monkeypatch.setattr(o.httpx, "AsyncClient", lambda **kw: FakeClient(fake))
+    monkeypatch.setattr(o, "call_api", spy)
+    monkeypatch.setattr(o, "TOOLS_BY_SCOPE",
+                        {"all": [o._schema(t) for t in o.REGISTRY]})
+
+    asyncio.run(o.chat_with_tools(
+        "show the flows",
+        scope="all",
+        progress=progress,
+    ))
+
+    stages = [event[0] for event in events]
+    assert stages == [
+        "selecting_tools",
+        "executing_tool",
+        "flow_resolution",
+        "flow_resolution",
+        "analyzing_results",
+        "final_analysis",
+    ]
+    assert events[1][2]["tool"] == "networks_flow_inventory"
+    assert "Fetching and resolving" in events[2][1]
+    assert "resolved" in events[3][1]
+
+
 # --- API surface --------------------------------------------------------------
 
 from fastapi.testclient import TestClient  # noqa: E402

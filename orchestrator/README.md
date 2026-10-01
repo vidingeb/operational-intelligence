@@ -45,6 +45,8 @@ environment set behaves exactly as before.
 | `HISTORY_TURNS` | `6` | Prior exchanges replayed into a follow-up question |
 | `SCHEDULER_ENABLED` | `true` | Set false to run without the schedule runner |
 | `SCHEDULER_TICK` | `30` | Seconds between checks for a due schedule |
+| `FLOW_INVENTORY_CACHE_TTL` | `60` | VCF Networks service: seconds to reuse a resolved flow inventory; `0` disables |
+| `FLOW_INVENTORY_CACHE_MAX_ENTRIES` | `32` | VCF Networks service: maximum cached inventory variants |
 | `UI_BIND` | `127.0.0.1` | Interface `web_ui.py` listens on |
 | `UI_AUTH` | `tailscale` | `tailscale` or `none`; any other value refuses to start |
 | `UI_ALLOWED_LOGINS` | *(empty)* | Comma-separated logins; empty means any tailnet user |
@@ -264,6 +266,43 @@ curl http://localhost:8090/config
 # Liveness of inference and each API
 curl http://localhost:8090/health
 ```
+
+### Open WebUI progress
+
+The OpenAI-compatible `/v1/chat/completions` stream reports operational
+milestones before the answer: tool selection, each named tool execution, flow
+inventory resolution, and final answer analysis. Status chunks use
+`choices[0].delta.reasoning_content` plus a machine-readable top-level
+`x_copilot_status` object:
+
+```json
+{
+  "choices": [{"delta": {"reasoning_content": "Executing networks_flow_inventory\n"}}],
+  "x_copilot_status": {
+    "stage": "executing_tool",
+    "message": "Executing networks_flow_inventory",
+    "elapsed_seconds": 2.184,
+    "tool": "networks_flow_inventory"
+  }
+}
+```
+
+Current Open WebUI renders `reasoning_content` in its separate collapsible
+activity/reasoning panel. It is never sent as an answer `content` delta or
+added to the model conversation. Other OpenAI clients may ignore that optional
+delta field and the `x_copilot_status` extension; normal answer chunks and the
+terminal `data: [DONE]` remain unchanged. This reports milestones, not model
+reasoning or chain-of-thought.
+
+### Flow inventory cache
+
+`/ni/flows/inventory` caches only fully resolved successful responses in the
+VCF Networks process. The exact `(hours, limit, traffic_type, vm)` request is
+the key. Entries expire after `FLOW_INVENTORY_CACHE_TTL` seconds, the oldest
+entry is evicted above `FLOW_INVENTORY_CACHE_MAX_ENTRIES`, and callers receive
+deep copies. Identical concurrent misses share one upstream resolution.
+Failures and partial results containing a failed flow detail are not cached.
+Set the TTL to `0` to disable both reuse and request coalescing.
 
 `/health` always returns HTTP 200 so a probe can read the detail; branch on
 the `status` field instead:
