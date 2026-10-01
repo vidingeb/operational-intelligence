@@ -106,6 +106,38 @@ def test_backup_sessions_use_exact_results_and_jobs_are_unique():
         "Failed": 1, "Success": 1, "Warning": 1
     }
     assert analysis["counts"]["unique_backup_jobs"] == 2
+    assert analysis["backup_status"] == "WARNING"
+
+
+def test_unknown_restore_point_freshness_is_not_reported_healthy():
+    data = sources()
+    data["veeam_sessions"] = env(
+        "Veeam",
+        "sessions",
+        {"sessions": [{"name": "job-a", "result": "Success"}]},
+        ("sessions",),
+    )
+    data["veeam_protected"] = env(
+        "Veeam",
+        "protected",
+        {"objects": [{"name": "on-good", "restore_points": 2,
+                      "newest_restore_point_age_hours": None}]},
+        ("objects",),
+    )
+    analysis = h.analyze(data)
+    assert analysis["backup_status"] == "UNKNOWN"
+    report = {
+        "report_id": "report-1",
+        "collector_version": h.COLLECTOR_VERSION,
+        "schema_version": h.SCHEMA_VERSION,
+        "metadata": {
+            "collected_at": NOW,
+            "window": {"start": NOW, "end": NOW},
+        },
+        "sources": data,
+        "analysis": analysis,
+    }
+    assert "| Backup | **UNKNOWN** |" in h.render(report)
 
 
 def test_no_restore_point_wording_requires_review_not_automatic_enrollment():

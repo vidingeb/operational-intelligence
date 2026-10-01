@@ -327,11 +327,20 @@ def analyze(envelopes: dict, previous: Optional[dict] = None) -> dict:
     session_counts = Counter(str(item.get("result") or "Unknown") for item in sessions)
     failed_sessions = [
         item for item in sessions
-        if str(item.get("result") or "").lower() not in ("success", "")
+        if str(item.get("result") or "").lower() == "failed"
     ]
     backup = _backup_classification(vms, protected, failed_sessions)
     backup_counts = Counter(item["classification"] for item in backup)
     powered_on_tools_problems = [vm for vm in vms if _tools_problem(vm)]
+    if failed_sessions or session_counts.get("Warning") or any(
+        backup_counts.get(status)
+        for status in ("failed_job_or_session", "no_restore_point", "stale_restore_point")
+    ):
+        backup_status = "WARNING"
+    elif backup_counts.get("unknown"):
+        backup_status = "UNKNOWN"
+    else:
+        backup_status = "HEALTHY"
 
     host_dimensions = {
         "inventory": "HEALTHY" if envelopes["vcenter_hosts"]["status"] == "complete" else "UNKNOWN",
@@ -393,12 +402,13 @@ def analyze(envelopes: dict, previous: Optional[dict] = None) -> dict:
         "UNKNOWN" if any(status in ("failed", "truncated", "partial") for status in source_status.values())
         else "HEALTHY",
         "CRITICAL" if alarm_counts.get("CRITICAL") or alarm_counts.get("RED") else "HEALTHY",
-        "WARNING" if failed_sessions else "HEALTHY",
+        backup_status,
     ])
 
     return {
         "aggregate_status": aggregate,
         "host_status": host_status,
+        "backup_status": backup_status,
         "host_dimensions": host_dimensions,
         "counts": {
             "hosts": len(hosts),
@@ -459,7 +469,7 @@ def render(report: dict) -> str:
         f"| Estate | **{a['aggregate_status']}** | Conservative aggregate; missing required checks are UNKNOWN |",
         f"| Hosts | **{a['host_status']}** | {c['hosts']} hosts; hardware/network/path checks remain explicit |",
         f"| VMs | **{'WARNING' if c['powered_on_tools_problems'] else 'HEALTHY'}** | {c['vms']} VMs; {c['powered_on_tools_problems']} powered-on Tools problems |",
-        f"| Backup | **{'WARNING' if c['backup_classification'].get('no_restore_point', 0) or c['backup_classification'].get('failed_job_or_session', 0) else 'HEALTHY'}** | Exact session and restore-point evidence below |",
+        f"| Backup | **{a['backup_status']}** | Exact session and restore-point evidence below |",
         "",
         "## Priority findings",
         "",
