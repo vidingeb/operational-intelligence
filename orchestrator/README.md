@@ -51,6 +51,7 @@ environment set behaves exactly as before.
 | `UI_AUTH` | `tailscale` | `tailscale` or `none`; any other value refuses to start |
 | `UI_ALLOWED_LOGINS` | *(empty)* | Comma-separated logins; empty means any tailnet user |
 | `ORCHESTRATOR_BIND` | `127.0.0.1` | Interface `orchestrator.py` listens on |
+| `DIAGRAM_PUBLIC_URL_BASE` | *(empty)* | Absolute HTTPS `/diagrams` proxy URL for measured PNGs, shared by both clients |
 
 ## Access control
 
@@ -346,7 +347,7 @@ fails, the assistant says that the image was unread rather than guessing.
 
 `vcenter_folders` is the authoritative read-only folder list/search tool. Its
 vCenter endpoint is `GET /folders`, with optional case-insensitive `name` and
-`exact=true|false` parameters. Results include stable full inventory paths,
+`exact=true|false` parameters. Results include stable managed-object IDs and full inventory paths,
 parent path/name, VM/host/network/datastore/generic category, an explicit
 system-folder flag, and a bounded immediate-child summary. Duplicate folder
 names remain distinct through their full paths. The response reports
@@ -359,7 +360,171 @@ NSX searches do not prove folder absence. A screenshot response from a general
 model such as `qwen3:8b` is likewise unsupported evidence until the folder tool
 confirms it.
 
-Rollback is configuration-only after reverting the application commit: restore
+### Measured infrastructure diagrams
+
+`folder_topology_diagram` is a local **read-only** tool in the `all` and
+`vcenter` scopes. Python, not the model, collects the inventory, builds a
+typed graph, emits Mermaid, renders a local PNG and writes the final report.
+The tool loop returns that report directly, without a model synthesis round.
+Usage accounting, conversation history, pending write approvals and scheduled
+read-only operation keep their existing behavior. Model-generated Mermaid or
+links to unverified diagram images are withheld rather than passed off as
+measured topology. This is an intentional change from syntax-only validation.
+
+The tool accepts:
+
+```json
+{"selector":{"path":"/DC/vm/Apps"},"recursive":true}
+```
+
+Exactly one selector field is allowed: `folder_id`, `path`, or `name`.
+Paths are full, case-sensitive inventory paths; each segment is percent-encoded
+so a slash in a folder name is not a path separator. `name` is an exact,
+case-insensitive match, **not** a VM-name search. Duplicate folder names produce
+HTTP 409 with candidate IDs/paths; choose an ID or full path rather than the
+first result. `GET /folders` supplies these selectors.
+
+The Windows wrapper supplies `GET /folders/topology` with the same
+`folder_id|path|name` selector and `recursive=true|false`. Recursive membership
+includes descendant folders/vApps; `false` includes only immediate VM children.
+The response explicitly states the mode. Views are destroyed in `finally`.
+Failed folder enumeration/resolution returns an error, not a claim of absence.
+A complete scan with no matching folder returns 404. An old wrapper's generic
+404 `Not Found` is reported as **unsupported: update Windows first**.
+
+The response schema is `folder-topology-v1`: vCenter source, collection UTC
+timestamp, exact folder identity, membership mode, completeness/errors,
+enumerated/examined/returned VM counts, truncation and per-VM identities,
+runtime host, datastores and per-vNIC backing. V1 does not truncate. An empty
+folder is reported only after a complete collection; partial results retain
+observed objects and explicit per-object/per-relationship errors. Failed
+identity reads do not generate placeholder VM names. Counts can differ on
+incomplete collections, and the report shows that difference. PNG/Mermaid
+output is withheld if any enumerated VM identity is missing without explicit
+truncation; rendered VM counts must equal the enumerated population. Partial
+host/storage/network reads can still render all identified VMs with explicit
+errors and only the proven edges.
+
+The normalized `measured-graph-v1` graph contains typed nodes and edges.
+Node IDs encode the complete type/object ID, never the display name or a
+shortened hash. Shared objects deduplicate by identity, duplicate names stay
+distinct, labels are escaped, and nodes/edges sort deterministically. Every
+edge has `source`, `endpoint`, `object_id`, `relationship` and `target_id`
+evidence. Only these edges exist:
+
+- Selected folder to enumerated VMs: immediate or recursive membership.
+- VM to its observed `runtime.host`.
+- VM to datastores returned by `VirtualMachine.datastore`.
+- VM to its actual device-key vNIC, then to its resolved network backing.
+
+Distributed backing resolves the actual switch UUID/portgroup key; unresolved
+backing remains an explicit error with the observed keys. Opaque network
+IDs/types stay opaque, **not** inferred NSX segments. Storage/network edges
+mean backing/attachment, **not traffic**. No folder-to-host or host-to-storage
+shortcut, application role, SNMP/API dependency, backup protection/repository,
+firewall ALLOW/DROP rule, forced firewall hop or host metric is inferred.
+Firewall rules, traffic and host metrics are explicitly not examined in v1.
+A proposed design is not measured evidence and must be discussed separately
+as a proposal; this tool does not draw hypothetical topology.
+
+Progress callbacks emit `folder_resolution`, `topology_collection`,
+`diagram_generation` and `diagram_rendering`. OpenAI streaming carries these
+through the existing status frames. Collection and renderer failures remain
+explicit; a retained Mermaid source is not described as a successful PNG.
+
+#### Images in both clients
+
+Set `DIAGRAM_PUBLIC_URL_BASE` to the authenticated absolute HTTPS origin/path
+that actually serves `/diagrams`, for example
+`https://assistant.your-tailnet.ts.net/diagrams`. Both the custom `/chat`
+response and OpenAI `/v1/chat/completions` response embed the **same URL**.
+Relative URLs are not emitted by this tool: Open WebUI runs at another
+origin and cannot be assumed to have that route. A missing/invalid public
+base is an explicit image error, not a public-endpoint fallback.
+
+The custom UI creates responsive image elements only for hash-named PNGs on
+the local `/diagrams` path or the configured trusted HTTPS base. It never
+interprets arbitrary HTML or fetches images from other origins. Mermaid source
+is collapsed in optional details; image failures show an explicit message.
+Open/download controls use the same authenticated URL. Stored answers use the
+same renderer, and PDF export waits for images (or prints a visible load error)
+instead of printing a Markdown image token or silently omitting the diagram.
+
+Preserve the existing Tailscale Serve `/diagrams` mapping to
+`http://127.0.0.1:8090/diagrams` and `DIAGRAM_AUTH=tailscale`.
+Confirm the route with `tailscale serve status`, then retrieve a rendered
+image through HTTPS as an authenticated tailnet user. No new public route,
+auth bypass, third-party image model, export service or Ollama runtime is
+needed. PNG rendering reuses the existing offline Mermaid container and
+content-hash filenames. Leave vision configuration unchanged.
+
+#### Windows-first rollout and rollback
+
+**Manual deployment gate:** this change must not restart either host during
+development. Obtain coordinated approval before running these instructions.
+Use the tested commit SHA supplied in the implementation handoff.
+
+On the Windows API host, run elevated PowerShell:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$ExpectedCommit = '<tested commit SHA from handoff>'
+Set-Location C:\MCP
+if (git status --porcelain --untracked-files=no) { throw 'Tracked changes: stop and preserve them' }
+git fetch origin
+if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
+git switch vidingeb-verified-infrastructure-diagrams
+if ($LASTEXITCODE -ne 0) { throw 'git switch failed' }
+git pull --ff-only origin vidingeb-verified-infrastructure-diagrams
+if ($LASTEXITCODE -ne 0) { throw 'git pull failed' }
+if ((git rev-parse HEAD).Trim() -ne $ExpectedCommit) { throw 'Unexpected checkout SHA' }
+& C:\Python\python.exe -m py_compile C:\MCP\vcenter\vcenter_api.py
+if ($LASTEXITCODE -ne 0) { throw 'Python syntax check failed' }
+Restart-Service mcp-vcenter
+Get-Service mcp-vcenter
+$matches = Invoke-RestMethod 'http://127.0.0.1:8080/folders?name=Tn3-Pod1&exact=true'
+if (-not $matches.complete -or $matches.count -ne 1) { throw 'Resolve folder ambiguity/errors first' }
+$path = [Uri]::EscapeDataString($matches.folders[0].path)
+$topology = Invoke-RestMethod "http://127.0.0.1:8080/folders/topology?path=$path&recursive=true"
+$topology | ConvertTo-Json -Depth 12
+if ($topology.schema_version -ne 'folder-topology-v1' -or -not $topology.complete) {
+    throw 'Topology unsupported/incomplete: inspect errors before Linux rollout'
+}
+if ($topology.counts.enumerated -ne $topology.counts.returned -or
+    $topology.counts.returned -ne @($topology.vms).Count) { throw 'Topology count mismatch' }
+```
+
+No dependency install or NSSM service-path change is required. The existing
+service runs `C:\Python\python.exe -m uvicorn vcenter_api:app --host 0.0.0.0
+--port 8080` in `C:\MCP\vcenter`; diagnostics are in
+`C:\MCP\logs\mcp-vcenter.log`.
+
+Only after Windows success and coordinated approval, update
+`/opt/operational-intelligence` on the orchestrator to the same pinned branch
+and SHA (fetch, switch, fast-forward only, verify SHA). Stop if tracked files
+are modified. Preserve the state DB, the untracked DB backup and all existing
+systemd environment entries; do not clean, reset or replace the checkout.
+Add only `Environment="DIAGRAM_PUBLIC_URL_BASE=<verified HTTPS /diagrams URL>"`
+to an orchestrator-service drop-in, leaving the existing renderer, auth,
+vision, model and cache settings intact. Then run `systemctl daemon-reload`
+and restart `orchestrator.service` and `orchestrator-ui.service` to load the
+new image renderer. No Tailscale Serve reconfiguration is needed.
+
+Verify `/health`, a folder diagram in both UIs, exact VM counts/names and the
+same authenticated PNG URL. Check a screenshot turn, daily health report and
+cached flow lookup for regressions. A live membership preview before Windows
+update can use `/folders?name=Tn3-Pod1&exact=true`, but this proves only folder
+identity/child summaries, **not host/storage/network topology**.
+
+Rollback in reverse order after approval: check out the prior deployed
+commit `f4aeb52d0d9094797e114dbe9fb04a6829fb27ef` on Linux, remove only the
+new public-URL environment entry, reload systemd and restart both orchestrator
+and custom UI services.
+On Windows, restore that same commit and restart `mcp-vcenter`. Preserve all
+other env values, databases/backups and service configuration. No model
+removal is involved.
+
+For the vision feature, rollback is configuration-only after reverting its application commit: restore
 the prior `VISION_MODEL`/`VISION_NUM_CTX` values in the existing systemd
 drop-in, run `systemctl daemon-reload`, and restart only the orchestrator and
 custom WebUI services. Removing the downloaded Ollama model is optional and
@@ -444,7 +609,8 @@ will pay a load cost on the next request.
 2. The orchestrator forwards it to Ollama (Llama 3.2) with tool definitions
 3. The LLM decides which API(s) to call based on the question
 4. The orchestrator executes those API calls against the MCP server
-5. Results are fed back to the LLM for synthesis
+5. Results are fed back to the LLM for synthesis, except measured folder diagrams,
+   whose authoritative Python report returns directly
 6. A human-readable answer is returned
 
 ## Example Questions

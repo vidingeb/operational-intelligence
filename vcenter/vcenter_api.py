@@ -148,6 +148,7 @@ def _folder_record(folder, content, system_folders):
     parent = getattr(folder, "parent", None)
     folder_id = getattr(folder, "_moId", None)
     return {
+        "id": folder_id,
         "name": str(getattr(folder, "name", "")),
         "path": _inventory_path(folder, content.rootFolder),
         "parent_name": (
@@ -292,9 +293,11 @@ def list_folders(
     impossible to interpret.
     """
     content = get_si().RetrieveContent()
-    datacenter_view = get_view(content, vim.Datacenter)
-    folder_view = get_view(content, vim.Folder)
+    datacenter_view = None
+    folder_view = None
     try:
+        datacenter_view = get_view(content, vim.Datacenter)
+        folder_view = get_view(content, vim.Folder)
         system_folders = {}
         for datacenter in datacenter_view.view:
             for attr, category in (
@@ -331,8 +334,256 @@ def list_folders(
             "note": "Datacenter objects are excluded because they are not folders.",
         }
     finally:
-        folder_view.Destroy()
-        datacenter_view.Destroy()
+        try:
+            if folder_view is not None:
+                folder_view.Destroy()
+        finally:
+            if datacenter_view is not None:
+                datacenter_view.Destroy()
+
+
+@app.get("/folders/topology")
+def folder_topology(
+    folder_id: str = Query(None, description="Exact folder managed-object ID"),
+    path: str = Query(None, description="Exact canonical escaped inventory path"),
+    name: str = Query(None, description="Exact case-insensitive folder name"),
+    recursive: bool = Query(True, description="Include descendant folders and vApps"),
+):
+    """Read actual VM membership and relationships, without inferred connectivity."""
+    selectors = [value for value in (folder_id, path, name) if value is not None]
+    if len(selectors) != 1 or not selectors[0]:
+        raise HTTPException(400, "Supply exactly one nonempty folder_id, path, or name")
+
+    errors = []
+    views = []
+
+    def object_id(obj):
+        return getattr(obj, "_moId", None)
+
+    def failure(obj, relationship, exc):
+        errors.append({
+            "object_id": object_id(obj) if obj is not None else None,
+            "relationship": relationship,
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+
+    def identity(obj):
+        moid = object_id(obj)
+        label = obj.name
+        if not moid or not isinstance(label, str) or not label:
+            raise ValueError("Managed object has no readable ID or name")
+        # _inventory_path intentionally tolerates missing names for other endpoints.
+        # Here every ancestor must be readable to claim an authoritative path.
+        seen = set()
+        current = obj
+        while current is not content.rootFolder:
+            if current is None or object_id(current) in seen:
+                raise ValueError("Inventory parent chain is missing or cyclic")
+            seen.add(object_id(current))
+            if not current.name:
+                raise ValueError("Inventory ancestor has no readable name")
+            current = current.parent
+        return {"id": moid, "name": label, "path": _inventory_path(obj, content.rootFolder)}
+
+    def view(kind):
+        created = get_view(content, kind)
+        views.append(created)
+        return created
+
+    def backing_value(value):
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, vim.ManagedObject):
+            return {"id": object_id(value)}
+        if isinstance(value, (list, tuple)):
+            return [backing_value(item) for item in value]
+        if hasattr(value, "_GetPropertyList"):
+            return {
+                prop.name: backing_value(getattr(value, prop.name))
+                for prop in value._GetPropertyList()
+            }
+        raise ValueError(f"Unsupported backing value: {type(value).__name__}")
+
+    result = None
+    try:
+        try:
+            content = get_si().RetrieveContent()
+            folders = list(view(vim.Folder).view)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            failure(None, "folders.enumeration", exc)
+            raise HTTPException(502, {"complete": False, "errors": errors})
+
+        matches = []
+        for folder in folders:
+            try:
+                record = identity(folder)
+                if (
+                    (folder_id is not None and record["id"] == folder_id)
+                    or (path is not None and record["path"] == path)
+                    or (name is not None and record["name"].casefold() == name.casefold())
+                ):
+                    matches.append((folder, record))
+            except Exception as exc:
+                failure(folder, "folder.identity", exc)
+        if errors:
+            raise HTTPException(502, {"complete": False, "errors": errors})
+        matches.sort(key=lambda item: (item[1]["path"], item[1]["id"]))
+        if not matches:
+            raise HTTPException(404, {"complete": True, "error": "Folder not found"})
+        if len(matches) > 1:
+            raise HTTPException(409, {
+                "complete": True, "error": "Folder selector is ambiguous",
+                "candidates": [record for _, record in matches],
+            })
+        selected, folder_record = matches[0]
+        members = {}
+        visited = set()
+
+        def walk(container):
+            cid = object_id(container)
+            if cid in visited:
+                return
+            visited.add(cid)
+            relationship = "vapp.vm" if isinstance(container, vim.VirtualApp) else "folder.childEntity"
+            try:
+                children = list(container.vm if isinstance(container, vim.VirtualApp) else container.childEntity)
+            except Exception as exc:
+                failure(container, relationship, exc)
+                return
+            if isinstance(container, vim.VirtualApp) and recursive:
+                try:
+                    children += list(container.resourcePool)
+                except Exception as exc:
+                    failure(container, "vapp.resourcePool", exc)
+            for child in children:
+                if isinstance(child, vim.VirtualMachine):
+                    members[object_id(child)] = child
+                elif recursive and isinstance(child, (vim.Folder, vim.VirtualApp)):
+                    walk(child)
+
+        walk(selected)
+        distributed = None
+
+        def distributed_network(switch_uuid, pg_key):
+            nonlocal distributed
+            if distributed is None:
+                distributed = {}
+                try:
+                    groups = list(view(vim.dvs.DistributedVirtualPortgroup).view)
+                    for group in groups:
+                        try:
+                            key = (group.config.distributedVirtualSwitch.uuid, group.key)
+                            distributed.setdefault(key, []).append(group)
+                        except Exception as exc:
+                            failure(group, "distributed_portgroup.backing", exc)
+                except Exception as exc:
+                    failure(None, "distributed_portgroups.enumeration", exc)
+            groups = distributed.get((switch_uuid, pg_key), [])
+            if len(groups) != 1:
+                raise ValueError("Distributed backing does not resolve to exactly one switch UUID/portgroup key")
+            return dict(identity(groups[0]), kind="distributed",
+                        switch_uuid=switch_uuid, portgroup_key=pg_key)
+
+        vms = []
+        examined = 0
+        for mid, vm in sorted(members.items(), key=lambda item: item[0] or ""):
+            examined += 1
+            try:
+                record = identity(vm)
+            except Exception as exc:
+                failure(vm, "vm.identity", exc)
+                continue
+            record.update(host=None, datastores=[], nics=[])
+            try:
+                host = vm.runtime.host
+                if host is not None:
+                    record["host"] = identity(host)
+            except Exception as exc:
+                failure(vm, "vm.runtime.host", exc)
+            try:
+                datastores = list(vm.datastore)
+            except Exception as exc:
+                failure(vm, "vm.datastore", exc)
+                datastores = []
+            seen_datastores = set()
+            for datastore in datastores:
+                try:
+                    ds = identity(datastore)
+                    if ds["id"] not in seen_datastores:
+                        record["datastores"].append(ds)
+                        seen_datastores.add(ds["id"])
+                except Exception as exc:
+                    failure(datastore, "vm.datastore.identity", exc)
+            record["datastores"].sort(key=lambda item: item["id"])
+            try:
+                devices = list(vm.config.hardware.device)
+            except Exception as exc:
+                failure(vm, "vm.config.hardware.device", exc)
+                devices = []
+            for device in devices:
+                if not isinstance(device, vim.vm.device.VirtualEthernetCard):
+                    continue
+                try:
+                    key = device.key
+                    label = device.deviceInfo.label
+                    if type(key) is not int or not isinstance(label, str):
+                        raise ValueError("NIC has no readable integer key or string label")
+                except Exception as exc:
+                    failure(vm, "nic.identity", exc)
+                    continue
+                nic = {"key": key, "label": label, "network": None, "backing": {}}
+                record["nics"].append(nic)
+                try:
+                    backing = device.backing
+                    nic["backing"] = (
+                        {"type": type(backing).__name__, **backing_value(backing)}
+                        if backing is not None else {"type": None}
+                    )
+                    card = vim.vm.device.VirtualEthernetCard
+                    if backing is None:
+                        continue
+                    if isinstance(backing, card.NetworkBackingInfo):
+                        if backing.network is None:
+                            raise ValueError("Standard backing has no readable network reference")
+                        nic["network"] = dict(identity(backing.network), kind="standard")
+                    elif isinstance(backing, card.DistributedVirtualPortBackingInfo):
+                        nic["network"] = distributed_network(
+                            backing.port.switchUuid, backing.port.portgroupKey)
+                    elif isinstance(backing, card.OpaqueNetworkBackingInfo):
+                        if not backing.opaqueNetworkId:
+                            raise ValueError("Opaque backing has no network ID")
+                        nic["network"] = {
+                            "id": backing.opaqueNetworkId,
+                            "name": backing.opaqueNetworkId,
+                            "path": None, "kind": "opaque",
+                            "opaque_network_type": backing.opaqueNetworkType,
+                        }
+                    else:
+                        raise ValueError(f"Unsupported NIC backing: {type(backing).__name__}")
+                except Exception as exc:
+                    failure(vm, f"nic[{nic['key']}].backing", exc)
+            record["nics"].sort(key=lambda item: item["key"])
+            vms.append(record)
+        vms.sort(key=lambda item: (item["path"], item["id"]))
+        result = {
+            "schema_version": "folder-topology-v1", "source": "vcenter",
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "folder": folder_record, "recursive": recursive,
+            "complete": not errors, "errors": errors,
+            "counts": {"enumerated": len(members), "examined": examined, "returned": len(vms)},
+            "truncated": False, "vms": vms,
+        }
+        return result
+    finally:
+        for created in reversed(views):
+            try:
+                created.Destroy()
+            except Exception as exc:
+                failure(None, "view.destroy", exc)
+        if result is not None:
+            result["complete"] = not errors
 
 
 @app.get("/vms/search")

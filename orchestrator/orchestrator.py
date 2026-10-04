@@ -51,6 +51,7 @@ from pydantic import BaseModel
 import store
 import schedule_times
 import health_report
+import topology_diagram
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,7 @@ DIAGRAM_WIDTH = os.getenv("DIAGRAM_WIDTH", "1400")
 # Resolved by the browser against whichever origin served the chat, so the same
 # answer works behind the proxy without knowing its own public URL.
 DIAGRAM_URL_BASE = os.getenv("DIAGRAM_URL_BASE", "/diagrams")
+DIAGRAM_PUBLIC_URL_BASE = os.getenv("DIAGRAM_PUBLIC_URL_BASE", "").rstrip("/")
 # "tailscale" requires the proxy's identity header; "none" serves to anyone who
 # can reach the port, which is loopback plus whatever the proxy forwards.
 DIAGRAM_AUTH = os.getenv("DIAGRAM_AUTH", "tailscale").lower()
@@ -205,6 +207,17 @@ REGISTRY = [
            "name": (Str, False, "Optional folder name; matching is case-insensitive"),
            "exact": (Bool, False, "Exact name match instead of contains (default false)"),
        }),
+    _t("folder_topology_diagram", "LOCAL", f"{VCENTER_BASE}/folders/topology",
+       "Measured infrastructure diagram for VMs in a vCenter inventory folder. "
+       "Use for folder infrastructure sketches/topology; never invent Mermaid "
+       "from names or infer firewall/traffic paths. Python collects membership, "
+       "runtime hosts, datastore and per-vNIC backing and returns the final report. "
+       "Select by stable folder_id, unambiguous full path, or exact name; ambiguous "
+       "names return candidates, never an arbitrary folder.",
+       {
+           "selector": ("object", True, "Exactly one folder_id, path, or exact name"),
+           "recursive": (Bool, False, "Include descendant folders (default true), or immediate VMs only"),
+       }, local="folder_topology_diagram"),
     _t("vcenter_vm_details", "GET", f"{VCENTER_BASE}/vm/details",
        "Detailed info for one VM: CPU, memory, disks, network, host placement",
        {"name": (Str, True, "Exact VM name")}),
@@ -562,6 +575,13 @@ def _schema(spec: dict) -> dict:
     props, required = {}, []
     for arg, (jtype, is_required, desc) in spec["params"].items():
         props[arg] = {"type": jtype, "description": desc}
+        if spec["name"] == "folder_topology_diagram" and arg == "selector":
+            props[arg].update({
+                "properties": {key: {"type": "string", "minLength": 1}
+                               for key in ("folder_id", "path", "name")},
+                "additionalProperties": False,
+                "oneOf": [{"required": [key]} for key in ("folder_id", "path", "name")],
+            })
         if is_required:
             required.append(arg)
     description = spec["description"]
@@ -659,6 +679,9 @@ the way an experienced engineer does.
   complete=true with zero matches. VM, host, cluster, datastore, NSX, or other
   searches cannot establish folder absence. Never describe an invented tool
   name as unavailable or imply that you queried a tool that is not registered.
+- Use folder_topology_diagram for a measured infrastructure sketch of a folder.
+  Pass a structured selector, never fuzzy VM names. Its report is generated in
+  Python from API evidence; do not create your own topology or add metrics.
 - Continue automatically with available read-only tools needed to answer the
   question. Do not ask the operator to run a lookup that you can run in the
   next tool round.
@@ -711,18 +734,13 @@ the way an experienced engineer does.
   more than about three items that share the same fields — one row per object,
   a header row, and a separator row. Do not emit HTML such as <br> in prose; it
   is stripped. Prose, headings and "- " bullets are fine for everything else.
-- The pane renders Mermaid diagrams from a ```mermaid fenced block. Use one for
-  topology, dependencies and design questions, where a picture carries what a
-  table cannot. Two syntax rules matter, because breaking either fails the
-  whole diagram rather than one line, and the operator sees an error instead of
-  a picture:
-  1. A %% comment must be on a line of its own. Never append one to a
-     statement: "a --> b %% note" is a parse error, not an ignored comment.
-  2. For a line break inside a label use <br/>, which is preserved inside a
-     fence. Do not rely on a backslash-n escape.
-  Diagram the estate as you actually measured it. A diagram is read as fact and
-  invites less scrutiny than prose, so never draw a component you have not
-  confirmed, and label anything unverified as such.
+- Measured diagrams come only from folder_topology_diagram. Do not write your
+  own Mermaid or invent an image URL; unsupported model diagrams are withheld
+  in code. The tool renders a local PNG, so never instruct the operator to
+  export infrastructure data through mermaid.live or another third-party site.
+  Folder membership is not application roles, backup protection, firewall
+  rules or traffic dependency evidence. Discuss proposed designs separately
+  as proposals, not as measured infrastructure.
 - Put every row you are reporting in the table. Never write "the remaining N
   follow the same pattern", "omitted for brevity", or "the full list is in the
   raw output": you have not checked that they do, the operator cannot see the
@@ -954,7 +972,7 @@ async def call_api(tool_name: str, arguments: dict, confirmed: bool = False,
         if not handler:
             return {"error": f"{tool_name} has no handler"}
         kwargs = dict(arguments or {})
-        if spec["local"] == "daily_health_report":
+        if spec["local"] in ("daily_health_report", "folder_topology_diagram"):
             kwargs["progress"] = progress
         return await handler(**kwargs)
 
@@ -1715,6 +1733,146 @@ async def render_diagrams(answer: str) -> str:
     return "\n".join(parts)
 
 
+async def folder_topology_diagram(selector: dict, recursive: bool = True,
+                                  progress=None) -> dict:
+    async def notify(stage, message):
+        if progress:
+            await progress(stage, message, {"tool": "folder_topology_diagram"})
+
+    def failure(detail, **metadata):
+        return {
+            "error": detail,
+            "report_markdown": "**Infrastructure diagram unavailable:** "
+                               + topology_diagram.markdown_text(detail),
+            "image_url": None,
+            "source": {
+                "endpoint": f"{VCENTER_BASE}/folders/topology",
+                "collected_at": datetime.now(timezone.utc).isoformat(),
+                "complete": False,
+                "errors": [{"object_id": None, "relationship": "collection", "error": detail}],
+                "counts": None,
+                "truncated": None,
+                "recursive": recursive,
+            },
+            **metadata,
+        }
+
+    await notify("folder_resolution", "Resolving an authoritative vCenter folder selector")
+    try:
+        selection = topology_diagram.FolderSelector.model_validate(selector)
+    except ValueError as exc:
+        return failure(f"Invalid folder selector: {exc}")
+    if not isinstance(recursive, bool):
+        return failure("recursive must be a boolean.")
+    params = {**selection.model_dump(exclude_none=True), "recursive": recursive}
+    await notify("topology_collection", "Collecting folder VM membership and observed backing relationships")
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.get(f"{VCENTER_BASE}/folders/topology", params=params)
+        if response.status_code == 404:
+            try:
+                detail = response.json().get("detail")
+            except ValueError:
+                detail = None
+            if detail == "Not Found":
+                return failure(
+                    "The Windows vCenter wrapper does not support /folders/topology. "
+                    "Update mcp-vcenter on Windows first; no folder absence is inferred.")
+        if response.is_error:
+            try:
+                detail = response.json().get("detail", response.text)
+            except ValueError:
+                detail = response.text
+            return failure(f"vCenter topology HTTP {response.status_code}: "
+                           f"{json.dumps(detail, ensure_ascii=True)}",
+                           api_detail=detail, status_code=response.status_code)
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        return failure(f"vCenter topology collection failed: {type(exc).__name__}: {exc}")
+
+    await notify("diagram_generation", "Generating a deterministic evidence-backed graph")
+    try:
+        graph = topology_diagram.build_graph(payload)
+        if graph.source.recursive != recursive:
+            raise ValueError("Topology API returned a different membership mode than requested.")
+        if selection.folder_id is not None and graph.source.folder.id != selection.folder_id:
+            raise ValueError("Topology API returned a different folder ID than requested.")
+        if selection.path is not None and graph.source.folder.path != selection.path:
+            raise ValueError("Topology API returned a different folder path than requested.")
+        if (selection.name is not None
+                and graph.source.folder.name.casefold() != selection.name.strip().casefold()):
+            raise ValueError("Topology API returned a different folder name than requested.")
+    except ValueError as exc:
+        return failure(f"Invalid topology API response: {exc}")
+    source = topology_diagram.mermaid(graph)
+    await notify("diagram_rendering", "Rendering the measured infrastructure diagram")
+    image_url = None
+    render_error = None
+    population_gap = (graph.source.counts.returned != graph.source.counts.enumerated
+                      and not graph.source.truncated)
+    if population_gap:
+        render_error = (
+            "Some enumerated VM identities could not be read. PNG/source withheld "
+            "rather than render fewer VMs or invent placeholder names.")
+    elif not re.fullmatch(r"https://[a-zA-Z0-9.-]+(?::\d+)?/diagrams", DIAGRAM_PUBLIC_URL_BASE):
+        render_error = (
+            "DIAGRAM_PUBLIC_URL_BASE must be an absolute HTTPS URL to the authenticated "
+            "/diagrams proxy, usable by both the custom UI and Open WebUI. "
+            "No relative image URL was emitted.")
+    elif not DIAGRAM_IMAGE:
+        render_error = "DIAGRAM_IMAGE is not configured; PNG rendering is disabled."
+    else:
+        name = await _render_one(source)
+        if name:
+            image_url = f"{DIAGRAM_PUBLIC_URL_BASE}/{name}"
+        else:
+            render_error = "The Mermaid PNG renderer failed; inspect the orchestrator journal."
+    result = {
+        "schema_version": topology_diagram.SCHEMA_VERSION,
+        "graph": graph.model_dump(),
+        "mermaid": None if population_gap else source,
+        "report_markdown": topology_diagram.report(
+            graph, f"{VCENTER_BASE}/folders/topology", image_url, render_error),
+        "image_url": image_url,
+        "source": {
+            "endpoint": f"{VCENTER_BASE}/folders/topology",
+            "collected_at": graph.source.collected_at,
+            "complete": graph.source.complete,
+            "errors": [error.model_dump() for error in graph.source.errors],
+            "counts": graph.source.counts.model_dump(),
+            "truncated": graph.source.truncated,
+            "recursive": graph.source.recursive,
+        },
+    }
+    if render_error:
+        result["error"] = render_error
+    return result
+
+
+async def client_answer(result: dict) -> str:
+    if result.get("authoritative_diagram"):
+        return result["answer"]
+    return await render_diagrams(plain_text(result["answer"]))
+
+
+def safe_model_answer(answer: str) -> str:
+    unverified = any(fenced and info.lower() == "mermaid"
+                     for fenced, info, _ in _iter_fence_segments(answer))
+    unverified = unverified or bool(re.search(
+        r"!\[[^\]]*\]\([^)\n]*/diagrams/[0-9a-f]{16}\.png", answer))
+    if unverified:
+        logger.warning("Withheld model-generated diagram without authoritative graph evidence")
+        return (
+            "**Unverified infrastructure diagram withheld.** The model did not return "
+            "an API-backed folder topology report. No VM names, application roles, "
+            "backup protection, firewall rules or traffic relationships from that "
+            "diagram are confirmed. Use folder_topology_diagram with a stable folder "
+            "ID, full inventory path or unambiguous exact name. Measured PNGs are "
+            "rendered locally, not exported to third-party services."
+        )
+    return repair_mermaid(answer)
+
+
 LOCAL_HANDLERS = {
     "triage_vm": triage_vm,
     "triage_host": triage_host,
@@ -1722,6 +1880,7 @@ LOCAL_HANDLERS = {
     "backup_coverage": backup_coverage,
     "estate_versions": estate_versions,
     "daily_health_report": daily_health_report,
+    "folder_topology_diagram": folder_topology_diagram,
 }
 
 
@@ -1975,7 +2134,7 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
                         round=round_number,
                     )
                     return {
-                        "answer": _flag_tool_failures(repair_mermaid(content), tool_errors),
+                        "answer": _flag_tool_failures(safe_model_answer(content), tool_errors),
                         "usage": usage.as_dict(),
                         "tools_called": tools_called,
                         "pending_actions": pending_actions,
@@ -2075,6 +2234,28 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
                     "content": summarize_tool_result(result_data),
                 })
 
+            # The model selects the folder; it cannot rewrite measured facts,
+            # add graph edges, or turn an API/renderer failure into success.
+            diagrams = [
+                result for tc, result in zip(tool_calls, results)
+                if tc["function"]["name"] == "folder_topology_diagram"
+                and isinstance(result, dict) and "report_markdown" in result
+            ]
+            if diagrams:
+                answer = "\n\n".join(result["report_markdown"] for result in diagrams)
+                other_errors = [error for error in tool_errors
+                                if error["tool"] != "folder_topology_diagram"]
+                answer = _flag_tool_failures(answer, other_errors)
+                conversation.append({"role": "assistant", "content": answer})
+                return {
+                    "answer": answer,
+                    "authoritative_diagram": True,
+                    "usage": usage.as_dict(),
+                    "tools_called": tools_called,
+                    "pending_actions": pending_actions,
+                    "tool_errors": tool_errors,
+                }
+
         # Out of rounds, or the model stalled: ask once more with tools withheld
         # so it has to produce prose from what it has already gathered.
         conversation.append({
@@ -2090,7 +2271,7 @@ async def chat_with_tools(user_message: str, model: str = None, conversation: li
             "model with stronger tool-calling support."
         )
         return {
-            "answer": _flag_tool_failures(repair_mermaid(answer), tool_errors),
+            "answer": _flag_tool_failures(safe_model_answer(answer), tool_errors),
             "usage": usage.as_dict(),
             "tools_called": tools_called,
             "pending_actions": pending_actions,
@@ -2226,6 +2407,7 @@ async def config():
             "mime_types": sorted(_IMAGE_SIGNATURES),
         },
         "diagram_renderer": DIAGRAM_IMAGE or None,
+        "diagram_public_url_base": DIAGRAM_PUBLIC_URL_BASE or None,
         # Exposed so the UI describes the systems actually wired up rather
         # than a list written by hand, which went stale the moment logs and
         # backup were added.
@@ -2406,7 +2588,7 @@ async def chat(request: ChatRequest):
         # Telemetry is best-effort decoration; a dead exporter must not fail a
         # question that was answered successfully.
         return ChatResponse(
-            answer=await render_diagrams(plain_text(result["answer"])),
+            answer=await client_answer(result),
             model=use_model,
             usage=result["usage"],
             tools_called=result["tools_called"],
@@ -2670,7 +2852,8 @@ async def run_scheduled(schedule: dict) -> str:
             schedule["question"], model=schedule.get("model"),
             conversation=conversation, scope=schedule.get("scope", "all"),
             read_only=True)
-        store.finish_run(run_id, answer=plain_text(result["answer"]),
+        store.finish_run(run_id, answer=(result["answer"] if result.get("authoritative_diagram")
+                                       else plain_text(result["answer"])),
                          tools_called=result["tools_called"],
                          usage=result["usage"])
     except Exception as exc:
@@ -3268,11 +3451,8 @@ async def openai_chat_completions(request: Request):
                 scope=scope,
                 progress=progress,
             )
-            text = (
-                plain_text(result["answer"])
-                + _describe_pending(result.get("pending_actions", []))
-            )
-            text = await render_diagrams(text)
+            text = await client_answer(result)
+            text += _describe_pending(result.get("pending_actions", []))
             return _openai_response(model_id, text, result.get("usage") or {})
 
         return StreamingResponse(
@@ -3296,8 +3476,8 @@ async def openai_chat_completions(request: Request):
             detail=f"Cannot reach Ollama at {OLLAMA_URL} — is it running and reachable?",
         )
 
-    text = plain_text(result["answer"]) + _describe_pending(result.get("pending_actions", []))
-    text = await render_diagrams(text)
+    text = await client_answer(result)
+    text += _describe_pending(result.get("pending_actions", []))
     payload = _openai_response(model_id, text, result.get("usage") or {})
     return payload
 

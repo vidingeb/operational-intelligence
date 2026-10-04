@@ -39,6 +39,91 @@ paths:
       responses:
         '200':
           description: OK
+  /folders:
+    get:
+      summary: Authoritative inventory folder list and search
+      operationId: listFolders
+      description: >
+        Includes system folders. Every folder record includes its managed-object
+        id, name, and canonical escaped inventory path for topology selectors.
+      parameters:
+        - in: query
+          name: name
+          type: string
+          description: Case-insensitive folder name filter
+        - in: query
+          name: exact
+          type: boolean
+          default: false
+          description: Exact rather than contains name matching
+      responses:
+        '200':
+          description: Folder records and explicit search completeness
+  /folders/topology:
+    get:
+      summary: Authoritative read-only topology of one inventory folder
+      operationId: getFolderTopology
+      description: >
+        Supply exactly one nonempty folder_id, path, or name. Names match exactly
+        and case-insensitively; ambiguous names return 409 with candidate IDs and
+        full paths. Paths match exactly, including case and percent escaping:
+        each inventory segment is URL-escaped (a slash in a name is %2F).
+        The path query value must also be encoded normally by the HTTP client.
+        Unknown selectors return 404 only after a complete folder scan.
+        Folder enumeration or identity failures return an explicit error, not absence.
+        Membership comes from folder.childEntity and, recursively, vApp VM and
+        nested-vApp references. recursive=false includes only immediate VMs.
+        All discovered VMs are examined without pagination or truncation.
+        Hosts come only from vm.runtime.host, storage from vm.datastore, and
+        network references from each VirtualEthernetCard backing.
+        Distributed backings resolve by both switch UUID and portgroup key,
+        never by names. Unresolved backings retain actual backing keys and errors.
+        Opaque IDs and types remain opaque; the name is the actual opaque ID
+        label, path is null, and no NSX inference is made.
+        There is no host-network, traffic, firewall, or metrics inference.
+        Partial object or relationship failures return 200 with complete=false
+        and explicit errors. Unnamed/unreadable VM identities are omitted and
+        counts still account for examination. A null relationship plus an error
+        means unreadable/unresolved, not assumed absence or disconnection.
+      parameters:
+        - in: query
+          name: folder_id
+          type: string
+          description: Exact managed-object ID from GET /folders
+        - in: query
+          name: path
+          type: string
+          description: Exact canonical escaped inventory path from GET /folders
+        - in: query
+          name: name
+          type: string
+          description: Exact case-insensitive name; refuses ambiguous matches
+        - in: query
+          name: recursive
+          type: boolean
+          default: true
+          description: Include descendant folders and vApps; always explicit in response
+      responses:
+        '200':
+          description: Complete or explicitly partial topology; inspect complete and errors
+          schema:
+            $ref: '#/definitions/FolderTopology'
+        '400':
+          description: Exactly one nonempty selector is required
+        '404':
+          description: Complete scan found no folder; detail.complete is true
+        '409':
+          description: >
+            Ambiguous selector; detail contains complete=true and candidates,
+            each with id, name, and full canonical path.
+        '422':
+          description: Invalid query parameter type (including recursive)
+        '502':
+          description: >
+            vCenter or folder enumeration/identity failure. Inventory failures
+            include detail.complete=false and detail.errors; no absence claim.
+        '503':
+          description: vCenter credentials are not configured
   /vms/search:
     get:
       summary: Search virtual machines
@@ -448,7 +533,158 @@ paths:
       responses:
         '200':
           description: OK
-definitions: {}
+definitions:
+  InventoryReference:
+    type: object
+    required: [id, name, path]
+    properties:
+      id:
+        type: string
+        description: Actual managed-object ID (not a name-based key)
+      name:
+        type: string
+        description: Actual inventory name
+      path:
+        type: string
+        description: Canonical inventory path with individually escaped segments
+  TopologyNetwork:
+    type: object
+    required: [id, name, path, kind]
+    properties:
+      id:
+        type: string
+        description: Managed-object ID, or actual opaqueNetworkId for opaque backings
+      name:
+        type: string
+        description: Actual network name, or actual opaque ID label for opaque backings
+      path:
+        type: string
+        x-nullable: true
+        description: Canonical path; null for opaque ID/type-only backings
+      kind:
+        type: string
+        enum: [standard, distributed, opaque]
+      switch_uuid:
+        type: string
+        description: Distributed backing switchUuid, when kind is distributed
+      portgroup_key:
+        type: string
+        description: Distributed backing portgroupKey, when kind is distributed
+      opaque_network_type:
+        type: string
+        description: Actual opaqueNetworkType, when kind is opaque; no inferred technology
+  TopologyNIC:
+    type: object
+    required: [key, label, network, backing]
+    properties:
+      key:
+        type: integer
+        description: Actual device key; NICs with unreadable identity are omitted with an explicit error
+      label:
+        type: string
+        description: Actual deviceInfo.label; never an invented label
+      network:
+        x-nullable: true
+        $ref: '#/definitions/TopologyNetwork'
+      backing:
+        type: object
+        additionalProperties: true
+        description: >
+          Actual backing properties serialized recursively, with type naming the
+          pyVmomi backing class. Managed-object references serialize as {id}.
+          An explicitly absent backing is {type: null}; a failed backing read
+          is {} with a corresponding error. Unresolved distributed backings
+          keep port.switchUuid, port.portgroupKey and other actual properties.
+  TopologyVM:
+    allOf:
+      - $ref: '#/definitions/InventoryReference'
+      - type: object
+        required: [host, datastores, nics]
+        properties:
+          host:
+            x-nullable: true
+            $ref: '#/definitions/InventoryReference'
+          datastores:
+            type: array
+            description: Actual vm.datastore references, deduplicated and sorted by ID
+            items:
+              $ref: '#/definitions/InventoryReference'
+          nics:
+            type: array
+            description: VirtualEthernetCard devices sorted by actual device key
+            items:
+              $ref: '#/definitions/TopologyNIC'
+  TopologyError:
+    type: object
+    required: [object_id, relationship, error]
+    properties:
+      object_id:
+        type: string
+        x-nullable: true
+        description: Actual managed-object ID; null for inventory/view-level failures
+      relationship:
+        type: string
+        description: Failed property or relationship, with device key for NIC backing errors
+      error:
+        type: string
+        description: Exception type and message
+  FolderTopology:
+    type: object
+    required:
+      - schema_version
+      - source
+      - collected_at
+      - folder
+      - recursive
+      - complete
+      - errors
+      - counts
+      - truncated
+      - vms
+    properties:
+      schema_version:
+        type: string
+        enum: [folder-topology-v1]
+      source:
+        type: string
+        enum: [vcenter]
+      collected_at:
+        type: string
+        format: date-time
+        description: UTC collection timestamp (not an atomic inventory snapshot)
+      folder:
+        $ref: '#/definitions/InventoryReference'
+      recursive:
+        type: boolean
+      complete:
+        type: boolean
+        description: False if any membership, identity, relationship or cleanup read failed
+      errors:
+        type: array
+        items:
+          $ref: '#/definitions/TopologyError'
+      counts:
+        type: object
+        required: [enumerated, examined, returned]
+        properties:
+          enumerated:
+            type: integer
+            description: Unique VM IDs discovered; not a total for unreadable subtrees
+          examined:
+            type: integer
+            description: Discovered VMs examined, including unreadable identities
+          returned:
+            type: integer
+            description: Exactly the length of vms, including partial relationship records
+      truncated:
+        type: boolean
+        enum: [false]
+        description: Always false; errors are not truncation
+      vms:
+        type: array
+        description: VM identity records sorted by canonical path and ID; deduplicated by ID
+        items:
+          $ref: '#/definitions/TopologyVM'
 parameters: {}
 responses: {}
 security: []

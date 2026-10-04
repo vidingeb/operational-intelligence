@@ -6,6 +6,7 @@ Serves a single-page chat interface on port 8091.
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 import os
+import json
 import httpx
 
 app = FastAPI(title="On-Prem AI Chat")
@@ -337,6 +338,15 @@ HTML_PAGE = """<!DOCTYPE html>
         .message h4 { font-size: 0.88rem; }
         .message h5 { font-size: 0.83rem; }
         .message p { margin: 0.45rem 0; }
+        .diagram-block { margin: 0.8rem 0; }
+        .diagram-image { display: block; max-width: 100%; height: auto; background: white; }
+        .diagram-image[hidden], .diagram-status[hidden] { display: none; }
+        .diagram-tools { display: flex; gap: 0.8rem; margin-top: 0.4rem; }
+        .diagram-tools a { color: #81d4fa; }
+        .diagram-status { color: #ffcc80; }
+        .diagram-source { margin: 0.5rem 0; }
+        .diagram-source summary { cursor: pointer; color: #9fb3c8; }
+        .diagram-source pre { overflow-x: auto; white-space: pre; font-size: 0.75rem; }
         .message ul, .message ol { margin: 0.45rem 0; padding-left: 1.3rem; }
         .message li { margin: 0.15rem 0; }
         .message code {
@@ -1287,8 +1297,76 @@ HTML_PAGE = """<!DOCTYPE html>
         const HRULE = /^\\s*(-{3,}|\\*{3,}|_{3,})\\s*$/;
         const BULLET = /^\\s*[-*+]\\s+(.*)$/;
         const NUMBERED = /^\\s*\\d+[.)]\\s+(.*)$/;
+        const DIAGRAM_PUBLIC_BASE = "{{DIAGRAM_PUBLIC_BASE}}";
+        const DIAGRAM_PATH = /^\\/diagrams\\/[0-9a-f]{16}\\.png$/;
+        const IMAGE_LINE = /^\\s*!\\[([^\\]]*)\\]\\(([^\\s)]+)\\)\\s*$/;
+        const CODE_FENCE = /^\\s*(`{3,}|~{3,})([^\\s]*)\\s*$/;
         // Escape, bold, code, italic - in that order, so ** is not eaten by *.
         const INLINE = /(\\\\.)|(\\*\\*[^*]+\\*\\*)|(`[^`]+`)|(\\*[^*\\n]+\\*)/g;
+
+        function decodeTextEntities(text) {
+            return text.replace(/&(#\\d+|#x[0-9a-f]+|amp|lt|gt|quot);/gi, (whole, code) => {
+                if (code[0] !== '#') {
+                    return {amp: '&', lt: '<', gt: '>', quot: '"'}[code.toLowerCase()];
+                }
+                const point = code[1].toLowerCase() === 'x'
+                    ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
+                if (point < 0 || point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff)) return whole;
+                if (point <= 0xffff) return String.fromCharCode(point);
+                return String.fromCharCode(0xd800 + ((point - 0x10000) >> 10),
+                                           0xdc00 + ((point - 0x10000) & 1023));
+            });
+        }
+
+        function trustedDiagramUrl(value) {
+            if (DIAGRAM_PATH.test(value)) return value;
+            if (/^https:\\/\\/[a-z0-9.-]+(?::\\d+)?\\/diagrams$/i.test(DIAGRAM_PUBLIC_BASE) &&
+                    value.indexOf(DIAGRAM_PUBLIC_BASE + '/') === 0 &&
+                    /^[0-9a-f]{16}\\.png$/.test(value.slice(DIAGRAM_PUBLIC_BASE.length + 1))) {
+                return value;
+            }
+            return null;
+        }
+
+        function buildDiagram(alt, value) {
+            const block = document.createElement('figure');
+            block.className = 'diagram-block';
+            const url = trustedDiagramUrl(value);
+            const status = document.createElement('p');
+            status.className = 'diagram-status';
+            if (!url) {
+                status.textContent = 'Diagram image blocked: URL is not a trusted local diagram PNG.';
+                block.appendChild(status);
+                return block;
+            }
+            const image = document.createElement('img');
+            image.className = 'diagram-image';
+            image.alt = decodeTextEntities(alt) || 'Infrastructure diagram';
+            image.referrerPolicy = 'no-referrer';
+            status.textContent = 'Loading diagram...';
+            image.addEventListener('load', () => { status.hidden = true; });
+            image.addEventListener('error', () => {
+                image.hidden = true;
+                status.hidden = false;
+                status.textContent = 'Diagram image failed to load. Check authenticated /diagrams routing; use Open PNG to inspect the response.';
+            });
+            image.src = url;
+            block.appendChild(image);
+            block.appendChild(status);
+            const tools = document.createElement('div');
+            tools.className = 'diagram-tools';
+            ['Open PNG', 'Download PNG'].forEach(label => {
+                const link = document.createElement('a');
+                link.textContent = label;
+                link.href = url;
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                if (label === 'Download PNG') link.download = url.slice(url.lastIndexOf('/') + 1);
+                tools.appendChild(link);
+            });
+            block.appendChild(tools);
+            return block;
+        }
 
         function inlineParts(text) {
             const t = (text === null || text === undefined) ? '' : String(text);
@@ -1313,12 +1391,12 @@ HTML_PAGE = """<!DOCTYPE html>
         function renderInline(el, text) {
             inlineParts(text).forEach(part => {
                 if (part.kind === 'text') {
-                    el.appendChild(document.createTextNode(part.value));
+                    el.appendChild(document.createTextNode(decodeTextEntities(part.value)));
                 } else {
                     const tag = part.kind === 'strong' ? 'strong'
                               : part.kind === 'code' ? 'code' : 'em';
                     const node = document.createElement(tag);
-                    node.textContent = part.value;
+                    node.textContent = decodeTextEntities(part.value);
                     el.appendChild(node);
                 }
             });
@@ -1326,7 +1404,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         // A CSV of "**Low** (degradation)" should read "Low (degradation)".
         function stripInline(text) {
-            return inlineParts(text).map(p => p.value).join('');
+            return inlineParts(text).map(p => decodeTextEntities(p.value)).join('');
         }
 
         function splitCells(line) {
@@ -1469,6 +1547,42 @@ HTML_PAGE = """<!DOCTYPE html>
             }
 
             while (i < lines.length) {
+                const fence = CODE_FENCE.exec(lines[i]);
+                if (fence) {
+                    flushText();
+                    const source = [];
+                    let j = i + 1;
+                    while (j < lines.length) {
+                        const closing = CODE_FENCE.exec(lines[j]);
+                        if (closing && closing[1][0] === fence[1][0] &&
+                                closing[1].length >= fence[1].length && !closing[2]) break;
+                        source.push(lines[j++]);
+                    }
+                    const pre = document.createElement('pre');
+                    const code = document.createElement('code');
+                    code.textContent = source.join('\\n');
+                    pre.appendChild(code);
+                    if (fence[2].toLowerCase() === 'mermaid') {
+                        const details = document.createElement('details');
+                        details.className = 'diagram-source';
+                        const summary = document.createElement('summary');
+                        summary.textContent = 'Diagram source (Mermaid)';
+                        details.appendChild(summary);
+                        details.appendChild(pre);
+                        container.appendChild(details);
+                    } else {
+                        container.appendChild(pre);
+                    }
+                    i = j < lines.length ? j + 1 : j;
+                    continue;
+                }
+                const image = IMAGE_LINE.exec(lines[i]);
+                if (image) {
+                    flushText();
+                    container.appendChild(buildDiagram(image[1], image[2]));
+                    i++;
+                    continue;
+                }
                 const isTableStart = TABLE_ROW.test(lines[i]) &&
                                      i + 1 < lines.length &&
                                      TABLE_SEP.test(lines[i + 1]);
@@ -1522,13 +1636,49 @@ HTML_PAGE = """<!DOCTYPE html>
             'li { margin: 2px 0; }',
             'code { background: #eee; padding: 0 3px; }',
             'hr { border: 0; border-top: 1px solid #ccc; margin: 12px 0; }',
-            '.message-tools, .table-tools, .model-tag, .usage-bar, .confirm-box',
+            '.diagram-image { max-width: 100%; height: auto; }',
+            '.diagram-status { color: #8a3300; }',
+            '.diagram-block { margin: 8px 0; break-inside: avoid; }',
+            '.message-tools, .table-tools, .model-tag, .usage-bar, .confirm-box, .diagram-tools, .diagram-source',
             '  { display: none !important; }',
             // Repeat headers on every page and avoid splitting a row.
             '@media print { @page { margin: 14mm; }',
             '  thead { display: table-header-group; }',
             '  tr { break-inside: avoid; page-break-inside: avoid; } }'
         ].join('\\n');
+
+        function printWhenImagesReady(root, print, schedule) {
+            const images = root.querySelectorAll ? root.querySelectorAll('img.diagram-image') : [];
+            let remaining = images.length;
+            let done = false;
+            function finish() {
+                if (done) return;
+                done = true;
+                print();
+            }
+            if (!remaining) { finish(); return; }
+            Array.prototype.forEach.call(images, image => {
+                image.loading = 'eager';
+                let settled = false;
+                function settle(failed) {
+                    if (settled) return;
+                    settled = true;
+                    const status = image.parentNode.querySelector('.diagram-status');
+                    if (status) {
+                        status.hidden = !failed;
+                        if (failed) status.textContent = 'Diagram unavailable in PDF: image failed to load.';
+                    }
+                    if (failed) image.hidden = true;
+                    if (--remaining === 0) finish();
+                }
+                if (image.complete) settle(!image.naturalWidth);
+                else {
+                    image.addEventListener('load', () => settle(false));
+                    image.addEventListener('error', () => settle(true));
+                    schedule(() => settle(true), 10000);
+                }
+            });
+        }
 
         function exportPdf(messageDiv, model, question) {
             const win = window.open('', '_blank');
@@ -1565,19 +1715,20 @@ HTML_PAGE = """<!DOCTYPE html>
 
             doc.body.appendChild(doc.importNode(messageDiv, true));
             win.focus();
-            // Give the imported nodes a tick to lay out before the dialog opens.
-            win.setTimeout(function () { win.print(); }, 300);
+            printWhenImagesReady(doc.body, () => {
+                win.setTimeout(function () { win.print(); }, 300);
+            }, (callback, delay) => win.setTimeout(callback, delay));
         }
 
         function addMessage(text, type, model, data) {
             const div = document.createElement('div');
             div.className = 'message ' + type;
-            if (model && type === 'assistant') {
+            if (type === 'assistant') {
                 const tools = document.createElement('div');
                 tools.className = 'message-tools';
                 const tag = document.createElement('div');
                 tag.className = 'model-tag';
-                tag.textContent = model;
+                tag.textContent = model || '';
                 const question = lastQuestion;
                 const pdfButton = document.createElement('button');
                 pdfButton.className = 'pdf-button';
@@ -1586,7 +1737,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 pdfButton.addEventListener('click',
                     () => exportPdf(div, model, question));
                 tools.appendChild(pdfButton);
-                tools.appendChild(tag);
+                if (model) tools.appendChild(tag);
                 div.appendChild(tools);
                 renderBody(div, '\\n' + text);
                 const usage = buildUsageBar(data);
@@ -2004,6 +2155,9 @@ async def index():
     return (HTML_PAGE
             .replace("{{LLM_BACKEND}}", llm)
             .replace("{{API_BACKEND}}", apis)
+            .replace("{{DIAGRAM_PUBLIC_BASE}}", json.dumps(
+                cfg.get("diagram_public_url_base") or ""
+            )[1:-1].replace("<", "\\u003c").replace(">", "\\u003e"))
             .replace("{{WELCOME}}", build_welcome(cfg)))
 
 
