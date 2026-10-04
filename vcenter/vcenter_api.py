@@ -97,14 +97,39 @@ def _inventory_segment(name):
     return urllib.parse.quote(str(name or ""), safe="")
 
 
+def _inventory_identity(obj):
+    if obj is None:
+        return None
+    moid = getattr(obj, "_moId", None)
+    if not isinstance(moid, str) or not moid:
+        raise ValueError("Inventory ancestor has no managed-object ID")
+    return (type(obj), moid, getattr(obj, "_serverGuid", None))
+
+
+def _same_inventory_object(first, second):
+    if first is None or second is None:
+        return first is second
+    return _inventory_identity(first) == _inventory_identity(second)
+
+
 def _inventory_path(obj, root):
+    """Root-qualified path, independent of which pyVmomi proxy was returned."""
     segments = []
     current = obj
-    while current is not None and current is not root:
+    seen = set()
+    while current is not None:
+        identity = _inventory_identity(current)
+        if identity in seen:
+            raise ValueError("Inventory parent chain is cyclic")
+        seen.add(identity)
         name = getattr(current, "name", None)
         if name:
             segments.append(_inventory_segment(name))
+        if _same_inventory_object(current, root):
+            break
         current = getattr(current, "parent", None)
+    if current is None:
+        raise ValueError("Inventory parent chain does not reach the inventory root")
     return "/" + "/".join(reversed(segments))
 
 
@@ -152,11 +177,13 @@ def _folder_record(folder, content, system_folders):
         "name": str(getattr(folder, "name", "")),
         "path": _inventory_path(folder, content.rootFolder),
         "parent_name": (
-            str(getattr(parent, "name", "")) if parent is not content.rootFolder else None
+            str(getattr(parent, "name", ""))
+            if parent is not None and not _same_inventory_object(parent, content.rootFolder)
+            else None
         ),
         "parent_path": (
             _inventory_path(parent, content.rootFolder)
-            if parent is not None and parent is not content.rootFolder
+            if parent is not None and not _same_inventory_object(parent, content.rootFolder)
             else "/"
         ),
         "category": _folder_category(folder, system_folders),
@@ -372,14 +399,15 @@ def folder_topology(
         label = obj.name
         if not moid or not isinstance(label, str) or not label:
             raise ValueError("Managed object has no readable ID or name")
-        # _inventory_path intentionally tolerates missing names for other endpoints.
-        # Here every ancestor must be readable to claim an authoritative path.
         seen = set()
         current = obj
-        while current is not content.rootFolder:
-            if current is None or object_id(current) in seen:
-                raise ValueError("Inventory parent chain is missing or cyclic")
-            seen.add(object_id(current))
+        while not _same_inventory_object(current, content.rootFolder):
+            if current is None:
+                raise ValueError("Inventory parent chain does not reach the inventory root")
+            ancestor = _inventory_identity(current)
+            if ancestor in seen:
+                raise ValueError("Inventory parent chain is cyclic")
+            seen.add(ancestor)
             if not current.name:
                 raise ValueError("Inventory ancestor has no readable name")
             current = current.parent

@@ -62,7 +62,7 @@ class View:
 
 
 def inventory():
-    root = Folder("root", "root")
+    root = Folder("", "root")
     dc1 = Datacenter("DC1", "dc-1", root)
     dc2 = Datacenter("DC2", "dc-2", root)
     vm1 = Folder("vm", "group-vm-1", dc1)

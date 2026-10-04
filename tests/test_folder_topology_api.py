@@ -417,3 +417,155 @@ def test_existing_folder_listing_cleans_up_after_second_view_creation_failure(mo
     with pytest.raises(RuntimeError, match="folder view denied"):
         api.get("/folders")
     assert created.destroyed
+
+
+class NamedProxy:
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def parent(self):
+        return self._parent
+
+
+class FolderProxy(NamedProxy, vim.Folder):
+    def __init__(self, name, moid, parent=None):
+        super().__init__(moid)
+        self._name = name
+        self._parent = parent
+        self._children = []
+
+    @property
+    def childEntity(self):
+        return self._children
+
+
+class DatacenterProxy(NamedProxy, vim.Datacenter):
+    def __init__(self, parent):
+        super().__init__("datacenter-3")
+        self._name = "Tier0-Mgmt-dc01"
+        self._parent = parent
+        self._folders = {}
+
+    vmFolder = property(lambda self: self._folders["vm"])
+    hostFolder = property(lambda self: self._folders["host"])
+    datastoreFolder = property(lambda self: self._folders["datastore"])
+    networkFolder = property(lambda self: self._folders["network"])
+
+
+class VMProxy(NamedProxy, vim.VirtualMachine):
+    def __init__(self, parent):
+        super().__init__("vm-101")
+        self._name = "observed VM"
+        self._parent = parent
+
+    runtime = property(lambda self: NS(host=None, powerState="poweredOn"))
+    datastore = property(lambda self: [])
+    config = property(lambda self: NS(hardware=NS(device=[], numCPU=2, memoryMB=2048)))
+    guest = property(lambda self: None)
+
+
+@pytest.fixture
+def proxy_inventory(monkeypatch):
+    root = FolderProxy("Datacenters", "group-d1")
+    parent_root = FolderProxy("Datacenters", "group-d1")
+    assert root is not parent_root and root == parent_root
+    dc = DatacenterProxy(parent_root)
+    for category, moid in (("vm", "group-v4"), ("host", "group-h5"),
+                           ("datastore", "group-s6"), ("network", "group-n7")):
+        dc._folders[category] = FolderProxy(category, moid, dc)
+    target = FolderProxy("Tn3-Pod1", "group-v142", dc.vmFolder)
+    target._children = [VMProxy(target)]
+    dc.vmFolder._children = [target]
+    views = []
+    content = NS(rootFolder=root)
+    monkeypatch.setattr(v, "get_si", lambda: NS(RetrieveContent=lambda: content))
+
+    def get_view(_content, kind):
+        if kind is vim.Datacenter:
+            values = [dc]
+        elif kind is vim.VirtualMachine:
+            values = target._children
+        else:
+            values = [*dc._folders.values(), target]
+        created = View(values)
+        views.append(created)
+        return created
+
+    monkeypatch.setattr(v, "get_view", get_view)
+    return NS(api=TestClient(v.app), root=root, parent_root=parent_root,
+              dc=dc, target=target, views=views)
+
+
+def test_distinct_pyvmomi_root_proxies_resolve_system_folders_and_topology(proxy_inventory):
+    inventory = proxy_inventory
+    expected = "/Datacenters/Tier0-Mgmt-dc01/vm/Tn3-Pod1"
+    current = inventory.target
+    while current is not None and current is not inventory.root:
+        current = current.parent
+    assert current is None  # The old reference-identity loop misses the valid root.
+    for selector in ({"folder_id": "group-v142"}, {"name": "Tn3-Pod1"}, {"path": expected}):
+        response = inventory.api.get("/folders/topology", params=selector)
+        assert response.status_code == 200, response.json()
+        body = response.json()
+        assert body["complete"] is True and body["errors"] == []
+        assert body["folder"]["path"] == expected
+        assert body["counts"] == {"enumerated": 1, "examined": 1, "returned": 1}
+        assert body["vms"][0]["path"] == expected + "/observed%20VM"
+    folders = inventory.api.get("/folders").json()
+    assert folders["complete"] is True
+    assert {record["id"] for record in folders["folders"] if record["is_system_folder"]} == {
+        "group-v4", "group-h5", "group-s6", "group-n7",
+    }
+    assert next(record for record in folders["folders"]
+                if record["id"] == "group-v142")["path"] == expected
+    assert all(created.destroyed for created in inventory.views)
+
+
+def test_paths_do_not_depend_on_root_proxy_instance(proxy_inventory):
+    inventory = proxy_inventory
+    proxied = v._inventory_path(inventory.target, inventory.root)
+    same_instance = v._inventory_path(inventory.target, inventory.parent_root)
+    assert proxied == same_instance == "/Datacenters/Tier0-Mgmt-dc01/vm/Tn3-Pod1"
+    assert v._inventory_path(inventory.parent_root, inventory.root) == "/Datacenters"
+
+
+def test_existing_vm_inventory_still_returns_its_original_response_shape(proxy_inventory):
+    response = proxy_inventory.api.get("/vms")
+    assert response.status_code == 200
+    assert response.json() == [{
+        "name": "observed VM", "power_state": "poweredOn", "cpu": 2, "memory_mb": 2048,
+        "guest_os": None, "guest_ip": None, "vmware_tools_status": None, "host": None,
+    }]
+    assert proxy_inventory.views[0].destroyed
+
+
+@pytest.mark.parametrize("broken", ["missing", "cycle", "cycle_distinct_proxy", "wrong_root",
+                                   "wrong_type", "wrong_server", "missing_id"])
+def test_real_parent_chain_failures_still_fail_closed(proxy_inventory, broken):
+    inventory = proxy_inventory
+    if broken == "missing":
+        inventory.dc._parent = None
+    elif broken == "cycle":
+        inventory.dc._parent = inventory.target
+    elif broken == "cycle_distinct_proxy":
+        duplicate = FolderProxy("Tn3-Pod1", "group-v142", inventory.dc)
+        inventory.dc._parent = duplicate
+    elif broken == "wrong_root":
+        inventory.dc._parent = FolderProxy("Datacenters", "group-other")
+    elif broken == "wrong_type":
+        impostor = DatacenterProxy(None)
+        impostor._moId = inventory.root._moId
+        inventory.dc._parent = impostor
+    elif broken == "wrong_server":
+        inventory.parent_root._serverGuid = "different-vcenter"
+    else:
+        inventory.dc._moId = None
+    response = inventory.api.get("/folders/topology", params={"folder_id": "group-v142"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["complete"] is False
+    assert response.json()["detail"]["errors"]
+    with pytest.raises(ValueError, match="Inventory"):
+        v._inventory_path(inventory.target, inventory.root)
+    assert all(created.destroyed for created in inventory.views)

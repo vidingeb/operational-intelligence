@@ -374,7 +374,7 @@ measured topology. This is an intentional change from syntax-only validation.
 The tool accepts:
 
 ```json
-{"selector":{"path":"/DC/vm/Apps"},"recursive":true}
+{"selector":{"path":"/Datacenters/DC/vm/Apps"},"recursive":true}
 ```
 
 Exactly one selector field is allowed: `folder_id`, `path`, or `name`.
@@ -383,6 +383,13 @@ so a slash in a folder name is not a path separator. `name` is an exact,
 case-insensitive match, **not** a VM-name search. Duplicate folder names produce
 HTTP 409 with candidate IDs/paths; choose an ID or full path rather than the
 first result. `GET /folders` supplies these selectors.
+
+Paths include the inventory root's name when present (for example
+`/Datacenters/DC/vm/Apps`), retaining the deployed `/folders` path format.
+Parent traversal identifies the root by managed-object type, ID and server GUID,
+not Python reference identity: pyVmomi may return separate proxies for the same
+root. A real missing ancestor, wrong root/server or cyclic chain still fails
+collection; reaching a null parent is not accepted as proof of the expected root.
 
 The Windows wrapper supplies `GET /folders/topology` with the same
 `folder_id|path|name` selector and `recursive=true|false`. Recursive membership

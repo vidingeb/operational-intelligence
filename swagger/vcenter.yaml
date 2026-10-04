@@ -93,7 +93,7 @@ paths:
         - in: query
           name: path
           type: string
-          description: Exact canonical escaped inventory path from GET /folders
+          description: Exact root-qualified escaped inventory path from GET /folders
         - in: query
           name: name
           type: string
@@ -546,7 +546,7 @@ definitions:
         description: Actual inventory name
       path:
         type: string
-        description: Canonical inventory path with individually escaped segments
+        description: Root-qualified inventory path with individually escaped segments; includes the named inventory root
   TopologyNetwork:
     type: object
     required: [id, name, path, kind]
