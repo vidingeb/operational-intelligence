@@ -17,6 +17,9 @@ Environment:
     OLLAMA_URL      Ollama endpoint       (default http://localhost:11434)
     VISION_MODEL    Vision model for pasted screenshots, e.g. qwen2.5vl:7b
                     (unset = images are reported as unread, never dropped)
+    VISION_MAX_IMAGES       Maximum images in one turn       (default 4)
+    VISION_MAX_IMAGE_BYTES  Maximum decoded bytes per image  (default 8 MiB)
+    VISION_MAX_TOTAL_BYTES  Maximum decoded bytes per turn   (default 16 MiB)
     MCP_SERVER      API host base URL     (default http://192.0.2.140)
     DEFAULT_MODEL   Model to use          (default llama3.1:8b)
     OLLAMA_TIMEOUT  Seconds, overrides the per-model default
@@ -29,6 +32,8 @@ Environment:
 import os
 import re
 import json
+import base64
+import binascii
 import hashlib
 import logging
 import urllib.parse
@@ -113,6 +118,9 @@ VISION_MODEL = os.getenv("VISION_MODEL", "")
 VISION_NUM_CTX = int(os.getenv("VISION_NUM_CTX", "8192"))
 VISION_KEEP_ALIVE = os.getenv("VISION_KEEP_ALIVE", "5m")
 VISION_TIMEOUT = float(os.getenv("VISION_TIMEOUT", "180"))
+VISION_MAX_IMAGES = int(os.getenv("VISION_MAX_IMAGES", "4"))
+VISION_MAX_IMAGE_BYTES = int(os.getenv("VISION_MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))
+VISION_MAX_TOTAL_BYTES = int(os.getenv("VISION_MAX_TOTAL_BYTES", str(16 * 1024 * 1024)))
 
 # Server-side diagram rendering. A diffusion model asked for this estate's
 # topology returned "EXN03", "ESXt01" and "Magrmnt VSAN 01" in 54 s on the GPU;
@@ -189,6 +197,14 @@ REGISTRY = [
     _t("vcenter_search_vms", "GET", f"{VCENTER_BASE}/vms/search",
        "Search for virtual machines by name",
        {"name": (Str, True, "VM name or partial name")}),
+    _t("vcenter_folders", "GET", f"{VCENTER_BASE}/folders",
+       "Authoritative tool for listing or searching vCenter inventory folders. "
+       "Returns complete, deterministic full inventory paths and explicitly "
+       "labels vCenter system folders. Use this before claiming a folder is absent",
+       {
+           "name": (Str, False, "Optional folder name; matching is case-insensitive"),
+           "exact": (Bool, False, "Exact name match instead of contains (default false)"),
+       }),
     _t("vcenter_vm_details", "GET", f"{VCENTER_BASE}/vm/details",
        "Detailed info for one VM: CPU, memory, disks, network, host placement",
        {"name": (Str, True, "Exact VM name")}),
@@ -638,6 +654,11 @@ the way an experienced engineer does.
 - Use only the exact tool names in the supplied registry. For host CPU and
   memory utilization, the registered tool is vcenter_host_usage. Never invent
   a similar name such as vcenter_host_metrics.
+- vcenter_folders is authoritative for vCenter inventory folder existence.
+  Say that no matching folder exists only when vcenter_folders returned
+  complete=true with zero matches. VM, host, cluster, datastore, NSX, or other
+  searches cannot establish folder absence. Never describe an invented tool
+  name as unavailable or imply that you queried a tool that is not registered.
 - Continue automatically with available read-only tools needed to answer the
   question. Do not ask the operator to run a lookup that you can run in the
   next tool round.
@@ -2088,6 +2109,7 @@ class ChatRequest(BaseModel):
     model: Optional[str] = None  # Optional model override
     scope: str = "all"  # "all", or one of SYSTEMS: vcenter / vcf_ops / vcf_networks
     conversation_id: Optional[str] = None  # Continue an existing conversation; None starts one
+    images: Optional[list[str]] = None  # Inline data URLs; remote URLs are never fetched
 
 class ChatResponse(BaseModel):
     answer: str
@@ -2195,6 +2217,14 @@ async def config():
         "write_tools_enabled": ENABLE_WRITE_TOOLS,
         "telemetry_url": GB10_TELEMETRY_URL or None,
         "vision_model": VISION_MODEL or None,
+        "vision_num_ctx": VISION_NUM_CTX,
+        "vision_keep_alive": VISION_KEEP_ALIVE,
+        "vision_limits": {
+            "max_images": VISION_MAX_IMAGES,
+            "max_image_bytes": VISION_MAX_IMAGE_BYTES,
+            "max_total_bytes": VISION_MAX_TOTAL_BYTES,
+            "mime_types": sorted(_IMAGE_SIGNATURES),
+        },
         "diagram_renderer": DIAGRAM_IMAGE or None,
         # Exposed so the UI describes the systems actually wired up rather
         # than a list written by hand, which went stale the moment logs and
@@ -2349,12 +2379,29 @@ async def chat(request: ChatRequest):
     conversation_id = request.conversation_id or store.create_conversation()
     conversation, replayed = build_conversation(request.scope, request.conversation_id)
     try:
-        result = await chat_with_tools(request.message, model=use_model,
+        images = _extract_images([
+            {"type": "image_url", "image_url": {"url": url}}
+            for url in (request.images or [])
+        ])
+    except ImageValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    latest = request.message.strip()
+    if images:
+        note = await image_note(images)
+        latest = f"{latest}\n\n{note}" if latest else note
+    elif not latest:
+        raise HTTPException(status_code=400, detail="A message or attached image is required.")
+    try:
+        result = await chat_with_tools(latest, model=use_model,
                                        conversation=conversation,
                                        scope=request.scope)
         # Persist after the answer, not before: a failed question should not
         # leave a dangling user turn that the next question replays as context.
-        store.add_message(conversation_id, "user", request.message)
+        store.add_message(
+            conversation_id,
+            "user",
+            request.message.strip() or "[Image attached]",
+        )
         store.add_message(conversation_id, "assistant", result["answer"])
         # Telemetry is best-effort decoration; a dead exporter must not fail a
         # question that was answered successfully.
@@ -2816,27 +2863,27 @@ def _flatten_content(content) -> str:
     return ""
 
 
-def _has_image(messages: list) -> bool:
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "image_url":
-                    return True
-    return False
+_DATA_URL = re.compile(
+    r"^data:(image/(?:png|jpeg|webp|gif));base64,(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_IMAGE_SIGNATURES = {
+    "image/png": lambda data: data.startswith(b"\x89PNG\r\n\x1a\n"),
+    "image/jpeg": lambda data: data.startswith(b"\xff\xd8\xff"),
+    "image/webp": lambda data: len(data) >= 12
+    and data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+    "image/gif": lambda data: data.startswith((b"GIF87a", b"GIF89a")),
+}
 
 
-_DATA_URL = re.compile(r"^data:image/[A-Za-z0-9.+-]+;base64,", re.IGNORECASE)
+class ImageValidationError(ValueError):
+    """An inline image was unsafe, malformed, or outside configured bounds."""
 
 
 def _extract_images(content) -> list:
-    """Base64 payloads from OpenAI image_url parts, stripped of the data: prefix.
-
-    Only inline data URLs are taken. A remote http URL is left alone on purpose:
-    fetching one would have the orchestrator retrieve an arbitrary address on
-    behalf of whoever is chatting.
-    """
+    """Validate inline image parts and return canonical base64 payloads."""
     images = []
+    total_bytes = 0
     if not isinstance(content, list):
         return images
     for part in content:
@@ -2844,8 +2891,39 @@ def _extract_images(content) -> list:
             continue
         url = part.get("image_url")
         url = url.get("url") if isinstance(url, dict) else url
-        if isinstance(url, str) and _DATA_URL.match(url):
-            images.append(_DATA_URL.sub("", url, count=1))
+        if not isinstance(url, str):
+            raise ImageValidationError("Each image_url must contain a string URL.")
+        match = _DATA_URL.fullmatch(url)
+        if not match:
+            raise ImageValidationError(
+                "Only inline PNG, JPEG, WebP, or GIF data URLs are accepted; "
+                "remote image URLs are never fetched."
+            )
+        if len(images) >= VISION_MAX_IMAGES:
+            raise ImageValidationError(
+                f"At most {VISION_MAX_IMAGES} images may be attached to one turn."
+            )
+        mime = match.group(1).lower()
+        try:
+            decoded = base64.b64decode(match.group(2), validate=True)
+        except (binascii.Error, ValueError):
+            raise ImageValidationError("Image data is not valid base64.")
+        if not decoded:
+            raise ImageValidationError("Attached images must not be empty.")
+        if len(decoded) > VISION_MAX_IMAGE_BYTES:
+            raise ImageValidationError(
+                f"Each image must be at most {VISION_MAX_IMAGE_BYTES} decoded bytes."
+            )
+        if not _IMAGE_SIGNATURES[mime](decoded):
+            raise ImageValidationError(
+                f"Image bytes do not match the declared {mime} MIME type."
+            )
+        total_bytes += len(decoded)
+        if total_bytes > VISION_MAX_TOTAL_BYTES:
+            raise ImageValidationError(
+                f"Attached images may total at most {VISION_MAX_TOTAL_BYTES} decoded bytes."
+            )
+        images.append(base64.b64encode(decoded).decode("ascii"))
     return images
 
 
@@ -2874,6 +2952,49 @@ async def describe_images(images: list) -> str:
         response = await client.post(f"{OLLAMA_URL}/api/chat", json=body)
         response.raise_for_status()
         return (response.json().get("message") or {}).get("content", "").strip()
+
+
+async def image_note(images: list, progress=None) -> str:
+    """Transcribe validated images and preserve their unverified status."""
+    if progress:
+        await progress(
+            "analyzing_image",
+            "Analyzing attached image",
+            {"image_count": len(images), "vision_model": VISION_MODEL or None},
+        )
+    if not VISION_MODEL:
+        return (
+            "[The user attached an image. This assistant has no vision model "
+            "configured and cannot read it. Say so; do not guess at its contents.]"
+        )
+    started = time.perf_counter()
+    logger.info("vision_inference start model=%s images=%d", VISION_MODEL, len(images))
+    try:
+        description = await describe_images(images)
+    except Exception as exc:
+        logger.warning(
+            "vision_inference failed model=%s images=%d elapsed_seconds=%.3f error=%s",
+            VISION_MODEL,
+            len(images),
+            time.perf_counter() - started,
+            exc.__class__.__name__,
+        )
+        return (
+            "[The user attached an image, but it could not be read: "
+            f"{exc.__class__.__name__}. Say so; do not guess at its contents.]"
+        )
+    logger.info(
+        "vision_inference complete model=%s images=%d elapsed_seconds=%.3f",
+        VISION_MODEL,
+        len(images),
+        time.perf_counter() - started,
+    )
+    if not description:
+        return (
+            "[The user attached an image, but the vision model returned nothing. "
+            "Say so; do not guess at its contents.]"
+        )
+    return frame_screenshot(description, len(images))
 
 
 def frame_screenshot(description: str, count: int) -> str:
@@ -3100,36 +3221,15 @@ async def openai_chat_completions(request: Request):
     # An attached image used to be discarded whenever any text arrived with it,
     # so the model answered without it while appearing to have looked. Either it
     # gets transcribed, or the turn says plainly that it was not read.
-    images = _extract_images(turns[-1].get("content"))
-    if images:
-        if VISION_MODEL:
-            print(f"[orchestrator] vision: {len(images)} image(s) -> {VISION_MODEL}", flush=True)
-            try:
-                description = await describe_images(images)
-            except Exception as exc:
-                note = ("[The user attached an image, but it could not be read: "
-                        f"{exc.__class__.__name__}. Say so; do not guess at its contents.]")
-                print(f"[orchestrator] vision failed: {exc!r}", flush=True)
-            else:
-                note = frame_screenshot(description, len(images)) if description else (
-                    "[The user attached an image, but the vision model returned "
-                    "nothing. Say so; do not guess at its contents.]")
-        else:
-            note = ("[The user attached an image. This assistant has no vision model "
-                    "configured and cannot read it. Say so; do not guess at its "
-                    "contents.]")
-        latest = f"{latest}\n\n{note}" if latest else note
-    elif not latest:
-        if _has_image(messages):
-            raise HTTPException(
-                status_code=400,
-                detail="An image was referenced by URL rather than attached. "
-                       "Paste or upload the image itself so it can be read.",
-            )
+    try:
+        images = _extract_images(turns[-1].get("content"))
+    except ImageValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not images and not latest:
         raise HTTPException(status_code=400, detail="The last user message is empty.")
 
     # Approval typed as text, handled before the model sees it.
-    approval = _APPROVAL_RE.match(latest)
+    approval = _APPROVAL_RE.match(latest) if not images else None
     if approval:
         verb, token = approval.group(1).lower(), approval.group(2)
         try:
@@ -3157,8 +3257,12 @@ async def openai_chat_completions(request: Request):
 
     if stream:
         async def complete(progress):
+            prepared = latest
+            if images:
+                note = await image_note(images, progress=progress)
+                prepared = f"{prepared}\n\n{note}" if prepared else note
             result = await chat_with_tools(
-                latest,
+                prepared,
                 model=DEFAULT_MODEL,
                 conversation=conversation,
                 scope=scope,
@@ -3177,6 +3281,9 @@ async def openai_chat_completions(request: Request):
         )
 
     try:
+        if images:
+            note = await image_note(images)
+            latest = f"{latest}\n\n{note}" if latest else note
         result = await chat_with_tools(
             latest,
             model=DEFAULT_MODEL,

@@ -14,6 +14,7 @@ says so has to travel with the content rather than live in documentation.
 """
 import pytest
 from fastapi.testclient import TestClient
+import json
 
 import orchestrator as o
 
@@ -56,7 +57,8 @@ def test_extract_images_takes_inline_data_urls():
 
 def test_extract_images_ignores_remote_urls():
     """Fetching one would have the orchestrator retrieve an arbitrary address."""
-    assert o._extract_images([image_part("https://example.invalid/x.png")]) == []
+    with pytest.raises(o.ImageValidationError, match="never fetched"):
+        o._extract_images([image_part("https://example.invalid/x.png")])
 
 
 def test_extract_images_handles_plain_string_url_form():
@@ -67,6 +69,34 @@ def test_extract_images_handles_plain_string_url_form():
 
 def test_extract_images_on_plain_string_content():
     assert o._extract_images("just text") == []
+
+
+def test_extract_images_rejects_malformed_base64():
+    with pytest.raises(o.ImageValidationError, match="valid base64"):
+        o._extract_images([image_part("data:image/png;base64,%%%")])
+
+
+def test_extract_images_rejects_mime_signature_mismatch():
+    with pytest.raises(o.ImageValidationError, match="MIME type"):
+        o._extract_images([image_part("data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUg==")])
+
+
+def test_extract_images_enforces_individual_size(monkeypatch):
+    monkeypatch.setattr(o, "VISION_MAX_IMAGE_BYTES", 4)
+    with pytest.raises(o.ImageValidationError, match="Each image"):
+        o._extract_images([image_part()])
+
+
+def test_extract_images_enforces_count(monkeypatch):
+    monkeypatch.setattr(o, "VISION_MAX_IMAGES", 1)
+    with pytest.raises(o.ImageValidationError, match="At most 1"):
+        o._extract_images([image_part(), image_part()])
+
+
+def test_extract_images_enforces_total_size(monkeypatch):
+    monkeypatch.setattr(o, "VISION_MAX_TOTAL_BYTES", 20)
+    with pytest.raises(o.ImageValidationError, match="may total"):
+        o._extract_images([image_part(), image_part()])
 
 
 # --- the silent drop ---------------------------------------------------------
@@ -172,7 +202,19 @@ def test_remote_image_without_text_is_rejected_clearly(client, captured):
         },
     )
     assert response.status_code == 400
-    assert "attach" in response.json()["detail"].lower()
+    assert "never fetched" in response.json()["detail"].lower()
+
+
+def test_remote_image_with_text_is_also_rejected(client, captured):
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "oi-all",
+            "messages": [user_turn("caption", image_part("https://example.invalid/x.png"))],
+        },
+    )
+    assert response.status_code == 400
+    assert "never fetched" in response.json()["detail"].lower()
 
 
 def test_plain_text_turn_is_untouched(client, captured, monkeypatch):
@@ -182,6 +224,77 @@ def test_plain_text_turn_is_untouched(client, captured, monkeypatch):
         json={"model": "oi-all", "messages": [{"role": "user", "content": "how many VMs?"}]},
     )
     assert captured["message"] == "how many VMs?"
+
+
+def test_stream_reports_image_analysis_before_tool_progress(client, monkeypatch):
+    async def fake_describe(images):
+        return "known harmless screenshot"
+
+    async def fake_chat(message, progress=None, **kwargs):
+        assert "known harmless screenshot" in message
+        await progress("selecting_tools", "Selecting tools", {})
+        return {"answer": "ok", "usage": {}, "pending_actions": []}
+
+    monkeypatch.setattr(o, "VISION_MODEL", "vl:test")
+    monkeypatch.setattr(o, "describe_images", fake_describe)
+    monkeypatch.setattr(o, "chat_with_tools", fake_chat)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "assistant-all",
+            "stream": True,
+            "messages": [user_turn("inspect", image_part())],
+        },
+    )
+    events = [
+        json.loads(line[6:])
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    stages = [
+        event["x_copilot_status"]["stage"]
+        for event in events
+        if "x_copilot_status" in event
+    ]
+    assert stages[:2] == ["analyzing_image", "selecting_tools"]
+    assert response.text.rstrip().endswith("data: [DONE]")
+
+
+def test_custom_chat_accepts_image_only_without_persisting_transcription(
+        client, monkeypatch):
+    seen = {}
+    stored = []
+
+    async def installed():
+        return {"test-model"}
+
+    async def fake_describe(images):
+        return "secret screenshot transcription"
+
+    async def fake_chat(message, **kwargs):
+        seen["message"] = message
+        return {"answer": "ok", "usage": {}, "tools_called": [], "pending_actions": []}
+
+    monkeypatch.setattr(o, "_installed_models", installed)
+    monkeypatch.setattr(o, "VISION_MODEL", "vl:test")
+    monkeypatch.setattr(o, "describe_images", fake_describe)
+    monkeypatch.setattr(o, "chat_with_tools", fake_chat)
+    monkeypatch.setattr(o.store, "create_conversation", lambda: "conv-1")
+    monkeypatch.setattr(o.store, "add_message",
+                        lambda cid, role, content: stored.append((role, content)))
+    monkeypatch.setattr(o, "fetch_telemetry", lambda: _async_value({}))
+    response = client.post(
+        "/chat",
+        json={"message": "", "model": "test-model", "images": [PNG]},
+    )
+    assert response.status_code == 200
+    assert "secret screenshot transcription" in seen["message"]
+    assert ("user", "[Image attached]") in stored
+    assert all("secret screenshot transcription" not in content for _, content in stored)
+
+
+async def _async_value(value):
+    return value
 
 
 # --- frame_screenshot --------------------------------------------------------

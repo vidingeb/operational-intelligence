@@ -5,6 +5,8 @@ import ssl
 import os
 import atexit
 import threading
+import urllib.parse
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 
 app = FastAPI(
@@ -88,6 +90,83 @@ def get_view(content, vim_type):
         [vim_type],
         True
     )
+
+
+def _inventory_segment(name):
+    """One stable path segment; folder names containing '/' stay unambiguous."""
+    return urllib.parse.quote(str(name or ""), safe="")
+
+
+def _inventory_path(obj, root):
+    segments = []
+    current = obj
+    while current is not None and current is not root:
+        name = getattr(current, "name", None)
+        if name:
+            segments.append(_inventory_segment(name))
+        current = getattr(current, "parent", None)
+    return "/" + "/".join(reversed(segments))
+
+
+def _managed_type(obj):
+    type_map = (
+        (vim.Folder, "folder"),
+        (vim.VirtualMachine, "virtual_machine"),
+        (vim.HostSystem, "host"),
+        (vim.ClusterComputeResource, "cluster"),
+        (vim.ComputeResource, "compute_resource"),
+        (vim.Network, "network"),
+        (vim.Datastore, "datastore"),
+        (vim.Datacenter, "datacenter"),
+    )
+    for cls, label in type_map:
+        if isinstance(obj, cls):
+            return label
+    return type(obj).__name__
+
+
+def _folder_category(folder, system_folders):
+    current = folder
+    while current is not None:
+        category = system_folders.get(getattr(current, "_moId", None))
+        if category:
+            return category
+        current = getattr(current, "parent", None)
+    return "generic"
+
+
+def _folder_record(folder, content, system_folders):
+    children = list(getattr(folder, "childEntity", None) or [])
+    counts = Counter(_managed_type(child) for child in children)
+    names = sorted(
+        (
+            {"name": str(getattr(child, "name", "")), "type": _managed_type(child)}
+            for child in children
+        ),
+        key=lambda item: (item["name"].casefold(), item["type"]),
+    )
+    parent = getattr(folder, "parent", None)
+    folder_id = getattr(folder, "_moId", None)
+    return {
+        "name": str(getattr(folder, "name", "")),
+        "path": _inventory_path(folder, content.rootFolder),
+        "parent_name": (
+            str(getattr(parent, "name", "")) if parent is not content.rootFolder else None
+        ),
+        "parent_path": (
+            _inventory_path(parent, content.rootFolder)
+            if parent is not None and parent is not content.rootFolder
+            else "/"
+        ),
+        "category": _folder_category(folder, system_folders),
+        "is_system_folder": folder_id in system_folders,
+        "immediate_children": {
+            "count": len(children),
+            "counts_by_type": dict(sorted(counts.items())),
+            "sample": names[:20],
+            "sample_truncated": len(names) > 20,
+        },
+    }
 
 
 @app.get("/health")
@@ -198,6 +277,62 @@ def list_vms():
 
     view.Destroy()
     return result
+
+
+@app.get("/folders")
+def list_folders(
+    name: str = Query(None, description="Optional case-insensitive folder name"),
+    exact: bool = Query(False, description="Use exact rather than contains matching"),
+):
+    """Authoritative vCenter inventory folder list/search.
+
+    Datacenter objects are not folders and are never returned as folder records.
+    vCenter's built-in VM/host/network/datastore folders are retained but
+    explicitly labelled, because hiding them makes full inventory paths
+    impossible to interpret.
+    """
+    content = get_si().RetrieveContent()
+    datacenter_view = get_view(content, vim.Datacenter)
+    folder_view = get_view(content, vim.Folder)
+    try:
+        system_folders = {}
+        for datacenter in datacenter_view.view:
+            for attr, category in (
+                ("vmFolder", "vm"),
+                ("hostFolder", "host"),
+                ("networkFolder", "network"),
+                ("datastoreFolder", "datastore"),
+            ):
+                folder = getattr(datacenter, attr, None)
+                folder_id = getattr(folder, "_moId", None)
+                if folder_id:
+                    system_folders[folder_id] = category
+
+        query = (name or "").strip().casefold()
+        records = []
+        for folder in folder_view.view:
+            folder_name = str(getattr(folder, "name", ""))
+            if query:
+                candidate = folder_name.casefold()
+                if ((candidate == query) if exact else (query in candidate)):
+                    records.append(_folder_record(folder, content, system_folders))
+            else:
+                records.append(_folder_record(folder, content, system_folders))
+        records.sort(key=lambda item: (item["path"].casefold(), item["path"]))
+        return {
+            "folders": records,
+            "count": len(records),
+            "complete": True,
+            "query": name,
+            "match_semantics": (
+                "case_insensitive_exact" if exact else "case_insensitive_contains"
+            ) if query else "all",
+            "system_folders": "included_and_labelled",
+            "note": "Datacenter objects are excluded because they are not folders.",
+        }
+    finally:
+        folder_view.Destroy()
+        datacenter_view.Destroy()
 
 
 @app.get("/vms/search")

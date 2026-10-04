@@ -464,6 +464,58 @@ HTML_PAGE = """<!DOCTYPE html>
             gap: 0.8rem;
             align-items: center;
         }
+        #message-composer {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
+        }
+        #attachment-preview {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+        }
+        #attachment-preview:empty { display: none; }
+        .attachment {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            max-width: 260px;
+            padding: 0.3rem 0.45rem;
+            border: 1px solid #2a4a7f;
+            border-radius: 6px;
+            background: #10182c;
+            color: #cfd8e3;
+            font-size: 0.75rem;
+        }
+        .attachment img {
+            width: 38px;
+            height: 38px;
+            border-radius: 4px;
+            object-fit: cover;
+        }
+        .attachment-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .attachment-remove {
+            border: 0;
+            background: none;
+            color: #ff8a80;
+            cursor: pointer;
+            font-size: 1rem;
+        }
+        #attach-btn {
+            padding: 0.75rem;
+            border: 1px solid #0f3460;
+            border-radius: 8px;
+            background: #1a1a2e;
+            color: #81d4fa;
+            cursor: pointer;
+        }
+        #image-input { display: none; }
         #model-select, #scope-select {
             padding: 0.6rem 0.8rem;
             border: 1px solid #0f3460;
@@ -504,7 +556,7 @@ HTML_PAGE = """<!DOCTYPE html>
         .confirm-status.bad { color: #ef5350; }
         .confirm-status.muted { color: #78909c; }
         #user-input {
-            flex: 1;
+            width: 100%;
             padding: 0.8rem 1rem;
             border: 1px solid #0f3460;
             border-radius: 8px;
@@ -576,6 +628,12 @@ HTML_PAGE = """<!DOCTYPE html>
             font-variant-numeric: tabular-nums;
         }
         .usage-bar .tools { opacity: 0.8; font-style: italic; }
+        @media (max-width: 760px) {
+            #input-area { padding: 0.75rem; gap: 0.45rem; flex-wrap: wrap; }
+            #model-select, #scope-select { max-width: calc(50% - 0.3rem); }
+            #message-composer { order: 2; flex-basis: 100%; }
+            #attach-btn, #send-btn { order: 3; }
+        }
     </style>
 </head>
 <body>
@@ -643,7 +701,12 @@ HTML_PAGE = """<!DOCTYPE html>
             <div id="input-area">
                 <select id="model-select"><option value="">Loading models...</option></select>
                 <select id="scope-select" title="Which systems the assistant may query"></select>
-                <input type="text" id="user-input" placeholder="Ask about your VMware infrastructure..." autofocus>
+                <div id="message-composer">
+                    <div id="attachment-preview" aria-live="polite"></div>
+                    <input type="text" id="user-input" placeholder="Ask about your VMware infrastructure..." autofocus>
+                </div>
+                <label id="attach-btn" for="image-input" title="Attach screenshot">📎 Image</label>
+                <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple>
                 <button id="send-btn" onclick="sendMessage()">Send</button>
             </div>
         </div>
@@ -652,6 +715,8 @@ HTML_PAGE = """<!DOCTYPE html>
     <script>
         const chatContainer = document.getElementById('chat-container');
         const userInput = document.getElementById('user-input');
+        const imageInput = document.getElementById('image-input');
+        const attachmentPreview = document.getElementById('attachment-preview');
         const sendBtn = document.getElementById('send-btn');
         const modelSelect = document.getElementById('model-select');
         const scopeSelect = document.getElementById('scope-select');
@@ -659,6 +724,93 @@ HTML_PAGE = """<!DOCTYPE html>
         const memoryState = document.getElementById('memory-state');
         const panel = document.getElementById('panel');
         let timerInterval = null;
+        const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+        const MAX_IMAGES = 4;
+        const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+        const MAX_TOTAL_IMAGE_BYTES = 16 * 1024 * 1024;
+        let selectedImages = [];
+
+        function imageError(message) {
+            addMessage('Image not attached: ' + message, 'error');
+        }
+
+        function readDataUrl(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(new Error('Could not read ' + file.name));
+                reader.readAsDataURL(file);
+            });
+        }
+
+        function renderAttachments() {
+            attachmentPreview.textContent = '';
+            selectedImages.forEach((image, index) => {
+                const item = document.createElement('div');
+                item.className = 'attachment';
+                const thumb = document.createElement('img');
+                thumb.src = image.dataUrl;
+                thumb.alt = '';
+                const name = document.createElement('span');
+                name.className = 'attachment-name';
+                name.textContent = image.name;
+                name.title = image.name + ' (' + Math.ceil(image.size / 1024) + ' KiB)';
+                const remove = document.createElement('button');
+                remove.type = 'button';
+                remove.className = 'attachment-remove';
+                remove.textContent = '×';
+                remove.title = 'Remove ' + image.name;
+                remove.addEventListener('click', () => {
+                    selectedImages.splice(index, 1);
+                    renderAttachments();
+                });
+                item.append(thumb, name, remove);
+                attachmentPreview.appendChild(item);
+            });
+        }
+
+        async function addImageFiles(files) {
+            for (const file of files) {
+                if (!IMAGE_TYPES.has(file.type)) {
+                    imageError(file.name + ' is not a supported PNG, JPEG, WebP, or GIF image.');
+                    continue;
+                }
+                if (selectedImages.length >= MAX_IMAGES) {
+                    imageError('A message can contain at most ' + MAX_IMAGES + ' images.');
+                    break;
+                }
+                if (file.size <= 0 || file.size > MAX_IMAGE_BYTES) {
+                    imageError(file.name + ' must be between 1 byte and 8 MiB.');
+                    continue;
+                }
+                const total = selectedImages.reduce((sum, image) => sum + image.size, 0);
+                if (total + file.size > MAX_TOTAL_IMAGE_BYTES) {
+                    imageError('Attached images may total at most 16 MiB.');
+                    continue;
+                }
+                try {
+                    selectedImages.push({
+                        name: file.name || 'pasted-image',
+                        type: file.type,
+                        size: file.size,
+                        dataUrl: await readDataUrl(file)
+                    });
+                } catch (e) {
+                    imageError(e.message);
+                }
+            }
+            imageInput.value = '';
+            renderAttachments();
+        }
+
+        imageInput.addEventListener('change', () => addImageFiles(Array.from(imageInput.files || [])));
+        document.addEventListener('paste', event => {
+            const files = Array.from((event.clipboardData && event.clipboardData.files) || []);
+            if (files.length) {
+                event.preventDefault();
+                addImageFiles(files);
+            }
+        });
 
         userInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
@@ -1060,17 +1212,24 @@ HTML_PAGE = """<!DOCTYPE html>
 
         async function sendMessage() {
             const message = userInput.value.trim();
-            if (!message) return;
+            if (!message && !selectedImages.length) return;
 
             const model = modelSelect.value;
 
-            lastQuestion = message;
-            addMessage(message, 'user');
+            const sentImages = selectedImages.slice();
+            const displayMessage = message || '[Image attached]';
+            lastQuestion = displayMessage;
+            addMessage(displayMessage + (sentImages.length
+                ? '\\n\\nAttached: ' + sentImages.map(image => image.name).join(', ')
+                : ''), 'user');
             userInput.value = '';
             sendBtn.disabled = true;
 
             const modelLabel = modelSelect.options[modelSelect.selectedIndex].text;
-            const thinkingEl = addMessage('Thinking with ' + modelLabel + '...', 'thinking');
+            const thinkingEl = addMessage(
+                sentImages.length ? 'Analyzing image before VMware checks...'
+                                  : 'Thinking with ' + modelLabel + '...',
+                'thinking');
             startTimer();
 
             try {
@@ -1078,7 +1237,8 @@ HTML_PAGE = """<!DOCTYPE html>
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ message, model, scope: scopeSelect.value || 'all',
-                                           conversation_id: conversationId }),
+                                           conversation_id: conversationId,
+                                           images: sentImages.map(image => image.dataUrl) }),
                 });
 
                 stopTimer();
@@ -1086,6 +1246,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
                 if (response.ok) {
                     const data = await response.json();
+                    selectedImages = [];
+                    renderAttachments();
                     setConversationId(data.conversation_id || conversationId);
                     setMemoryState(data.history_turns || 0);
                     addMessage(data.answer, 'assistant', data.model, data);
@@ -1861,6 +2023,7 @@ async def chat(request: dict):
                 "model": request.get("model"),
                 "scope": request.get("scope", "all"),
                 "conversation_id": request.get("conversation_id"),
+                "images": request.get("images") or [],
             },
         )
         # raise_for_status() discards the orchestrator's message and returns a

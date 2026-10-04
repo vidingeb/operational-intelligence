@@ -294,6 +294,77 @@ delta field and the `x_copilot_status` extension; normal answer chunks and the
 terminal `data: [DONE]` remain unchanged. This reports milestones, not model
 reasoning or chain-of-thought.
 
+### Screenshot input and Qwen3-VL
+
+The existing `assistant-*` OpenAI models accept screenshots as inline
+`image_url` data URLs. The orchestrator uses the configured vision sidecar only
+to transcribe/describe the image, labels that transcription as unverified, and
+then hands the bounded text to `DEFAULT_MODEL` for VMware reasoning and tool
+use. Qwen3-VL is not exposed as a separate assistant model and does not receive
+tool credentials or raw API results.
+
+The lab deployment uses:
+
+```ini
+Environment="VISION_MODEL=qwen3-vl:30b"
+Environment="VISION_NUM_CTX=8192"
+Environment="VISION_KEEP_ALIVE=2m"
+Environment="VISION_MAX_IMAGES=4"
+Environment="VISION_MAX_IMAGE_BYTES=8388608"
+Environment="VISION_MAX_TOTAL_BYTES=16777216"
+```
+
+`qwen3-vl:30b` requires Ollama 0.12.7 or newer. Check `/api/version`, free disk,
+and available memory before pulling it. The two-minute keep-alive permits
+follow-up screenshot turns without pinning the vision model indefinitely;
+`gpt-oss:120b` remains the primary reasoning/tool model. Observe `/api/ps`
+after representative requests and lower the keep-alive if the host experiences
+memory pressure.
+
+Open WebUI sends the image through the existing OpenAI connection. The custom
+On-Prem AI Assistant supports file selection and clipboard paste, shows
+removable thumbnail/name previews, and sends the same inline data-URL format.
+Both paths accept PNG, JPEG, WebP, and GIF only, with at most four images,
+8 MiB per decoded image, and 16 MiB decoded total per turn. Remote image URLs
+are rejected and never fetched. Malformed, mismatched-MIME, empty, oversized,
+or excessive attachments return an explicit error rather than being dropped.
+The custom UI clears attachments only after a successful response.
+
+For streaming OpenAI requests, `analyzing_image` is emitted before normal tool
+milestones. The custom UI displays “Analyzing image before VMware checks…”
+while its conversation-preserving `/chat` request runs. Images are not written
+to conversation history; an image-only custom-UI turn stores only
+`[Image attached]`. Vision logs contain model, count, elapsed time, and error
+class, never image data or transcription.
+
+Image text is evidence supplied by a vision model, not measured infrastructure
+state. Hostnames, addresses, digits, statuses, and measurements remain
+unverified until a read-only tool confirms them. If vision is disabled or
+fails, the assistant says that the image was unread rather than guessing.
+
+### vCenter folder inventory
+
+`vcenter_folders` is the authoritative read-only folder list/search tool. Its
+vCenter endpoint is `GET /folders`, with optional case-insensitive `name` and
+`exact=true|false` parameters. Results include stable full inventory paths,
+parent path/name, VM/host/network/datastore/generic category, an explicit
+system-folder flag, and a bounded immediate-child summary. Duplicate folder
+names remain distinct through their full paths. The response reports
+`complete`, result count, and exact-versus-contains match semantics;
+Datacenter objects are explicitly excluded because they are not folders.
+
+The assistant may claim that a folder is absent only after this endpoint
+returns `complete=true` with zero matches. VM, host, cluster, datastore, and
+NSX searches do not prove folder absence. A screenshot response from a general
+model such as `qwen3:8b` is likewise unsupported evidence until the folder tool
+confirms it.
+
+Rollback is configuration-only after reverting the application commit: restore
+the prior `VISION_MODEL`/`VISION_NUM_CTX` values in the existing systemd
+drop-in, run `systemctl daemon-reload`, and restart only the orchestrator and
+custom WebUI services. Removing the downloaded Ollama model is optional and
+should be a separate, explicit storage-management decision.
+
 ### Flow inventory cache
 
 `/ni/flows/inventory` caches only fully resolved successful responses in the
